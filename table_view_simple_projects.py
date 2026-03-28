@@ -1612,34 +1612,38 @@ class ProjectSettingsEditor(QDialog):
             # For blacklist, try the last path in the list
             last_path = current_val.split(",")[-1].strip()
             start_dir = last_path if os.path.exists(last_path) else self.engine.root
+        elif current_val and os.path.isdir(current_val):
+            # If it's already a directory, open exactly there
+            start_dir = current_val
         elif current_val and os.path.exists(os.path.dirname(current_val)):
+            # If it's a file, open its parent
             start_dir = os.path.dirname(current_val)
         else:
             start_dir = self.engine.root
 
         # 2. Open the correct Dialog type
-        if key in ['data_root', 'scrape_blacklist']:
-            res = QFileDialog.getExistingDirectory(self, f"Select Directory to {'Exclude' if key == 'scrape_blacklist' else 'Scrape'}", start_dir)
+        # --- SURGICAL FIX: Move catalogs into the directory browser group ---
+        if key in ['scrape_blacklist', 'catalog_csv', 'catalog_dir']:
+            prompt = "Select Directory to Exclude" if key == 'scrape_blacklist' else f"Select Directory for {key}"
+            res = QFileDialog.getExistingDirectory(self, prompt, start_dir)
             
             if res:
                 res = os.path.normpath(res)
                 if key == 'scrape_blacklist':
                     # --- THE APPEND LOGIC ---
                     if current_val:
-                        # Clean up existing string and append with comma
                         new_val = f"{current_val.rstrip(',')}, {res}"
                     else:
                         new_val = res
                     edit_widget.setPlainText(new_val)
                 else:
-                    # Overwrite for single root
+                    # Overwrite for catalog_dir / catalog_csv
                     edit_widget.setPlainText(res)
         else:
-            # 3. CSV File Browser (Switching from Save to Open dialog)
+            # 3. CSV File Browser (For shots_csv, etc)
             default_fn = default_names.get(key, "data.csv")
             initial_path = os.path.join(start_dir, default_fn)
             
-            # Use getOpenFileName instead of getSaveFileName
             res, _ = QFileDialog.getOpenFileName(
                 self, 
                 f"Select {key} File", 
@@ -1649,8 +1653,6 @@ class ProjectSettingsEditor(QDialog):
             
             if res:
                 res = os.path.normpath(res)
-                # Note: getOpenFileName returns the path exactly as selected, 
-                # so the .csv check is mostly defensive here.
                 if not res.lower().endswith(".csv"):
                     res += ".csv"
                 edit_widget.setPlainText(res)
@@ -1813,277 +1815,6 @@ class SingleLineWrapEdit(QTextEdit):
             event.accept()
             return
         super().keyPressEvent(event)
-
-class ConfigEngine:
-    def __init__(self, root_path, bootstrap=False):
-        self.root = os.path.abspath(os.path.normpath(root_path))
-        self.apps_dir = os.path.join(self.root, "Media_Actions")
-        
-        # Existing logic preserved: bootstrap if requested OR if Media_Actions is missing
-        if bootstrap or not os.path.exists(self.apps_dir):
-            # No arguments needed here; it will default to self.root and 'create' mode
-            self.bootstrap_template()
-            
-        self.pathsubs = self._load_flat_csv("Path_Subs.csv")
-        # Global Injection
-        PathSwapper.PATHSUBS = self.pathsubs
-
-        # Load and SWAP settings immediately
-        raw = self._load_kv_csv("Project_Settings.csv")
-        self.settings = {k: PathSwapper.translate(str(v)) if ("/" in str(v) or "\\" in str(v)) else v 
-                         for k, v in raw.items()}
-
-        # --- THE MULTI-ROOT INTERCEPTOR ---
-        if 'data_root' in self.settings:
-            raw_dr = str(self.settings['data_root']).strip()
-            
-            # 1. Store the untouched payload for future multi-root scrapers
-            self.settings['data_root_raw'] = raw_dr 
-
-            # 2. Try to extract the first tuple's path for primary pipeline write actions
-            try:
-                import json
-                dr_list = json.loads(raw_dr)
-                
-                if isinstance(dr_list, list) and len(dr_list) > 0:
-                    first_item = dr_list[0]
-                    # We expect format: [["name", "/path"], ["name2", "/path2"]]
-                    if isinstance(first_item, (list, tuple)) and len(first_item) >= 2:
-                        self.settings['data_root'] = str(first_item[1])
-            except Exception:
-                # It's a legacy flat string (e.g. "/Volumes/jobs"). 
-                # Do nothing, leave self.settings['data_root'] exactly as it is!
-                pass
-                
-        self.apps = self._discover_apps()
-        # Load Naming Templates
-        self.naming_templates = self._load_kv_csv("Naming_Templates.csv")
-
-    def _load_kv_csv(self, filename):
-        path = os.path.join(self.root, filename)
-        if not os.path.exists(path): return {}
-        try:
-            # ADDED: dtype=str to keep padding in settings
-            df = pd.read_csv(path, encoding='cp1252', dtype=str).fillna("")
-            return dict(zip(df['Key'], df['Value']))
-        except Exception as e:
-            print(f"Error loading {filename}: {e}")
-            return {}
-
-    def _load_flat_csv(self, filename):
-        path = os.path.join(self.root, filename)
-        if not os.path.exists(path): return []
-        try: 
-            df = pd.read_csv(path, encoding='cp1252', dtype=str).fillna("")
-            
-            # --- CRITICAL: Capture the headers for the PathSwapper ---
-            if filename == "Path_Subs.csv":
-                PathSwapper.HEADERS = df.columns.tolist()
-                
-            return df.values.tolist()
-        except: 
-            return []
-
-    def _discover_apps(self):
-        """Discovers apps by folder name and loads the OS-specific CSV."""
-        apps = {}
-        if not os.path.exists(self.apps_dir): return {}
-        
-        # Determine our current OS label for the sub-folder search
-        plat_folder = "win" if sys.platform == "win32" else "mac" if sys.platform == "darwin" else "linux"
-        
-        # Look at each directory in Media_Actions (e.g., /Nuke, /RV)
-        for app_name in os.listdir(self.apps_dir):
-            app_path = os.path.join(self.apps_dir, app_name)
-            if os.path.isdir(app_path):
-                # Look for the specific OS csv inside that folder
-                os_csv = os.path.join(app_path, f"{plat_folder}.csv")
-                if os.path.exists(os_csv):
-                    # Load the Key/Value pairs for this specific OS
-                    apps[app_name] = self._load_kv_csv_multi(os_csv)
-        return apps
-
-    def _load_kv_csv_multi(self, path):
-        """Modified loader to allow multiple rows with the same Key (for 'env')."""
-        data = defaultdict(list)
-        try:
-            df = pd.read_csv(path, encoding='cp1252').fillna("")
-            for _, row in df.iterrows():
-                data[str(row['Key'])].append(str(row['Value']))
-            return dict(data)
-        except Exception as e:
-            print(f"Error loading {path}: {e}")
-            return {}
-
-    def bootstrap_template(self, target_dir=None, mode='create'):
-        if target_dir is None:
-            target_dir = self.root
-
-        def write(filename, rows):
-            path = os.path.join(target_dir, filename)
-            os.makedirs(os.path.dirname(path), exist_ok=True)
-            
-            # --- MODE: CREATE ---
-            if mode == 'create' or not os.path.exists(path):
-                self.write_csv(path, rows)
-                return
-
-            # --- MODE: SYNC (The Additive Logic) ---
-            if mode == 'sync' and os.path.exists(path):
-                try:
-                    # 1. Load the existing file
-                    existing_df = pd.read_csv(path, dtype=str).fillna("")
-                    # 2. Convert bootstrapper rows to a DF for comparison
-                    incoming_df = pd.DataFrame(rows[1:], columns=rows[0]).astype(str)
-                    
-                    # 3. Identify the "Key" column (usually Col 0)
-                    key_col = rows[0][0]
-                    
-                    # 4. Find what's in the bootstrapper but NOT in the file
-                    existing_keys = set(existing_df[key_col].tolist())
-                    missing_rows = incoming_df[~incoming_df[key_col].isin(existing_keys)]
-                    
-                    if not missing_rows.empty:
-                        # 5. Append only the missing variables to the end
-                        updated_df = pd.concat([existing_df, missing_rows], ignore_index=True)
-                        updated_df.to_csv(path, index=False)
-                        # print(f"Synced {len(missing_rows)} new keys to {filename}")
-                except Exception as e:
-                    print(f"Failed to sync {filename}: {e}")
-
-        # Project Settings
-        write("Project_Settings.csv", [
-            ["Key", "Value"],
-            ["data_root", "/your/job/directory"],
-            ["catalog_csv", ""],
-            ["shots_csv", "{data_root}/Shots_Template.csv"],
-            ["dual_name", "False"],
-            ["submission_types", "WIP, Final Pending QC, Final QC Approved"], # <--- NEW
-            ["status_options", "Ready for Review, Needs Update, Approved, RTS, Pending"],
-            ["submission_csv_headers", "LOCALPATH,SHOTNAME,FILENAME,FIRST,LAST,SUBNOTES,SUBTYPE"],
-            ["submission_review_headers", "LOCALPATH,SHOTNAME,FILENAME,FIRST,LAST,SUBTYPE,SUBNOTES"],
-            ["playlist_review_headers", "LOCALPATH,SHOTNAME,FILENAME,FIRST,LAST,SUBNOTES"],
-            ["scrape_blacklist", ".trash, .snapshot, _thumbs"],
-            ["padding_default", "4"],
-            ["padding_scans", "4"],
-            ["padding_renders", "4"]
-        ])
-        
-        # --- NEW: Project Actions (Nuke Folder-Based Structure) ---
-        nuke_root = "Project_Actions/Nuke"
-        
-        # 1. THE MASTER INDEX (Just IDs now)
-        write(f"{nuke_root}/nuke_templates.csv", [
-            ["Template_ID"],
-            ["read_write_setup"]
-        ])
-
-        # 2. THE SPECIFIC TEMPLATE SUBDIRECTORY
-        rw_dir = f"{nuke_root}/read_write_setup"
-        
-        # 3. THE CONFIG CSV (Paths)
-        write(f"{rw_dir}/config.csv", [
-            ["Key", "Value"],
-            ["Source_NK", ""],
-            ["Output_Template_path", "{data_root}/{SEQUENCE}/{SHOTNAME}/nuke/{SHOTNAME}"],
-            ["Output_Template_file", "{SHOTNAME}_comp_v001.nk"],
-            ["nuke_comp_render_path", "{data_root}/comp/{ALTSHOTNAME}/{ALTSHOTNAME}_comp_v001"],
-            ["nuke_comp_render_filename", "{ALTSHOTNAME}_comp_v001.{padding_default}.exr"]
-        ])
-
-        # 4. THE MAPPING CSV (Variables)
-        write(f"{rw_dir}/mapping.csv", [
-            ["Variable", "Source_Type", "Lookup_Key"],
-            ["FIRSTFRAME", "HEADER", "FIRSTFRAME"],
-            ["LASTFRAME", "HEADER", "LASTFRAME"]
-        ])
-
-        # Path Subs
-        write("Path_Subs.csv", [
-            ["Mac_Root", "Win_Root", "Linux_Root", "cloud"],
-            ["/Volumes/jobs", "J:", "/mnt/jobs", "{aws_config}"]
-        ])
-
-        # Naming Templates
-        write("Naming_Templates.csv", [
-            ["Key", "Value"],
-            ["scan_name_template", "SHOTNAME_plate_vHEROPLATE"]
-        ])
-
-        # NOTES CONFIG (Scoped) ---
-        write("Notes_Config.csv", [
-            ["Key", "Key_Type", "Value"],
-            # Global Logic
-            ["substitute_unresolved_vars", "main", "True"],
-            ["unresolved_vars_default_string", "main", "default"],
-            
-            # Roots (The Starting Points)
-            ["default", "root", "{data_root}"],
-            ["client", "root", "{s3_PROJECT_CLIENTNAME_config}"],
-            
-            # Trees (The Directory Structures)
-            ["default", "tree", "notes/{SHOTNAME}"],
-            ["sequence_shot_task_user", "tree", "{SEQUENCE}/{SHOTNAME}/{TASK}/{USER}"],
-            ["client", "tree", "prod/client/.notes/{SEQUENCE}/{SHOTNAME}/{TASK}/{USER}"],
-            
-            # Names (The File Conventions)
-            ["default", "name", "note_{TIMESTAMP}"],
-            ["client", "name", "note_CLIENTNAME_{TIMESTAMP}"]
-        ])
-
-        # Shots Template
-        write("Shots_Template.csv", [
-            ["SEQUENCE", "PROCESS", "SHOTNAME", "ALTSHOTNAME", "FIRSTFRAME", "LASTFRAME", "HEROPLATE"],
-            ["abc_001", "0", "job_001_abc_0010", "abc_001_0010", "1001", "1100", "001"]
-        ])
-
-        # Nuke Nested Configs
-        nuke_base = "Media_Actions/Nuke"
-        write(f"{nuke_base}/win.csv", [
-            ["Key", "Value"],
-            ["bin", "G:/Program Files/Nuke16.0v6/Nuke16.0.exe"],
-            ["flags", "--nukex, -m 18"]
-            #["env", "OCIO=Z:/config/aces_1.2/config.ocio"],
-            #["env", "NUKE_PATH=Z:/pipeline/nuke"]
-        ])
-        write(f"{nuke_base}/mac.csv", [
-            ["Key", "Value"],
-            ["bin", "/Applications/Nuke16.0v6/Nuke16.0v6.app/Contents/MacOS/Nuke16.0"],
-            ["flags", "--nukex"]
-            # ["env", "OCIO=/Volumes/jobs/config/aces_1.2/config.ocio"]
-        ])
-        write(f"{nuke_base}/linux.csv", [
-            ["Key", "Value"],
-            ["bin", "/opt/Nuke16.0v6/Nuke16.0"],
-            ["flags", "--nukex"]
-        ])
-
-        # RV Nested Configs
-        rv_base = "Media_Actions/RV"
-        write(f"{rv_base}/win.csv", [
-            ["Key", "Value"],
-            ["bin", "C:/Program Files/OpenRV-win/bin/rv.exe"],
-            ["flags", ""]
-        ])
-        write(f"{rv_base}/mac.csv", [
-            ["Key", "Value"],
-            ["bin", "/Applications/RV.app/Contents/MacOS/RV"],
-            ["flags", ""],
-            ["env", "/Users/uel/Dasein/daseinVfxPipe/aces_1.2/config.ocio"]
-        ])
-        write(f"{rv_base}/linux.csv", [
-            ["Key", "Value"],
-            ["bin", "/opt/RV/bin/rv"],
-            ["flags", ""],
-            ["env", "/Users/uel/Dasein/daseinVfxPipe/aces_1.2/config.ocio"]
-        ])
-
-    def write_csv(self, path, rows):
-        """Standard helper to actually touch the disk."""
-        import csv
-        with open(path, 'w', newline='', encoding='utf-8') as f:
-            writer = csv.writer(f)
-            writer.writerows(rows)
 
 class ProjectLauncherDialog(QDialog):
     def __init__(self):
@@ -2672,99 +2403,102 @@ class Scraper(QObject):
     progress = Signal(int)
     finished = Signal()
 
-    def __init__(self, root_dir, output_csv, blacklist_str=""):
+    def __init__(self, roots_list, output_dir, blacklist_str=""):
         super().__init__()
-        self.root_dir = os.path.normpath(PathSwapper.translate(root_dir))
-        self.output_csv = PathSwapper.translate(output_csv)
-        # Convert comma-separated string into a clean list of normalized paths
-        self.blacklist = [os.path.normpath(p.strip()) for p in blacklist_str.split(',') if p.strip()]
+        # List of [name, path] tuples
+        self.roots_list = roots_list 
+        self.output_dir = PathSwapper.translate(output_dir)
         
+        self.blacklist = [os.path.normpath(p.strip()) for p in blacklist_str.split(',') if p.strip()]
         self.ext_singles = {".nk", ".mov", ".mp4", ".ods", ".zip"}
         self.ext_sequences = {".exr", ".jpg", ".png", ".tiff", ".dpx"}
 
     def run(self):
-        potential_sequences = defaultdict(list)
-        final_rows = []
-        
-        # --- INITIALIZE COUNTERS FIRST ---
+        # 1. PRE-FLIGHT: Validate roots and count total directories for the single progress bar
+        valid_roots = []
+        total_dirs = 0
+        for name, r_path in self.roots_list:
+            clean_root = os.path.normpath(PathSwapper.translate(r_path))
+            if os.path.exists(clean_root):
+                valid_roots.append((name, clean_root))
+                total_dirs += sum([len(dirs) for _, dirs, _ in os.walk(clean_root)])
+                
         processed_dirs = 0
-        # Quick estimate for progress bar
-        total_dirs = sum([len(dirs) for _, dirs, _ in os.walk(self.root_dir)])
-        
-        # Pre-normalize blacklist for speed
         clean_blacklist = [p.lower() for p in self.blacklist]
 
-        for root, dirs, files in os.walk(self.root_dir):
-            # --- THE BLACKLIST PRUNING ---
-            # Modify 'dirs' in-place so os.walk doesn't enter these folders
-            for d in list(dirs):
-                full_dir_path = os.path.normpath(os.path.join(root, d))
-                # Check if just the folder name or the full path is blacklisted
-                if d.lower() in clean_blacklist or full_dir_path.lower() in clean_blacklist:
-                    dirs.remove(d)
+        # Ensure output directory exists once
+        if self.output_dir and not os.path.exists(self.output_dir):
+            os.makedirs(self.output_dir, exist_ok=True)
+
+        # 2. THE MAIN LOOP: Iterate over each valid root
+        for root_name, current_root_dir in valid_roots:
+            potential_sequences = defaultdict(list)
+            final_rows = []
             
-            # --- UPDATE PROGRESS ---
-            processed_dirs += 1
-            self.progress.emit(int((processed_dirs / (total_dirs + 1)) * 100))
-            
-            local_p = self.get_local_path(root)
-            
-            for f in files:
-                ext = os.path.splitext(f)[1].lower()
-                full_path = os.path.join(root, f)
-                if ext in self.ext_singles:
-                    stat = os.stat(full_path)
-                    # 1. Keeping full filename (f) instead of fname_no_ext
-                    final_rows.append(self.format_row(root, local_p, f, ext, "-", "-", stat.st_ctime, stat.st_mtime))
-                elif ext in self.ext_sequences:
-                    match = re.search(r'^(.*?)([._])(\d+)(\.[^.]+)$', f)
-                    if match:
-                        prefix, separator, frame, extension = match.groups()
-                        potential_sequences[(root, local_p, prefix, separator, extension)].append({
-                            "frame": int(frame), "pad": len(frame), "path": full_path, "original_name": f
-                        })
-                    else:
+            for root, dirs, files in os.walk(current_root_dir):
+                # --- THE BLACKLIST PRUNING ---
+                for d in list(dirs):
+                    full_dir_path = os.path.normpath(os.path.join(root, d))
+                    if d.lower() in clean_blacklist or full_dir_path.lower() in clean_blacklist:
+                        dirs.remove(d)
+                
+                # --- UPDATE PROGRESS ---
+                processed_dirs += 1
+                self.progress.emit(int((processed_dirs / (total_dirs + 1)) * 100))
+                
+                # Use current_root_dir to calculate relative path
+                local_p = self.get_local_path(root, current_root_dir)
+                
+                for f in files:
+                    ext = os.path.splitext(f)[1].lower()
+                    full_path = os.path.join(root, f)
+                    if ext in self.ext_singles:
                         stat = os.stat(full_path)
-                        # 1. Keeping full filename (f) instead of fname_no_ext
                         final_rows.append(self.format_row(root, local_p, f, ext, "-", "-", stat.st_ctime, stat.st_mtime))
+                    elif ext in self.ext_sequences:
+                        match = re.search(r'^(.*?)([._])(\d+)(\.[^.]+)$', f)
+                        if match:
+                            prefix, separator, frame, extension = match.groups()
+                            potential_sequences[(root, local_p, prefix, separator, extension)].append({
+                                "frame": int(frame), "pad": len(frame), "path": full_path, "original_name": f
+                            })
+                        else:
+                            stat = os.stat(full_path)
+                            final_rows.append(self.format_row(root, local_p, f, ext, "-", "-", stat.st_ctime, stat.st_mtime))
 
-        for (folder, local_folder, prefix, separator, ext), items in potential_sequences.items():
-            if len(items) > 1:
-                items.sort(key=lambda x: x["frame"])
-                all_stats = [os.stat(i["path"]) for i in items]
-                # Sequence format remains the same as it's already a 'full' name logic
-                formatted_name = f"{prefix}{separator}%0{items[0]['pad']}d{ext}"
-                final_rows.append(self.format_row(folder, local_folder, formatted_name, ext, min(i["frame"] for i in items), max(i["frame"] for i in items), 
-                                                min(s.st_ctime for s in all_stats), max(s.st_mtime for s in all_stats)))
-            else:
-                item = items[0]
-                stat = os.stat(item["path"])
-                # 1. Keeping full filename (original_name) instead of fname_no_ext
-                final_rows.append(self.format_row(folder, local_folder, item["original_name"], ext, "-", "-", stat.st_ctime, stat.st_mtime))
+            # --- PROCESS SEQUENCES ---
+            for (folder, local_folder, prefix, separator, ext), items in potential_sequences.items():
+                if len(items) > 1:
+                    items.sort(key=lambda x: x["frame"])
+                    all_stats = [os.stat(i["path"]) for i in items]
+                    formatted_name = f"{prefix}{separator}%0{items[0]['pad']}d{ext}"
+                    final_rows.append(self.format_row(folder, local_folder, formatted_name, ext, min(i["frame"] for i in items), max(i["frame"] for i in items), 
+                                                    min(s.st_ctime for s in all_stats), max(s.st_mtime for s in all_stats)))
+                else:
+                    item = items[0]
+                    stat = os.stat(item["path"])
+                    final_rows.append(self.format_row(folder, local_folder, item["original_name"], ext, "-", "-", stat.st_ctime, stat.st_mtime))
 
-        # --- NEW: Safely ensure the destination folder exists! ---
-        out_dir = os.path.dirname(self.output_csv)
-        if out_dir and not os.path.exists(out_dir):
-            os.makedirs(out_dir, exist_ok=True)
-
-        # 2. Add LOCALPATH to headers
-        headers = ["ABSPATH", "LOCALPATH", "FILENAME", "FILETYPE", "FIRST", "LAST", "CREATION", "MODDATE"]
-        with open(self.output_csv, "w", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=headers)
-            writer.writeheader()
-            writer.writerows(final_rows)
+            # --- 3. WRITE THE ISOLATED CSV ---
+            output_csv = os.path.join(self.output_dir, f"{root_name}.csv")
+            headers = ["ABSPATH", "LOCALPATH", "FILENAME", "FILETYPE", "FIRST", "LAST", "CREATION", "MODDATE"]
+            
+            with open(output_csv, "w", newline="", encoding='cp1252') as f:
+                writer = csv.DictWriter(f, fieldnames=headers)
+                writer.writeheader()
+                writer.writerows(final_rows)
+                
         self.finished.emit()
 
-    def get_local_path(self, full_root):
-        """Surgical removal of root_dir from the ABSPATH."""
-        # Calculate the relative path from the root
-        rel = os.path.relpath(full_root, self.root_dir)
+    def get_local_path(self, full_root, base_dir):
+        """Surgical removal of current base_dir from the ABSPATH."""
+        rel = os.path.relpath(full_root, base_dir)
         return "" if rel == "." else rel
 
     def format_row(self, root, local_root, name, ext, first, last, ctime, mtime):
         return {
             "ABSPATH": root, 
-            "LOCALPATH": local_root, # 2. New Column
+            "LOCALPATH": local_root,
             "FILENAME": name, 
             "FILETYPE": ext.lstrip('.'),
             "FIRST": first, "LAST": last,
@@ -2877,22 +2611,52 @@ class UpdateScrapeDialog(QDialog):
         self.setMinimumWidth(450)
         layout = QVBoxLayout(self)
 
-        # Pull paths
-        root_raw = str(self.engine.settings.get('data_root', ''))
-        csv_raw = str(self.engine.settings.get('catalog_csv', ''))
+        # 1. PARSE THE DATA ROOTS
+        raw_dr = str(self.engine.settings.get('data_root_raw', ''))
+        self.roots_list = []
+        try:
+            import json
+            parsed_dr = json.loads(raw_dr)
+            if isinstance(parsed_dr, list):
+                for item in parsed_dr:
+                    if isinstance(item, list) and len(item) >= 2:
+                        self.roots_list.append((str(item[0]), str(item[1])))
+        except:
+            # Legacy flat string fallback
+            flat_root = str(self.engine.settings.get('data_root', ''))
+            if flat_root:
+                self.roots_list.append(("default", flat_root))
 
-        # SMART FALLBACK: If the path is empty, suggest one in the project root
-        if not csv_raw or csv_raw == "" or csv_raw == "nan":
-            csv_raw = os.path.join(self.engine.root, "filesystem_catalog.csv")
-            # Make it sticky in memory for this session
-            self.engine.settings['catalog_csv'] = csv_raw
+        # 2. RESOLVE THE CATALOG DIRECTORY
+        cat_dir_raw = str(self.engine.settings.get('catalog_dir', '')).strip()
+        if not cat_dir_raw or cat_dir_raw == "nan":
+            # Fallback to the parent of the old catalog_csv
+            csv_raw = str(self.engine.settings.get('catalog_csv', '')).strip()
+            if csv_raw and csv_raw != "nan" and csv_raw.lower().endswith('.csv'):
+                cat_dir_raw = os.path.dirname(csv_raw)
+            else:
+                cat_dir_raw = self.engine.root # Fallback to _pipe_config
+                
+            self.engine.settings['catalog_dir'] = cat_dir_raw
 
-        self.root_dir = PathSwapper.translate(root_raw)
-        self.output_csv = PathSwapper.translate(csv_raw)
+        # Translate the base path and blindly append 'catalogs'
+        base_output_dir = PathSwapper.translate(cat_dir_raw)
+        self.output_dir = os.path.join(base_output_dir, "catalogs")
 
-        layout.addWidget(QLabel("<b>Ready to update data using current settings:</b><br>"))
-        layout.addWidget(QLabel(f"<b>From:</b> {self.root_dir}"))
-        layout.addWidget(QLabel(f"<b>To:</b> {self.output_csv}<br>"))
+        # 3. BUILD THE UI PREVIEW
+        layout.addWidget(QLabel("<b>Ready to update data from the following roots:</b>"))
+        
+        roots_text = ""
+        for name, path in self.roots_list:
+            roots_text += f"• <b>{name}</b>: {path}<br>"
+        if not roots_text:
+            roots_text = "<i>No data roots configured.</i>"
+            
+        lbl_roots = QLabel(roots_text)
+        lbl_roots.setStyleSheet("padding-left: 10px; color: #aaa;")
+        layout.addWidget(lbl_roots)
+        
+        layout.addWidget(QLabel(f"<br><b>To Catalog Directory:</b><br>{self.output_dir}<br>"))
 
         self.pbar = QProgressBar()
         self.pbar.setVisible(False)
@@ -2900,28 +2664,24 @@ class UpdateScrapeDialog(QDialog):
 
         self.buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         self.buttons.button(QDialogButtonBox.Ok).setText("Proceed")
+        
+        if not self.roots_list:
+            self.buttons.button(QDialogButtonBox.Ok).setEnabled(False)
+            
         self.buttons.accepted.connect(self.start_scrape)
         self.buttons.rejected.connect(self.reject)
         layout.addWidget(self.buttons)
 
     def start_scrape(self):
-        if not os.path.exists(self.root_dir):
-            from PySide6.QtWidgets import QMessageBox
-            QMessageBox.warning(self, "Path Not Found", f"The root directory does not exist:\n{self.root_dir}")
-            self.reject()
-            return
-
+        # We don't check os.path.exists here anymore, as the Scraper does a pre-flight check internally
         self.pbar.setVisible(True)
         self.buttons.setEnabled(False)
         
-        # --- THE SURGICAL FIX ---
-        # Pull the blacklist string from engine settings
         blacklist_val = str(self.engine.settings.get('scrape_blacklist', ''))
         
         self.thread = QThread()
-        # Pass the blacklist to the Scraper worker
-        self.worker = Scraper(self.root_dir, self.output_csv, blacklist_str=blacklist_val)
-        # ------------------------
+        # Pass the parsed roots list and output directory
+        self.worker = Scraper(self.roots_list, self.output_dir, blacklist_str=blacklist_val)
         
         self.worker.moveToThread(self.thread)
         self.thread.started.connect(self.worker.run)
@@ -2935,11 +2695,10 @@ class UpdateScrapeDialog(QDialog):
         self.accept()
 
     def closeEvent(self, event):
-        """Intercepts the 'X' button to prevent thread assassination."""
         if hasattr(self, 'thread') and self.thread.isRunning():
             from PySide6.QtWidgets import QMessageBox
             QMessageBox.warning(self, "Scrape in Progress", "Please wait for the scrape to finish before closing.")
-            event.ignore() # Blocks the window from closing
+            event.ignore() 
         else:
             event.accept()
 
@@ -4692,6 +4451,277 @@ class ConfigHub(QDialog):
     def exec_(self):
         return super().exec_()
 
+class ConfigEngine:
+    def __init__(self, root_path, bootstrap=False):
+        self.root = os.path.abspath(os.path.normpath(root_path))
+        self.apps_dir = os.path.join(self.root, "Media_Actions")
+        
+        # Existing logic preserved: bootstrap if requested OR if Media_Actions is missing
+        if bootstrap or not os.path.exists(self.apps_dir):
+            # No arguments needed here; it will default to self.root and 'create' mode
+            self.bootstrap_template()
+            
+        self.pathsubs = self._load_flat_csv("Path_Subs.csv")
+        # Global Injection
+        PathSwapper.PATHSUBS = self.pathsubs
+
+        # Load and SWAP settings immediately
+        raw = self._load_kv_csv("Project_Settings.csv")
+        self.settings = {k: PathSwapper.translate(str(v)) if ("/" in str(v) or "\\" in str(v)) else v 
+                         for k, v in raw.items()}
+
+        # --- THE MULTI-ROOT INTERCEPTOR ---
+        if 'data_root' in self.settings:
+            raw_dr = str(self.settings['data_root']).strip()
+            
+            # 1. Store the untouched payload for future multi-root scrapers
+            self.settings['data_root_raw'] = raw_dr 
+
+            # 2. Try to extract the first tuple's path for primary pipeline write actions
+            try:
+                import json
+                dr_list = json.loads(raw_dr)
+                
+                if isinstance(dr_list, list) and len(dr_list) > 0:
+                    first_item = dr_list[0]
+                    # We expect format: [["name", "/path"], ["name2", "/path2"]]
+                    if isinstance(first_item, (list, tuple)) and len(first_item) >= 2:
+                        self.settings['data_root'] = str(first_item[1])
+            except Exception:
+                # It's a legacy flat string (e.g. "/Volumes/jobs"). 
+                # Do nothing, leave self.settings['data_root'] exactly as it is!
+                pass
+                
+        self.apps = self._discover_apps()
+        # Load Naming Templates
+        self.naming_templates = self._load_kv_csv("Naming_Templates.csv")
+
+    def _load_kv_csv(self, filename):
+        path = os.path.join(self.root, filename)
+        if not os.path.exists(path): return {}
+        try:
+            # ADDED: dtype=str to keep padding in settings
+            df = pd.read_csv(path, encoding='cp1252', dtype=str).fillna("")
+            return dict(zip(df['Key'], df['Value']))
+        except Exception as e:
+            print(f"Error loading {filename}: {e}")
+            return {}
+
+    def _load_flat_csv(self, filename):
+        path = os.path.join(self.root, filename)
+        if not os.path.exists(path): return []
+        try: 
+            df = pd.read_csv(path, encoding='cp1252', dtype=str).fillna("")
+            
+            # --- CRITICAL: Capture the headers for the PathSwapper ---
+            if filename == "Path_Subs.csv":
+                PathSwapper.HEADERS = df.columns.tolist()
+                
+            return df.values.tolist()
+        except: 
+            return []
+
+    def _discover_apps(self):
+        """Discovers apps by folder name and loads the OS-specific CSV."""
+        apps = {}
+        if not os.path.exists(self.apps_dir): return {}
+        
+        # Determine our current OS label for the sub-folder search
+        plat_folder = "win" if sys.platform == "win32" else "mac" if sys.platform == "darwin" else "linux"
+        
+        # Look at each directory in Media_Actions (e.g., /Nuke, /RV)
+        for app_name in os.listdir(self.apps_dir):
+            app_path = os.path.join(self.apps_dir, app_name)
+            if os.path.isdir(app_path):
+                # Look for the specific OS csv inside that folder
+                os_csv = os.path.join(app_path, f"{plat_folder}.csv")
+                if os.path.exists(os_csv):
+                    # Load the Key/Value pairs for this specific OS
+                    apps[app_name] = self._load_kv_csv_multi(os_csv)
+        return apps
+
+    def _load_kv_csv_multi(self, path):
+        """Modified loader to allow multiple rows with the same Key (for 'env')."""
+        data = defaultdict(list)
+        try:
+            df = pd.read_csv(path, encoding='cp1252').fillna("")
+            for _, row in df.iterrows():
+                data[str(row['Key'])].append(str(row['Value']))
+            return dict(data)
+        except Exception as e:
+            print(f"Error loading {path}: {e}")
+            return {}
+
+    def bootstrap_template(self, target_dir=None, mode='create'):
+        if target_dir is None:
+            target_dir = self.root
+
+        def write(filename, rows):
+            path = os.path.join(target_dir, filename)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            
+            # --- MODE: CREATE ---
+            if mode == 'create' or not os.path.exists(path):
+                self.write_csv(path, rows)
+                return
+
+            # --- MODE: SYNC (The Additive Logic) ---
+            if mode == 'sync' and os.path.exists(path):
+                try:
+                    # 1. Load the existing file
+                    existing_df = pd.read_csv(path, dtype=str).fillna("")
+                    # 2. Convert bootstrapper rows to a DF for comparison
+                    incoming_df = pd.DataFrame(rows[1:], columns=rows[0]).astype(str)
+                    
+                    # 3. Identify the "Key" column (usually Col 0)
+                    key_col = rows[0][0]
+                    
+                    # 4. Find what's in the bootstrapper but NOT in the file
+                    existing_keys = set(existing_df[key_col].tolist())
+                    missing_rows = incoming_df[~incoming_df[key_col].isin(existing_keys)]
+                    
+                    if not missing_rows.empty:
+                        # 5. Append only the missing variables to the end
+                        updated_df = pd.concat([existing_df, missing_rows], ignore_index=True)
+                        updated_df.to_csv(path, index=False)
+                        # print(f"Synced {len(missing_rows)} new keys to {filename}")
+                except Exception as e:
+                    print(f"Failed to sync {filename}: {e}")
+
+        # Project Settings
+        write("Project_Settings.csv", [
+            ["Key", "Value"],
+            ["data_root", "/your/job/directory"],
+            ["catalog_dir", ""],
+            ["shots_csv", "Shots_Template.csv"],
+            ["dual_name", "False"],
+            ["submission_types", "WIP, Final Pending QC, Final QC Approved"], # <--- NEW
+            ["status_options", "Ready for Review, Needs Update, Approved, RTS, Pending"],
+            ["submission_csv_headers", "LOCALPATH,SHOTNAME,FILENAME,FIRST,LAST,SUBNOTES,SUBTYPE"],
+            ["submission_review_headers", "LOCALPATH,SHOTNAME,FILENAME,FIRST,LAST,SUBTYPE,SUBNOTES"],
+            ["playlist_review_headers", "LOCALPATH,SHOTNAME,FILENAME,FIRST,LAST,SUBNOTES"],
+            ["scrape_blacklist", ".trash, .snapshot, _thumbs"],
+            ["padding_default", "4"],
+            ["padding_scans", "4"],
+            ["padding_renders", "4"]
+        ])
+        
+        # --- NEW: Project Actions (Nuke Folder-Based Structure) ---
+        nuke_root = "Project_Actions/Nuke"
+        
+        # 1. THE MASTER INDEX (Just IDs now)
+        write(f"{nuke_root}/nuke_templates.csv", [
+            ["Template_ID"],
+            ["read_write_setup"]
+        ])
+
+        # 2. THE SPECIFIC TEMPLATE SUBDIRECTORY
+        rw_dir = f"{nuke_root}/read_write_setup"
+        
+        # 3. THE CONFIG CSV (Paths)
+        write(f"{rw_dir}/config.csv", [
+            ["Key", "Value"],
+            ["Source_NK", ""],
+            ["Output_Template_path", "{data_root}/{SEQUENCE}/{SHOTNAME}/nuke/{SHOTNAME}"],
+            ["Output_Template_file", "{SHOTNAME}_comp_v001.nk"],
+            ["nuke_comp_render_path", "{data_root}/comp/{ALTSHOTNAME}/{ALTSHOTNAME}_comp_v001"],
+            ["nuke_comp_render_filename", "{ALTSHOTNAME}_comp_v001.{padding_default}.exr"]
+        ])
+
+        # 4. THE MAPPING CSV (Variables)
+        write(f"{rw_dir}/mapping.csv", [
+            ["Variable", "Source_Type", "Lookup_Key"],
+            ["FIRSTFRAME", "HEADER", "FIRSTFRAME"],
+            ["LASTFRAME", "HEADER", "LASTFRAME"]
+        ])
+
+        # Path Subs
+        write("Path_Subs.csv", [
+            ["Mac_Root", "Win_Root", "Linux_Root", "cloud"],
+            ["/Volumes/jobs", "J:", "/mnt/jobs", "{aws_config}"]
+        ])
+
+        # Naming Templates
+        write("Naming_Templates.csv", [
+            ["Key", "Value"],
+            ["scan_name_template", "SHOTNAME_plate_vHEROPLATE"]
+        ])
+
+        # NOTES CONFIG (Scoped) ---
+        write("Notes_Config.csv", [
+            ["Key", "Key_Type", "Value"],
+            # Global Logic
+            ["substitute_unresolved_vars", "main", "True"],
+            ["unresolved_vars_default_string", "main", "default"],
+            
+            # Roots (The Starting Points)
+            ["default", "root", "{data_root}"],
+            ["client", "root", "{s3_PROJECT_CLIENTNAME_config}"],
+            
+            # Trees (The Directory Structures)
+            ["default", "tree", "notes/{SHOTNAME}"],
+            ["sequence_shot_task_user", "tree", "{SEQUENCE}/{SHOTNAME}/{TASK}/{USER}"],
+            ["client", "tree", "prod/client/.notes/{SEQUENCE}/{SHOTNAME}/{TASK}/{USER}"],
+            
+            # Names (The File Conventions)
+            ["default", "name", "note_{TIMESTAMP}"],
+            ["client", "name", "note_CLIENTNAME_{TIMESTAMP}"]
+        ])
+
+        # Shots Template
+        write("Shots_Template.csv", [
+            ["SEQUENCE", "PROCESS", "SHOTNAME", "ALTSHOTNAME", "FIRSTFRAME", "LASTFRAME", "HEROPLATE"],
+            ["abc_001", "0", "job_001_abc_0010", "abc_001_0010", "1001", "1100", "001"]
+        ])
+
+        # Nuke Nested Configs
+        nuke_base = "Media_Actions/Nuke"
+        write(f"{nuke_base}/win.csv", [
+            ["Key", "Value"],
+            ["bin", "G:/Program Files/Nuke16.0v6/Nuke16.0.exe"],
+            ["flags", "--nukex, -m 18"]
+            #["env", "OCIO=Z:/config/aces_1.2/config.ocio"],
+            #["env", "NUKE_PATH=Z:/pipeline/nuke"]
+        ])
+        write(f"{nuke_base}/mac.csv", [
+            ["Key", "Value"],
+            ["bin", "/Applications/Nuke16.0v6/Nuke16.0v6.app/Contents/MacOS/Nuke16.0"],
+            ["flags", "--nukex"]
+            # ["env", "OCIO=/Volumes/jobs/config/aces_1.2/config.ocio"]
+        ])
+        write(f"{nuke_base}/linux.csv", [
+            ["Key", "Value"],
+            ["bin", "/opt/Nuke16.0v6/Nuke16.0"],
+            ["flags", "--nukex"]
+        ])
+
+        # RV Nested Configs
+        rv_base = "Media_Actions/RV"
+        write(f"{rv_base}/win.csv", [
+            ["Key", "Value"],
+            ["bin", "C:/Program Files/OpenRV-win/bin/rv.exe"],
+            ["flags", ""]
+        ])
+        write(f"{rv_base}/mac.csv", [
+            ["Key", "Value"],
+            ["bin", "/Applications/RV.app/Contents/MacOS/RV"],
+            ["flags", ""],
+            ["env", "/Users/uel/Dasein/daseinVfxPipe/aces_1.2/config.ocio"]
+        ])
+        write(f"{rv_base}/linux.csv", [
+            ["Key", "Value"],
+            ["bin", "/opt/RV/bin/rv"],
+            ["flags", ""],
+            ["env", "/Users/uel/Dasein/daseinVfxPipe/aces_1.2/config.ocio"]
+        ])
+
+    def write_csv(self, path, rows):
+        """Standard helper to actually touch the disk."""
+        import csv
+        with open(path, 'w', newline='', encoding='utf-8') as f:
+            writer = csv.writer(f)
+            writer.writerows(rows)
+
 class CatalogProvider:
     """
     The dedicated bridge for fetching raw catalog data. 
@@ -5885,7 +5915,11 @@ class AssetManager(QMainWindow):
         s_path = PathSwapper.translate(raw_s)
 
         # 1. Catalog Loading
-        if m_path and m_path != "." and os.path.exists(m_path):
+        ui_order = ["LOCALPATH", "FILENAME", "FILETYPE", "FIRST", "LAST", "SUBSTATUS", "SUBSENT", 
+                    "SEQUENCE", "SHOTNAME", "ALTSHOTNAME", "CREATION", "MODDATE", "ABSPATH", "HAS_SHOT", "FILE_ID", "UUID"]
+
+        # SURGICAL FIX 1: Use os.path.isfile instead of os.path.exists so directories instantly fall to the 'else' block
+        if m_path and m_path != "." and os.path.isfile(m_path):
             try:
                 self.main_model.beginResetModel()
                 df_new = pd.read_csv(m_path, encoding='cp1252')
@@ -5896,23 +5930,20 @@ class AssetManager(QMainWindow):
                 for c in ["SUBSTATUS", "SUBSENT", "HAS_SHOT", "SHOTNAME", "ALTSHOTNAME"]: 
                     if c not in df_new.columns: df_new[c] = ""
 
-                # Ensure SEQUENCE is in the order for the UI mapping
-                ui_order = ["LOCALPATH", "FILENAME", "FILETYPE", "FIRST", "LAST", "SUBSTATUS", "SUBSENT", 
-                            "SEQUENCE", "SHOTNAME", "ALTSHOTNAME", "CREATION", "MODDATE", "ABSPATH", "HAS_SHOT", "FILE_ID", "UUID"]
-                
                 existing_cols = [c for c in ui_order if c in df_new.columns]
                 self.df_master = df_new[existing_cols]
                 self.main_model._data = self.df_master
                 self.main_model.endResetModel()
             except Exception as e:
                 print(f"DEBUG: Catalog Load Error: {e}")
+                # SURGICAL FIX 2: If the CSV is corrupt, build the skeleton so the UI doesn't crash!
+                self.df_master = pd.DataFrame(columns=ui_order)
+                self.main_model._data = self.df_master
                 self.main_model.endResetModel()
         else:
             self.main_model.beginResetModel()
-            # --- BULLETPROOF FIX: Give the empty DataFrame its skeleton ---
-            ui_order = ["LOCALPATH", "FILENAME", "FILETYPE", "FIRST", "LAST", "SUBSTATUS", "SUBSENT", 
-                        "SEQUENCE", "SHOTNAME", "ALTSHOTNAME", "CREATION", "MODDATE", "ABSPATH", "HAS_SHOT", "FILE_ID", "UUID"]
             self.df_master = pd.DataFrame(columns=ui_order) 
+            self.main_model._data = self.df_master # Ensure the model knows about the skeleton
             self.main_model.endResetModel()
 
         # 2. Shots Loading
