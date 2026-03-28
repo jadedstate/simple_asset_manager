@@ -6,7 +6,7 @@ import json
 import hashlib
 import glob
 from PySide6.QtWidgets import (QApplication, QMainWindow, QTableView, QStyledItemDelegate, QComboBox, QButtonGroup, QStackedWidget,
-                               QVBoxLayout, QHBoxLayout, QPushButton, QFrame, QHeaderView, QTextEdit, QListWidgetItem,
+                               QVBoxLayout, QHBoxLayout, QPushButton, QFrame, QHeaderView, QTextEdit, QListWidgetItem, QTableWidget, QTableWidgetItem,
                                QWidget, QLabel, QLineEdit, QFileDialog, QCheckBox, QDateEdit, QMessageBox, QStyleOptionViewItem,
                                QMenu, QDialog, QProgressBar, QDialogButtonBox, QSplitter, QListWidget, QFormLayout, QScrollArea)
 from PySide6.QtCore import QAbstractTableModel, Qt, QSortFilterProxyModel, QDate, QEvent, QTimer, QObject, Signal, QThread, QModelIndex
@@ -1528,18 +1528,47 @@ class ProjectSettingsEditor(QDialog):
         
         self.inputs = {}
         
-        # Define which keys get a 'Browse' button
-        path_keys = ['catalog_csv', 'shots_csv', 'data_root', 'scrape_blacklist']
+        # --- FIX 1: Removed 'data_root' from this list ---
+        path_keys = ['catalog_csv', 'shots_csv', 'scrape_blacklist']
 
         for key, value in self.engine.settings.items():
-            # --- NEW: Intercept dual_name to make it a Checkbox ---
+            # --- FIX 2: Block memory-only engine variables from entering the UI ---
+            if key in ['data_root_raw', 'data_root_list']:
+                continue
+
+            # --- ORIGINAL: Checkbox Setup ---
             if key == 'dual_name':
                 cb = QCheckBox("Enable dual-name shot matching")
-                # Parse the string as a boolean
                 cb.setChecked(str(value).strip().lower() == 'true')
                 self.inputs[key] = cb
                 form.addRow(QLabel(f"<b>{key}:</b>"), cb)
-                continue # Skip the rest of the loop for this key
+                continue
+
+            # --- FIX 3: The Data_Root Tuple Interceptor ---
+            if key == 'data_root':
+                # Grab the raw JSON string (the engine stores it here for us)
+                raw_val = str(self.engine.settings.get('data_root_raw', value))
+                
+                # Hidden storage for the save function
+                edit = QLineEdit(raw_val)
+                edit.hide()
+                self.inputs[key] = edit
+                
+                # The visual preview
+                preview_lbl = QLabel()
+                preview_lbl.setStyleSheet("color: #aaa; background-color: #2b2b2b; padding: 5px; border-radius: 3px;")
+                self._update_data_root_preview(preview_lbl, raw_val)
+                
+                # The launch button
+                btn_edit = QPushButton("Edit Data Roots...")
+                btn_edit.clicked.connect(lambda chk=False, e=edit, l=preview_lbl: self.open_data_roots_editor(e, l))
+                
+                h_layout = QHBoxLayout()
+                h_layout.addWidget(preview_lbl, stretch=1)
+                h_layout.addWidget(btn_edit)
+                h_layout.addWidget(edit) # Keep in layout so it gets garbage collected cleanly
+                form.addRow(QLabel(f"<b>{key}:</b>"), h_layout)
+                continue
 
             # --- ORIGINAL: Text Editor Setup ---
             edit = SingleLineWrapEdit(str(value))
@@ -1548,11 +1577,9 @@ class ProjectSettingsEditor(QDialog):
             self.inputs[key] = edit
 
             if key in path_keys:
-                # Group Edit + Button
                 h_layout = QHBoxLayout()
                 h_layout.addWidget(edit)
                 btn_browse = QPushButton("Browse...")
-                # Use a lambda that captures the specific 'edit' and 'key'
                 btn_browse.clicked.connect(lambda chk=False, e=edit, k=key: self.browse_path(e, k))
                 h_layout.addWidget(btn_browse)
                 form.addRow(QLabel(f"<b>{key}:</b>"), h_layout)
@@ -1628,12 +1655,38 @@ class ProjectSettingsEditor(QDialog):
                     res += ".csv"
                 edit_widget.setPlainText(res)
 
+    def _update_data_root_preview(self, label, raw_json):
+        import json
+        try:
+            data = json.loads(raw_json)
+            if not data:
+                label.setText("<i>No roots defined</i>")
+                return
+            lines = []
+            for item in data:
+                if isinstance(item, list) and len(item) >= 2:
+                    lines.append(f"<b>{item[0]}</b> - {item[1]}")
+            label.setText("<br>".join(lines))
+        except:
+            label.setText(f"<b>default</b> - {raw_json}")
+
+    def open_data_roots_editor(self, hidden_edit, preview_label):
+        current_data = hidden_edit.text()
+        dlg = DataRootsEditorDialog(current_data, self)
+        
+        if dlg.exec():
+            new_json = dlg.get_serialized_data()
+            hidden_edit.setText(new_json)
+            self._update_data_root_preview(preview_label, new_json)
+
     def save_and_close(self):
         cleaned_data = []
         for key, widget in self.inputs.items():
-            # --- NEW: Check widget type to extract value correctly ---
             if isinstance(widget, QCheckBox):
                 val = "True" if widget.isChecked() else "False"
+            # --- FIX 5: Catch the QLineEdit used by data_root ---
+            elif isinstance(widget, QLineEdit):
+                val = widget.text().strip()
             else:
                 val = widget.toPlainText().replace('\n', '').replace('\r', '').strip().rstrip(',')
             
@@ -1647,6 +1700,102 @@ class ProjectSettingsEditor(QDialog):
         except Exception as e:
             QMessageBox.critical(self, "Save Error", f"Could not write to config:\n{e}")
 
+class DataRootsEditorDialog(QDialog):
+    """Bespoke editor to manage the JSON list of [name, path] tuples for data_root."""
+    def __init__(self, current_data_string="", parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Manage Data Roots")
+        self.resize(600, 300)
+        
+        layout = QVBoxLayout(self)
+        
+        # 1. THE TABLE
+        self.table = QTableWidget(0, 3)
+        self.table.setHorizontalHeaderLabels(["Root ID", "Path", ""])
+        self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
+        self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Fixed)
+        self.table.setColumnWidth(2, 80)
+        layout.addWidget(self.table)
+        
+        # 2. ACTIONS
+        btn_layout = QHBoxLayout()
+        btn_add = QPushButton("+ Add New Root")
+        btn_add.clicked.connect(self.add_empty_row)
+        btn_layout.addWidget(btn_add)
+        btn_layout.addStretch()
+        layout.addLayout(btn_layout)
+        
+        # 3. SAVE / CANCEL
+        btns = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
+        btns.accepted.connect(self.accept)
+        btns.rejected.connect(self.reject)
+        layout.addWidget(btns)
+
+        # 4. LOAD DATA
+        self.load_data(current_data_string)
+
+    def load_data(self, raw_string):
+        """Expects: [["default", "/mnt/jobs"], ["usb", "/Volumes/usb"]]"""
+        self.table.setRowCount(0)
+        if not raw_string: return
+        
+        try:
+            data = json.loads(raw_string)
+            if isinstance(data, list):
+                for item in data:
+                    if isinstance(item, list) and len(item) >= 2:
+                        self.add_row(str(item[0]), str(item[1]))
+                    elif isinstance(item, dict): # Fallback if we accidentally saved dicts
+                        self.add_row(str(item.get('name', '')), str(item.get('path', '')))
+            else:
+                # Absolute legacy fallback
+                self.add_row("default", raw_string)
+        except:
+            # Absolute legacy fallback
+            self.add_row("default", raw_string)
+
+    def add_empty_row(self):
+        self.add_row("new_root", "")
+
+    def add_row(self, name, path):
+        row = self.table.rowCount()
+        self.table.insertRow(row)
+        
+        self.table.setItem(row, 0, QTableWidgetItem(name))
+        self.table.setItem(row, 1, QTableWidgetItem(path))
+        
+        widget = QWidget()
+        h_layout = QHBoxLayout(widget)
+        h_layout.setContentsMargins(2, 2, 2, 2)
+        
+        btn_browse = QPushButton("...")
+        btn_browse.clicked.connect(lambda chk=False, r=row: self.browse_path(r))
+        
+        btn_del = QPushButton("X")
+        btn_del.setStyleSheet("background-color: #882e2e; color: white;")
+        btn_del.clicked.connect(lambda chk=False, r=row: self.table.removeRow(r))
+        
+        h_layout.addWidget(btn_browse)
+        h_layout.addWidget(btn_del)
+        self.table.setCellWidget(row, 2, widget)
+
+    def browse_path(self, row):
+        current_path = self.table.item(row, 1).text()
+        folder = QFileDialog.getExistingDirectory(self, "Select Root Directory", current_path)
+        if folder:
+            self.table.setItem(row, 1, QTableWidgetItem(folder))
+
+    def get_serialized_data(self):
+        """Returns JSON string of strict tuples: [["default", "/path"], ["usb", "/path"]]"""
+        data = []
+        for r in range(self.table.rowCount()):
+            name = self.table.item(r, 0).text().strip()
+            path = self.table.item(r, 1).text().strip()
+            if name and path:
+                data.append([name, path])
+        return json.dumps(data)
+    
 class SingleLineWrapEdit(QTextEdit):
     def __init__(self, text="", parent=None):
         super().__init__(text, parent)
@@ -1683,7 +1832,29 @@ class ConfigEngine:
         raw = self._load_kv_csv("Project_Settings.csv")
         self.settings = {k: PathSwapper.translate(str(v)) if ("/" in str(v) or "\\" in str(v)) else v 
                          for k, v in raw.items()}
-        
+
+        # --- THE MULTI-ROOT INTERCEPTOR ---
+        if 'data_root' in self.settings:
+            raw_dr = str(self.settings['data_root']).strip()
+            
+            # 1. Store the untouched payload for future multi-root scrapers
+            self.settings['data_root_raw'] = raw_dr 
+
+            # 2. Try to extract the first tuple's path for primary pipeline write actions
+            try:
+                import json
+                dr_list = json.loads(raw_dr)
+                
+                if isinstance(dr_list, list) and len(dr_list) > 0:
+                    first_item = dr_list[0]
+                    # We expect format: [["name", "/path"], ["name2", "/path2"]]
+                    if isinstance(first_item, (list, tuple)) and len(first_item) >= 2:
+                        self.settings['data_root'] = str(first_item[1])
+            except Exception:
+                # It's a legacy flat string (e.g. "/Volumes/jobs"). 
+                # Do nothing, leave self.settings['data_root'] exactly as it is!
+                pass
+                
         self.apps = self._discover_apps()
         # Load Naming Templates
         self.naming_templates = self._load_kv_csv("Naming_Templates.csv")
@@ -2611,7 +2782,7 @@ class ScrapeDialog(QDialog):
 
         # 1. Pull current scrape root from config or fallback to a generic mount
         # We use str() to guard against those pesky NaN/float issues
-        conf_root = str(self.engine.settings.get('data_root', '/Volumes/jobs'))
+        conf_root = str(self.engine.settings.get('data_root'))
         conf_csv = str(self.engine.settings.get('catalog_csv', ''))
 
         # Root Folder
