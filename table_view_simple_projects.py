@@ -1816,472 +1816,6 @@ class SingleLineWrapEdit(QTextEdit):
             return
         super().keyPressEvent(event)
 
-class ProjectLauncherDialog(QDialog):
-    def __init__(self):
-        super().__init__()
-        self.setWindowTitle("Pipeline Control Center")
-        self.resize(600, 480) # Slight height bump for the new toggle
-        self.active_windows = {} 
-        
-        layout = QVBoxLayout(self)
-
-        # --- ADDITIVE: Lifecycle Filter ---
-        self.check_show_retired = QCheckBox("Show Retired Projects")
-        self.check_show_retired.stateChanged.connect(self._load_projects)
-        
-        layout.addWidget(QLabel("Registered Projects:"))
-        layout.addWidget(self.check_show_retired) # Placed for clear visibility
-        
-        self.list_widget = QListWidget()
-        self.list_widget.doubleClicked.connect(self.launch)
-        layout.addWidget(self.list_widget)
-        
-        # Row for Config/Folder management
-        btn_layout = QHBoxLayout()
-        btn_new = QPushButton("New Project...")
-        btn_new.clicked.connect(self.create_new)
-        
-        self.btn_import = QPushButton("Import Projects...")
-        self.btn_import.clicked.connect(self.action_import_search)
-        
-        btn_edit = QPushButton("Open Config Folder")
-        btn_edit.clicked.connect(self.open_folder)
-        
-        self.btn_update_config = QPushButton("Update Project Config")
-        self.btn_update_config.clicked.connect(self.action_update_config)
-        self.btn_update_config.setStyleSheet("background-color: #3d4c5c; color: #add8e6;")
-        
-        # --- ADDITIVE: Lifecycle Management Button ---
-        self.btn_manage = QPushButton("Manage Project...")
-        self.btn_manage.setStyleSheet("background-color: #5c3d3d; color: #ffbaba;")
-        self.btn_manage.clicked.connect(self.handle_lifecycle)
-        
-        # Building the row
-        btn_layout.addWidget(btn_new)
-        btn_layout.insertWidget(1, self.btn_import)
-        btn_layout.addWidget(btn_edit)
-        btn_layout.addWidget(self.btn_update_config)
-        btn_layout.addWidget(self.btn_manage) # Added to the end of the row
-        btn_layout.addStretch()
-        layout.addLayout(btn_layout)
-
-        # THE LAUNCHER CONTROLS
-        launch_layout = QHBoxLayout()
-        
-        self.btn_launch = QPushButton("Launch Selected Project")
-        self.btn_launch.setStyleSheet("""
-            background-color: #2e885a; 
-            color: white; 
-            font-weight: bold; 
-            height: 45px; 
-            font-size: 14px;
-        """)
-        self.btn_launch.clicked.connect(self.launch)
-        
-        self.btn_exit = QPushButton("Exit App")
-        self.btn_exit.setFixedWidth(100)
-        self.btn_exit.setFixedHeight(45)
-        self.btn_exit.clicked.connect(self.close)
-        
-        launch_layout.addWidget(self.btn_launch)
-        launch_layout.addWidget(self.btn_exit)
-        layout.addLayout(launch_layout)
-
-        # Perform the initial load AFTER UI is wired up
-        self._load_projects()
-
-    def _load_projects(self):
-        self.ledger_path = os.path.normpath(os.path.join(os.path.expanduser("~"), ".pipeconfigroot.csv"))
-        
-        # Ensure Schema (Additive STATUS column)
-        if not os.path.exists(self.ledger_path):
-            pd.DataFrame(columns=["ProjectName", "ConfigPath", "STATUS"]).to_csv(self.ledger_path, index=False)
-        
-        self.df_projects = pd.read_csv(self.ledger_path)
-        
-        if 'STATUS' not in self.df_projects.columns:
-            self.df_projects['STATUS'] = 'Active'
-            self.df_projects.to_csv(self.ledger_path, index=False)
-        
-        self.df_projects['ConfigPath'] = self.df_projects['ConfigPath'].apply(PathSwapper.translate)
-        
-        self.list_widget.clear()
-        
-        # Filtering logic
-        show_retired = hasattr(self, 'check_show_retired') and self.check_show_retired.isChecked()
-        
-        # We store the 'true' dataframe index in the list item's data role to avoid 
-        # index mismatching when filtered
-        for idx, row in self.df_projects.iterrows():
-            status = row.get('STATUS', 'Active')
-            if not show_retired and status == 'Retired':
-                continue
-                
-            display_text = f"{row['ProjectName']} ({row['ConfigPath']})"
-            item = QListWidgetItem(display_text)
-            item.setData(Qt.UserRole, idx) # Store real DF index
-            
-            if status == 'Retired':
-                item.setForeground(QColor(120, 120, 120))
-                item.setText(f"[RETIRED] {display_text}")
-                
-            self.list_widget.addItem(item)
-
-    def handle_lifecycle(self):
-        """Tiered dialog for Retire vs Wipe Config vs Obliterate."""
-        curr_item = self.list_widget.currentItem()
-        if not curr_item: return
-        
-        df_idx = curr_item.data(Qt.UserRole)
-        project_name = self.df_projects.at[df_idx, 'ProjectName']
-        config_path = self.df_projects.at[df_idx, 'ConfigPath']
-        status = self.df_projects.at[df_idx, 'STATUS']
-
-        choice = QMessageBox(self)
-        # --- THE FIX: Force the layout to follow our code order, not the OS ---
-        choice.setOption(QMessageBox.DontUseNativeDialog, True) 
-        
-        choice.setWindowTitle("Project Lifecycle Management")
-        choice.setText(f"Manage Project: {project_name}")
-        
-        # We add them in the EXACT order we want them to appear (Left to Right)
-        label_toggle = "Revive (Active)" if status == "Retired" else "Retire (Hide)"
-        btn_toggle = choice.addButton(label_toggle, QMessageBox.ActionRole)
-        
-        btn_erase_config = choice.addButton("Erase Config (Keep Data)", QMessageBox.ActionRole)
-        
-        btn_delete = choice.addButton("OBLITERATE EVERYTHING", QMessageBox.DestructiveRole)
-        
-        btn_cancel = choice.addButton("Cancel", QMessageBox.RejectRole)
-        
-        # Optional: Set the default focus so you don't accidentally obliterate on Enter
-        choice.setDefaultButton(btn_cancel)
-
-        choice.exec()
-
-        if choice.clickedButton() == btn_toggle:
-            new_status = "Active" if status == "Retired" else "Retired"
-            self.df_projects.at[df_idx, 'STATUS'] = new_status
-            self.df_projects.to_csv(self.ledger_path, index=False)
-            self._load_projects()
-
-        elif choice.clickedButton() == btn_erase_config:
-            self.erase_project_config(df_idx, project_name, config_path)
-
-        elif choice.clickedButton() == btn_delete:
-            self.obliterate_project(df_idx, project_name, config_path)
-
-    def erase_project_config(self, df_idx, name, path):
-        """
-        Surgically removes the Project Folder (parent of _pipe_config) 
-        and the ledger entry, but leaves the 'data_root' data untouched.
-        """
-        # path = .../ProjectName/_pipe_config
-        # project_folder = .../ProjectName/
-        project_folder = os.path.dirname(path)
-
-        msg = QMessageBox(self)
-        msg.setIcon(QMessageBox.Question)
-        msg.setWindowTitle("Erase Project Config & Folder")
-        msg.setText(f"Resetting Project: {name}")
-        msg.setInformativeText(
-            f"This will DELETE the folder:\n{project_folder}\n\n"
-            "This allows you to reuse the name 'test' immediately.\n"
-            "IT WILL NOT TOUCH YOUR ACTUAL SEQUENCE DATA/ROOT."
-        )
-        
-        btn_confirm = msg.addButton("Reset / Erase", QMessageBox.AcceptRole)
-        msg.addButton("Cancel", QMessageBox.RejectRole)
-        
-        msg.exec()
-        if msg.clickedButton() != btn_confirm:
-            return
-
-        try:
-            import shutil
-            # 1. KILL THE PROJECT FOLDER (The one containing _pipe_config)
-            if os.path.exists(project_folder):
-                shutil.rmtree(project_folder)
-            
-            # 2. REMOVE FROM LEDGER
-            self.df_projects = self.df_projects.drop(df_idx)
-            self.df_projects.to_csv(self.ledger_path, index=False)
-            
-            # 3. REFRESH UI
-            self._load_projects()
-            QMessageBox.information(self, "Success", f"Project '{name}' folder and config erased. You can now recreate it.")
-        except Exception as e:
-            QMessageBox.critical(self, "Error", f"Reset failed:\n{e}")
-
-    def obliterate_project(self, df_idx, name, path):
-        """Persistent 'Are you sure?' dialog with Root Discovery and Parent Cleanup."""
-        
-        # path = .../ProjectName/_pipe_config
-        # project_folder = .../ProjectName/
-        project_folder = os.path.dirname(path)
-        
-        settings_path = os.path.join(path, "Project_Settings.csv")
-        data_root = None
-        
-        if os.path.exists(settings_path):
-            try:
-                set_df = pd.read_csv(settings_path, dtype=str).fillna("")
-                match = set_df[set_df['Key'] == 'data_root']
-                if not match.empty:
-                    data_root = PathSwapper.translate(match.iloc[0]['Value'])
-            except Exception as e:
-                print(f"Failed to peek at project root: {e}")
-
-        # Target 1: The Data (The 10TB Render Root)
-        target_to_delete = data_root if data_root else project_folder
-
-        msg = QMessageBox(self)
-        msg.setIcon(QMessageBox.Warning)
-        msg.setWindowTitle("!!! PERMANENT DELETION !!!")
-        msg.setText(f"CRITICAL: You are about to delete the entire project:\n\n{target_to_delete}")
-        msg.setInformativeText("This will wipe all data defined in data_root. This is permanent.")
-        
-        btn_browse = msg.addButton("Open Folder to Verify", QMessageBox.ActionRole)
-        btn_abort = msg.addButton("Abort / Cancel", QMessageBox.RejectRole)
-        btn_confirm = msg.addButton("I am certain. Delete it.", QMessageBox.DestructiveRole)
-        
-        while True:
-            msg.exec()
-            clicked = msg.clickedButton()
-
-            if clicked == btn_browse:
-                try:
-                    if sys.platform == "win32": os.startfile(target_to_delete)
-                    else: subprocess.run(["open" if sys.platform == "darwin" else "xdg-open", target_to_delete])
-                except: pass
-                continue 
-
-            if clicked == btn_confirm:
-                final_check = QMessageBox.question(self, "FINAL CONFIRMATION", 
-                    f"Are you 100% absolutely sure you want to wipe '{name}' and ALL its data?",
-                    QMessageBox.Yes | QMessageBox.No)
-                
-                if final_check == QMessageBox.Yes:
-                    try:
-                        import shutil
-                        # 1. KILL THE DATA (The Project Root / Server Data)
-                        if os.path.exists(target_to_delete):
-                            shutil.rmtree(target_to_delete)
-                        
-                        # 2. KILL THE LOCAL PROJECT FOLDER (The one containing _pipe_config)
-                        # We do this even if target_to_delete was different, to clear the 'test' name.
-                        if os.path.exists(project_folder):
-                            shutil.rmtree(project_folder)
-                        
-                        # 3. REMOVE FROM LEDGER
-                        self.df_projects = self.df_projects.drop(df_idx)
-                        self.df_projects.to_csv(self.ledger_path, index=False)
-                        self._load_projects()
-                        
-                        QMessageBox.information(self, "Success", "Project obliterated.")
-                        break 
-                    except Exception as e:
-                        QMessageBox.critical(self, "Error", f"Obliteration failed:\n{e}")
-                        break
-            else:
-                break
-
-    def action_import_search(self):
-        start_dir = QFileDialog.getExistingDirectory(self, "Select Root to Search for Configs", os.path.expanduser("~"))
-        if not start_dir: return
-
-        self.btn_import.setEnabled(False)
-        self.btn_import.setText("Searching...")
-        
-        self.import_thread = ImportWorker(start_dir)
-        self.import_thread.found.connect(self.process_imported_configs)
-        self.import_thread.finished.connect(self.on_import_finished)
-        self.import_thread.start()
-
-    def process_imported_configs(self, config_list):
-        """Merges new configs into the CSV, avoiding duplicates."""
-        if not config_list:
-            QMessageBox.information(self, "Import", "No '_pipe_config' folders found in that directory.")
-            return
-
-        # 1. Load current ledger
-        df_ledger = pd.read_csv(self.ledger_path)
-        
-        # 2. Build new rows, ensuring we use absolute paths
-        new_rows = []
-        for name, path in config_list:
-            abs_path = os.path.abspath(path)
-            # Check if this path is already registered
-            if abs_path not in df_ledger['ConfigPath'].values:
-                new_rows.append({"ProjectName": name, "ConfigPath": abs_path})
-
-        if new_rows:
-            # 3. Concatenate and Save
-            df_new = pd.DataFrame(new_rows)
-            df_updated = pd.concat([df_ledger, df_new], ignore_index=True)
-            df_updated.to_csv(self.ledger_path, index=False)
-            
-            # 4. Refresh the UI
-            self._load_projects()
-            QMessageBox.information(self, "Import Complete", f"Successfully registered {len(new_rows)} new projects.")
-        else:
-            QMessageBox.information(self, "Import", "All discovered projects are already registered.")
-
-    def on_import_finished(self):
-        self.btn_import.setEnabled(True)
-        self.btn_import.setText("Import Projects...")
-
-    def open_folder(self):
-        idx = self.list_widget.currentRow()
-        if idx < 0: return
-        path = self.df_projects.iloc[idx]['ConfigPath']
-        if sys.platform == "win32": os.startfile(path)
-        else: subprocess.run(["open" if sys.platform == "darwin" else "xdg-open", path])
-
-    def create_new(self):
-        dlg = NewProjectDialog(self)
-        if dlg.exec() == QDialog.Accepted:
-            path = dlg.full_config_path
-            name = dlg.project_name
-            
-            # 1. Create the physical directory tree
-            # os.makedirs(path, exist_ok=True) # bootstrap_template handles this
-
-            # 2. Bootstrap (This builds the folders and the CSV templates)
-            ConfigEngine(path, bootstrap=True)
-
-            # 3. Register in the Home Ledger (~/.pipeconfigroot.csv)
-            # We refresh the dataframe from the file first to avoid race conditions
-            self.df_projects = pd.read_csv(self.ledger_path)
-            new_row = pd.DataFrame([{"ProjectName": name, "ConfigPath": path}])
-            self.df_projects = pd.concat([self.df_projects, new_row]).drop_duplicates(subset=['ProjectName'])
-            self.df_projects.to_csv(self.ledger_path, index=False)
-            
-            # 4. Refresh the UI list
-            self._load_projects()
-
-    def action_update_config(self):
-        idx = self.list_widget.currentRow()
-        if idx < 0: return
-        
-        project_path = self.df_projects.iloc[idx]['ConfigPath']
-        
-        # We don't need to 'launch' the engine, just use it to sync
-        # We create a dummy engine instance pointing to the path
-        temp_engine = ConfigEngine(project_path, bootstrap=False) 
-        
-        # Run the sync microsurgery
-        temp_engine.bootstrap_template(target_dir=project_path, mode='sync')
-        
-        QMessageBox.information(self, "Success", "Project config synchronized (Missing files added).")
-
-    def launch(self):
-        idx = self.list_widget.currentRow()
-        if idx < 0: return
-        
-        project_name = self.df_projects.iloc[idx]['ProjectName']
-        config_path = self.df_projects.iloc[idx]['ConfigPath']
-        
-        # --- SURGICAL FIX: Check if the window exists AND isn't wrapped in a dead C++ object ---
-        if config_path in self.active_windows:
-            win = self.active_windows[config_path]
-            try:
-                # This call will fail if the C++ object is deleted
-                win.isVisible() 
-                win.show()
-                win.raise_()
-                win.activateWindow()
-                return
-            except (RuntimeError, AttributeError):
-                # The C++ object is dead; remove the ghost reference and proceed to launch fresh
-                self.active_windows.pop(config_path, None)
-
-        engine = ConfigEngine(config_path)
-        PathSwapper.PATHSUBS = engine.pathsubs
-        
-        m_path = str(engine.settings.get('catalog_csv', ''))
-        s_path = str(engine.settings.get('shots_csv', ''))
-
-        window = AssetManager(
-            master_path=m_path,
-            shot_path=s_path,
-            engine=engine,
-            project_label=project_name
-        )
-        
-        self.active_windows[config_path] = window
-        window.setAttribute(Qt.WA_DeleteOnClose)
-        
-        # This cleanup signal is good, but sometimes the timing is off in PySide; 
-        # the try/except above is the bulletproof backup.
-        window.destroyed.connect(lambda c=config_path: self.active_windows.pop(c, None))
-        
-        window.show()
-
-class NewProjectDialog(QDialog):
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("Create New Project Configuration")
-        self.setMinimumWidth(450)
-        layout = QVBoxLayout(self)
-
-        # Name Input
-        layout.addWidget(QLabel("Project Name:"))
-        self.edit_name = QLineEdit()
-        self.edit_name.setPlaceholderText("e.g. Rage, Dasein, Project_X")
-        layout.addWidget(self.edit_name)
-
-        # Parent Directory Input
-        layout.addWidget(QLabel("Parent Directory (where the config folder will be created):"))
-        h_layout = QHBoxLayout()
-        self.edit_parent = QLineEdit(os.path.expanduser("~"))
-        btn_browse = QPushButton("Browse...")
-        btn_browse.clicked.connect(self.browse_parent)
-        h_layout.addWidget(self.edit_parent)
-        h_layout.addWidget(btn_browse)
-        layout.addLayout(h_layout)
-
-        # Result Path Preview
-        self.label_preview = QLabel("Result: ")
-        self.label_preview.setStyleSheet("color: #888;")
-        layout.addWidget(self.label_preview)
-        self.edit_name.textChanged.connect(self.update_preview)
-        self.edit_parent.textChanged.connect(self.update_preview)
-
-        # Buttons
-        self.buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        self.buttons.accepted.connect(self.validate_and_accept)
-        self.buttons.rejected.connect(self.reject)
-        layout.addWidget(self.buttons)
-
-    def browse_parent(self):
-        res = QFileDialog.getExistingDirectory(self, "Select Parent Directory", self.edit_parent.text())
-        if res: self.edit_parent.setText(res)
-
-    def update_preview(self):
-        full_path = os.path.join(self.edit_parent.text(), self.edit_name.text(), "_pipe_config")
-        self.label_preview.setText(f"Result: {full_path}")
-
-    def validate_and_accept(self):
-        name = self.edit_name.text().strip()
-        parent = self.edit_parent.text().strip()
-        
-        if not name or not parent:
-            return # Maybe add a shake effect or red border here
-
-        # The actual config root we intend to build
-        target_dir = os.path.join(parent, name, "_pipe_config")
-        
-        if os.path.exists(target_dir):
-            from PySide6.QtWidgets import QMessageBox
-            QMessageBox.critical(self, "Path Error", 
-                f"A configuration already exists at:\n{target_dir}\nPlease choose a different name or location.")
-            return
-
-        self.full_config_path = target_dir
-        self.project_name = name
-        self.accept()
-
 class ImportWorker(QThread):
     found = Signal(list) # Emits list of (ProjectName, ConfigPath)
     finished = Signal()
@@ -4552,6 +4086,15 @@ class ConfigEngine:
             print(f"Error loading {path}: {e}")
             return {}
 
+    def get_catalog_path(self, catalog_name):
+        """Resolves a catalog key to a physical CSV path in the data root."""
+        # 1. Grab the catalog_dir (the parent of catalogs) from settings
+        c_dir = PathSwapper.translate(str(self.settings.get('catalog_dir', '')))
+        
+        # 2. Point to the 'catalogs' subfolder within that data root
+        full_path = os.path.join(c_dir, "catalogs", f"{catalog_name}.csv")
+        return os.path.normpath(full_path)
+    
     def bootstrap_template(self, target_dir=None, mode='create'):
         if target_dir is None:
             target_dir = self.root
@@ -4722,35 +4265,514 @@ class ConfigEngine:
             writer = csv.writer(f)
             writer.writerows(rows)
 
+class ProjectLauncherDialog(QDialog):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Pipeline Control Center")
+        self.resize(600, 480) # Slight height bump for the new toggle
+        self.active_windows = {} 
+        
+        layout = QVBoxLayout(self)
+
+        # --- ADDITIVE: Lifecycle Filter ---
+        self.check_show_retired = QCheckBox("Show Retired Projects")
+        self.check_show_retired.stateChanged.connect(self._load_projects)
+        
+        layout.addWidget(QLabel("Registered Projects:"))
+        layout.addWidget(self.check_show_retired) # Placed for clear visibility
+        
+        self.list_widget = QListWidget()
+        self.list_widget.doubleClicked.connect(self.launch)
+        layout.addWidget(self.list_widget)
+        
+        # Row for Config/Folder management
+        btn_layout = QHBoxLayout()
+        btn_new = QPushButton("New Project...")
+        btn_new.clicked.connect(self.create_new)
+        
+        self.btn_import = QPushButton("Import Projects...")
+        self.btn_import.clicked.connect(self.action_import_search)
+        
+        btn_edit = QPushButton("Open Config Folder")
+        btn_edit.clicked.connect(self.open_folder)
+        
+        self.btn_update_config = QPushButton("Update Project Config")
+        self.btn_update_config.clicked.connect(self.action_update_config)
+        self.btn_update_config.setStyleSheet("background-color: #3d4c5c; color: #add8e6;")
+        
+        # --- ADDITIVE: Lifecycle Management Button ---
+        self.btn_manage = QPushButton("Manage Project...")
+        self.btn_manage.setStyleSheet("background-color: #5c3d3d; color: #ffbaba;")
+        self.btn_manage.clicked.connect(self.handle_lifecycle)
+        
+        # Building the row
+        btn_layout.addWidget(btn_new)
+        btn_layout.insertWidget(1, self.btn_import)
+        btn_layout.addWidget(btn_edit)
+        btn_layout.addWidget(self.btn_update_config)
+        btn_layout.addWidget(self.btn_manage) # Added to the end of the row
+        btn_layout.addStretch()
+        layout.addLayout(btn_layout)
+
+        # THE LAUNCHER CONTROLS
+        launch_layout = QHBoxLayout()
+        
+        self.btn_launch = QPushButton("Launch Selected Project")
+        self.btn_launch.setStyleSheet("""
+            background-color: #2e885a; 
+            color: white; 
+            font-weight: bold; 
+            height: 45px; 
+            font-size: 14px;
+        """)
+        self.btn_launch.clicked.connect(self.launch)
+        
+        self.btn_exit = QPushButton("Exit App")
+        self.btn_exit.setFixedWidth(100)
+        self.btn_exit.setFixedHeight(45)
+        self.btn_exit.clicked.connect(self.close)
+        
+        launch_layout.addWidget(self.btn_launch)
+        launch_layout.addWidget(self.btn_exit)
+        layout.addLayout(launch_layout)
+
+        # Perform the initial load AFTER UI is wired up
+        self._load_projects()
+
+    def _load_projects(self):
+        self.ledger_path = os.path.normpath(os.path.join(os.path.expanduser("~"), ".pipeconfigroot.csv"))
+        
+        # Ensure Schema (Additive STATUS column)
+        if not os.path.exists(self.ledger_path):
+            pd.DataFrame(columns=["ProjectName", "ConfigPath", "STATUS"]).to_csv(self.ledger_path, index=False)
+        
+        self.df_projects = pd.read_csv(self.ledger_path)
+        
+        if 'STATUS' not in self.df_projects.columns:
+            self.df_projects['STATUS'] = 'Active'
+            self.df_projects.to_csv(self.ledger_path, index=False)
+        
+        self.df_projects['ConfigPath'] = self.df_projects['ConfigPath'].apply(PathSwapper.translate)
+        
+        self.list_widget.clear()
+        
+        # Filtering logic
+        show_retired = hasattr(self, 'check_show_retired') and self.check_show_retired.isChecked()
+        
+        # We store the 'true' dataframe index in the list item's data role to avoid 
+        # index mismatching when filtered
+        for idx, row in self.df_projects.iterrows():
+            status = row.get('STATUS', 'Active')
+            if not show_retired and status == 'Retired':
+                continue
+                
+            display_text = f"{row['ProjectName']} ({row['ConfigPath']})"
+            item = QListWidgetItem(display_text)
+            item.setData(Qt.UserRole, idx) # Store real DF index
+            
+            if status == 'Retired':
+                item.setForeground(QColor(120, 120, 120))
+                item.setText(f"[RETIRED] {display_text}")
+                
+            self.list_widget.addItem(item)
+
+    def handle_lifecycle(self):
+        """Tiered dialog for Retire vs Wipe Config vs Obliterate."""
+        curr_item = self.list_widget.currentItem()
+        if not curr_item: return
+        
+        df_idx = curr_item.data(Qt.UserRole)
+        project_name = self.df_projects.at[df_idx, 'ProjectName']
+        config_path = self.df_projects.at[df_idx, 'ConfigPath']
+        status = self.df_projects.at[df_idx, 'STATUS']
+
+        choice = QMessageBox(self)
+        # --- THE FIX: Force the layout to follow our code order, not the OS ---
+        choice.setOption(QMessageBox.DontUseNativeDialog, True) 
+        
+        choice.setWindowTitle("Project Lifecycle Management")
+        choice.setText(f"Manage Project: {project_name}")
+        
+        # We add them in the EXACT order we want them to appear (Left to Right)
+        label_toggle = "Revive (Active)" if status == "Retired" else "Retire (Hide)"
+        btn_toggle = choice.addButton(label_toggle, QMessageBox.ActionRole)
+        
+        btn_erase_config = choice.addButton("Erase Config (Keep Data)", QMessageBox.ActionRole)
+        
+        btn_delete = choice.addButton("OBLITERATE EVERYTHING", QMessageBox.DestructiveRole)
+        
+        btn_cancel = choice.addButton("Cancel", QMessageBox.RejectRole)
+        
+        # Optional: Set the default focus so you don't accidentally obliterate on Enter
+        choice.setDefaultButton(btn_cancel)
+
+        choice.exec()
+
+        if choice.clickedButton() == btn_toggle:
+            new_status = "Active" if status == "Retired" else "Retired"
+            self.df_projects.at[df_idx, 'STATUS'] = new_status
+            self.df_projects.to_csv(self.ledger_path, index=False)
+            self._load_projects()
+
+        elif choice.clickedButton() == btn_erase_config:
+            self.erase_project_config(df_idx, project_name, config_path)
+
+        elif choice.clickedButton() == btn_delete:
+            self.obliterate_project(df_idx, project_name, config_path)
+
+    def erase_project_config(self, df_idx, name, path):
+        """
+        Surgically removes the Project Folder (parent of _pipe_config) 
+        and the ledger entry, but leaves the 'data_root' data untouched.
+        """
+        # path = .../ProjectName/_pipe_config
+        # project_folder = .../ProjectName/
+        project_folder = os.path.dirname(path)
+
+        msg = QMessageBox(self)
+        msg.setIcon(QMessageBox.Question)
+        msg.setWindowTitle("Erase Project Config & Folder")
+        msg.setText(f"Resetting Project: {name}")
+        msg.setInformativeText(
+            f"This will DELETE the folder:\n{project_folder}\n\n"
+            "This allows you to reuse the name 'test' immediately.\n"
+            "IT WILL NOT TOUCH YOUR ACTUAL SEQUENCE DATA/ROOT."
+        )
+        
+        btn_confirm = msg.addButton("Reset / Erase", QMessageBox.AcceptRole)
+        msg.addButton("Cancel", QMessageBox.RejectRole)
+        
+        msg.exec()
+        if msg.clickedButton() != btn_confirm:
+            return
+
+        try:
+            import shutil
+            # 1. KILL THE PROJECT FOLDER (The one containing _pipe_config)
+            if os.path.exists(project_folder):
+                shutil.rmtree(project_folder)
+            
+            # 2. REMOVE FROM LEDGER
+            self.df_projects = self.df_projects.drop(df_idx)
+            self.df_projects.to_csv(self.ledger_path, index=False)
+            
+            # 3. REFRESH UI
+            self._load_projects()
+            QMessageBox.information(self, "Success", f"Project '{name}' folder and config erased. You can now recreate it.")
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Reset failed:\n{e}")
+
+    def obliterate_project(self, df_idx, name, path):
+        """Persistent 'Are you sure?' dialog with Root Discovery and Parent Cleanup."""
+        
+        # path = .../ProjectName/_pipe_config
+        # project_folder = .../ProjectName/
+        project_folder = os.path.dirname(path)
+        
+        settings_path = os.path.join(path, "Project_Settings.csv")
+        data_root = None
+        
+        if os.path.exists(settings_path):
+            try:
+                set_df = pd.read_csv(settings_path, dtype=str).fillna("")
+                match = set_df[set_df['Key'] == 'data_root']
+                if not match.empty:
+                    data_root = PathSwapper.translate(match.iloc[0]['Value'])
+            except Exception as e:
+                print(f"Failed to peek at project root: {e}")
+
+        # Target 1: The Data (The 10TB Render Root)
+        target_to_delete = data_root if data_root else project_folder
+
+        msg = QMessageBox(self)
+        msg.setIcon(QMessageBox.Warning)
+        msg.setWindowTitle("!!! PERMANENT DELETION !!!")
+        msg.setText(f"CRITICAL: You are about to delete the entire project:\n\n{target_to_delete}")
+        msg.setInformativeText("This will wipe all data defined in data_root. This is permanent.")
+        
+        btn_browse = msg.addButton("Open Folder to Verify", QMessageBox.ActionRole)
+        btn_abort = msg.addButton("Abort / Cancel", QMessageBox.RejectRole)
+        btn_confirm = msg.addButton("I am certain. Delete it.", QMessageBox.DestructiveRole)
+        
+        while True:
+            msg.exec()
+            clicked = msg.clickedButton()
+
+            if clicked == btn_browse:
+                try:
+                    if sys.platform == "win32": os.startfile(target_to_delete)
+                    else: subprocess.run(["open" if sys.platform == "darwin" else "xdg-open", target_to_delete])
+                except: pass
+                continue 
+
+            if clicked == btn_confirm:
+                final_check = QMessageBox.question(self, "FINAL CONFIRMATION", 
+                    f"Are you 100% absolutely sure you want to wipe '{name}' and ALL its data?",
+                    QMessageBox.Yes | QMessageBox.No)
+                
+                if final_check == QMessageBox.Yes:
+                    try:
+                        import shutil
+                        # 1. KILL THE DATA (The Project Root / Server Data)
+                        if os.path.exists(target_to_delete):
+                            shutil.rmtree(target_to_delete)
+                        
+                        # 2. KILL THE LOCAL PROJECT FOLDER (The one containing _pipe_config)
+                        # We do this even if target_to_delete was different, to clear the 'test' name.
+                        if os.path.exists(project_folder):
+                            shutil.rmtree(project_folder)
+                        
+                        # 3. REMOVE FROM LEDGER
+                        self.df_projects = self.df_projects.drop(df_idx)
+                        self.df_projects.to_csv(self.ledger_path, index=False)
+                        self._load_projects()
+                        
+                        QMessageBox.information(self, "Success", "Project obliterated.")
+                        break 
+                    except Exception as e:
+                        QMessageBox.critical(self, "Error", f"Obliteration failed:\n{e}")
+                        break
+            else:
+                break
+
+    def action_import_search(self):
+        start_dir = QFileDialog.getExistingDirectory(self, "Select Root to Search for Configs", os.path.expanduser("~"))
+        if not start_dir: return
+
+        self.btn_import.setEnabled(False)
+        self.btn_import.setText("Searching...")
+        
+        self.import_thread = ImportWorker(start_dir)
+        self.import_thread.found.connect(self.process_imported_configs)
+        self.import_thread.finished.connect(self.on_import_finished)
+        self.import_thread.start()
+
+    def process_imported_configs(self, config_list):
+        """Merges new configs into the CSV, avoiding duplicates."""
+        if not config_list:
+            QMessageBox.information(self, "Import", "No '_pipe_config' folders found in that directory.")
+            return
+
+        # 1. Load current ledger
+        df_ledger = pd.read_csv(self.ledger_path)
+        
+        # 2. Build new rows, ensuring we use absolute paths
+        new_rows = []
+        for name, path in config_list:
+            abs_path = os.path.abspath(path)
+            # Check if this path is already registered
+            if abs_path not in df_ledger['ConfigPath'].values:
+                new_rows.append({"ProjectName": name, "ConfigPath": abs_path})
+
+        if new_rows:
+            # 3. Concatenate and Save
+            df_new = pd.DataFrame(new_rows)
+            df_updated = pd.concat([df_ledger, df_new], ignore_index=True)
+            df_updated.to_csv(self.ledger_path, index=False)
+            
+            # 4. Refresh the UI
+            self._load_projects()
+            QMessageBox.information(self, "Import Complete", f"Successfully registered {len(new_rows)} new projects.")
+        else:
+            QMessageBox.information(self, "Import", "All discovered projects are already registered.")
+
+    def on_import_finished(self):
+        self.btn_import.setEnabled(True)
+        self.btn_import.setText("Import Projects...")
+
+    def open_folder(self):
+        idx = self.list_widget.currentRow()
+        if idx < 0: return
+        path = self.df_projects.iloc[idx]['ConfigPath']
+        if sys.platform == "win32": os.startfile(path)
+        else: subprocess.run(["open" if sys.platform == "darwin" else "xdg-open", path])
+
+    def create_new(self):
+        dlg = NewProjectDialog(self)
+        if dlg.exec() == QDialog.Accepted:
+            path = dlg.full_config_path
+            name = dlg.project_name
+            
+            # 1. Create the physical directory tree
+            # os.makedirs(path, exist_ok=True) # bootstrap_template handles this
+
+            # 2. Bootstrap (This builds the folders and the CSV templates)
+            ConfigEngine(path, bootstrap=True)
+
+            # 3. Register in the Home Ledger (~/.pipeconfigroot.csv)
+            # We refresh the dataframe from the file first to avoid race conditions
+            self.df_projects = pd.read_csv(self.ledger_path)
+            new_row = pd.DataFrame([{"ProjectName": name, "ConfigPath": path}])
+            self.df_projects = pd.concat([self.df_projects, new_row]).drop_duplicates(subset=['ProjectName'])
+            self.df_projects.to_csv(self.ledger_path, index=False)
+            
+            # 4. Refresh the UI list
+            self._load_projects()
+
+    def action_update_config(self):
+        idx = self.list_widget.currentRow()
+        if idx < 0: return
+        
+        project_path = self.df_projects.iloc[idx]['ConfigPath']
+        
+        # We don't need to 'launch' the engine, just use it to sync
+        # We create a dummy engine instance pointing to the path
+        temp_engine = ConfigEngine(project_path, bootstrap=False) 
+        
+        # Run the sync microsurgery
+        temp_engine.bootstrap_template(target_dir=project_path, mode='sync')
+        
+        QMessageBox.information(self, "Success", "Project config synchronized (Missing files added).")
+
+    def launch(self):
+        idx = self.list_widget.currentRow()
+        if idx < 0: return
+        
+        project_name = self.df_projects.iloc[idx]['ProjectName']
+        config_path = self.df_projects.iloc[idx]['ConfigPath']
+        
+        # --- SURGICAL FIX: Check if the window exists AND isn't wrapped in a dead C++ object ---
+        if config_path in self.active_windows:
+            win = self.active_windows[config_path]
+            try:
+                # This call will fail if the C++ object is deleted
+                win.isVisible() 
+                win.show()
+                win.raise_()
+                win.activateWindow()
+                return
+            except (RuntimeError, AttributeError):
+                # The C++ object is dead; remove the ghost reference and proceed to launch fresh
+                self.active_windows.pop(config_path, None)
+
+        engine = ConfigEngine(config_path)
+        PathSwapper.PATHSUBS = engine.pathsubs
+        
+        m_path = str(engine.settings.get('catalog_csv', ''))
+        s_path = str(engine.settings.get('shots_csv', ''))
+
+        window = AssetManager(
+            master_path=m_path,
+            shot_path=s_path,
+            engine=engine,
+            project_label=project_name
+        )
+        
+        self.active_windows[config_path] = window
+        window.setAttribute(Qt.WA_DeleteOnClose)
+        
+        # This cleanup signal is good, but sometimes the timing is off in PySide; 
+        # the try/except above is the bulletproof backup.
+        window.destroyed.connect(lambda c=config_path: self.active_windows.pop(c, None))
+        
+        window.show()
+
+class NewProjectDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Create New Project Configuration")
+        self.setMinimumWidth(450)
+        layout = QVBoxLayout(self)
+
+        # Name Input
+        layout.addWidget(QLabel("Project Name:"))
+        self.edit_name = QLineEdit()
+        self.edit_name.setPlaceholderText("e.g. Rage, Dasein, Project_X")
+        layout.addWidget(self.edit_name)
+
+        # Parent Directory Input
+        layout.addWidget(QLabel("Parent Directory (where the config folder will be created):"))
+        h_layout = QHBoxLayout()
+        self.edit_parent = QLineEdit(os.path.expanduser("~"))
+        btn_browse = QPushButton("Browse...")
+        btn_browse.clicked.connect(self.browse_parent)
+        h_layout.addWidget(self.edit_parent)
+        h_layout.addWidget(btn_browse)
+        layout.addLayout(h_layout)
+
+        # Result Path Preview
+        self.label_preview = QLabel("Result: ")
+        self.label_preview.setStyleSheet("color: #888;")
+        layout.addWidget(self.label_preview)
+        self.edit_name.textChanged.connect(self.update_preview)
+        self.edit_parent.textChanged.connect(self.update_preview)
+
+        # Buttons
+        self.buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        self.buttons.accepted.connect(self.validate_and_accept)
+        self.buttons.rejected.connect(self.reject)
+        layout.addWidget(self.buttons)
+
+    def browse_parent(self):
+        res = QFileDialog.getExistingDirectory(self, "Select Parent Directory", self.edit_parent.text())
+        if res: self.edit_parent.setText(res)
+
+    def update_preview(self):
+        full_path = os.path.join(self.edit_parent.text(), self.edit_name.text(), "_pipe_config")
+        self.label_preview.setText(f"Result: {full_path}")
+
+    def validate_and_accept(self):
+        name = self.edit_name.text().strip()
+        parent = self.edit_parent.text().strip()
+        
+        if not name or not parent:
+            return # Maybe add a shake effect or red border here
+
+        # The actual config root we intend to build
+        target_dir = os.path.join(parent, name, "_pipe_config")
+        
+        if os.path.exists(target_dir):
+            from PySide6.QtWidgets import QMessageBox
+            QMessageBox.critical(self, "Path Error", 
+                f"A configuration already exists at:\n{target_dir}\nPlease choose a different name or location.")
+            return
+
+        self.full_config_path = target_dir
+        self.project_name = name
+        self.accept()
+
 class CatalogProvider:
-    """
-    The dedicated bridge for fetching raw catalog data. 
-    Currently reads a single CSV, but designed to scale to multiple Data Roots.
-    """
     def __init__(self, engine):
         self.engine = engine
 
-    def get_raw_catalog(self):
-        """Returns a tuple: (Raw DataFrame, Master Path)."""
-        raw_m = str(self.engine.settings.get('catalog_csv', '')).strip()
-        m_path = PathSwapper.translate(raw_m)
-
-        if m_path and m_path != "." and os.path.exists(m_path):
+    def get_raw_csv_df(self):
+        """The Authority: Decides which catalogs to load based on engine settings."""
+        # 1. Demand the raw list of data roots
+        raw_dr = self.engine.settings.get('data_root_raw', [])
+        
+        # 2. Safe evaluation if it's a string from the CSV
+        if isinstance(raw_dr, str):
             try:
-                # We return the raw, unadulterated CSV
-                df = pd.read_csv(m_path, encoding='cp1252')
-                return df, m_path
+                import ast
+                raw_dr = ast.literal_eval(raw_dr)
+            except:
+                return pd.DataFrame()
+
+        if not raw_dr or not isinstance(raw_dr, list):
+            return pd.DataFrame()
+
+        # 3. Logic: Get the key from the first tuple (Default Catalog)
+        catalog_key = raw_dr[0][0]
+
+        # 4. Ask the Engine for the path to this specific key
+        target_path = self.engine.get_catalog_path(catalog_key)
+
+        # 5. Load and return
+        if os.path.exists(target_path):
+            try:
+                return pd.read_csv(target_path, encoding='cp1252', dtype=str).fillna("")
             except Exception as e:
-                print(f"DEBUG: Catalog Load Error: {e}")
-                
-        # Fallback: Return empty dataframe and whatever path we had
-        return pd.DataFrame(), m_path
+                print(f"Provider: Error reading {target_path}: {e}")
+        
+        return pd.DataFrame()
     
 class AssetManager(QMainWindow):
     def __init__(self, master_path="", shot_path="", engine=None, project_label="Generic Project"):
         super().__init__()
         self.engine = engine
-        self.project_label = project_label 
+        self.project_label = project_label
+
+        self.catalog_provider = CatalogProvider(self.engine)
         
         self.setWindowTitle(f"[{self.project_label}] - Pipeline Asset Manager")
         self.resize(1500, 850)
@@ -5907,67 +5929,64 @@ class AssetManager(QMainWindow):
         else: self.proxy_model.set_shot_filter("|".join([re.escape(p.strip()) for p in t.split("|")]))
 
     def reload_all(self):
-        """Audited: Uses Engine Settings and delegates UI sizing to finalize_ui."""
+        """Audited: Uses CatalogProvider for data, but preserves all original processing logic."""
         raw_m = str(self.engine.settings.get('catalog_csv', '')).strip()
         raw_s = str(self.engine.settings.get('shots_csv', '')).strip()
         
         m_path = PathSwapper.translate(raw_m)
         s_path = PathSwapper.translate(raw_s)
 
-        # 1. Catalog Loading
+        # 1. Catalog Intake: Ask the Authority for the Data
+        self.main_model.beginResetModel()
+        df_provided = self.catalog_provider.get_raw_csv_df()
+        
         ui_order = ["LOCALPATH", "FILENAME", "FILETYPE", "FIRST", "LAST", "SUBSTATUS", "SUBSENT", 
                     "SEQUENCE", "SHOTNAME", "ALTSHOTNAME", "CREATION", "MODDATE", "ABSPATH", "HAS_SHOT", "FILE_ID", "UUID"]
 
-        # SURGICAL FIX 1: Use os.path.isfile instead of os.path.exists so directories instantly fall to the 'else' block
-        if m_path and m_path != "." and os.path.isfile(m_path):
+        if not df_provided.empty:
             try:
-                self.main_model.beginResetModel()
-                df_new = pd.read_csv(m_path, encoding='cp1252')
-                df_new['UUID'] = df_new.apply(lambda x: generate_uuid(x['LOCALPATH'], x['FILENAME']), axis=1)
-                df_new['ABSPATH'] = df_new['ABSPATH'].apply(lambda x: PathSwapper.translate(str(x)))
-                df_new['FILE_ID'] = df_new['ABSPATH'].astype(str) + "/" + df_new['FILENAME'].astype(str)
+                # --- RESTORED ORIGINAL PROCESSING LOGIC ---
+                # This ensures UUID, ABSPATH, and FILE_ID exist before refresh_logic runs
+                df_provided['UUID'] = df_provided.apply(lambda x: generate_uuid(x['LOCALPATH'], x['FILENAME']), axis=1)
+                df_provided['ABSPATH'] = df_provided['ABSPATH'].apply(lambda x: PathSwapper.translate(str(x)))
+                df_provided['FILE_ID'] = df_provided['ABSPATH'].astype(str) + "/" + df_provided['FILENAME'].astype(str)
                 
+                # Ensure fabric columns exist
                 for c in ["SUBSTATUS", "SUBSENT", "HAS_SHOT", "SHOTNAME", "ALTSHOTNAME"]: 
-                    if c not in df_new.columns: df_new[c] = ""
+                    if c not in df_provided.columns: df_provided[c] = ""
 
-                existing_cols = [c for c in ui_order if c in df_new.columns]
-                self.df_master = df_new[existing_cols]
-                self.main_model._data = self.df_master
-                self.main_model.endResetModel()
+                # Filter to the column set the UI expects
+                existing_cols = [c for c in ui_order if c in df_provided.columns]
+                self.df_master = df_provided[existing_cols]
+                # -------------------------------------------
             except Exception as e:
-                print(f"DEBUG: Catalog Load Error: {e}")
-                # SURGICAL FIX 2: If the CSV is corrupt, build the skeleton so the UI doesn't crash!
+                print(f"DEBUG: Data Processing Error: {e}")
                 self.df_master = pd.DataFrame(columns=ui_order)
-                self.main_model._data = self.df_master
-                self.main_model.endResetModel()
         else:
-            self.main_model.beginResetModel()
-            self.df_master = pd.DataFrame(columns=ui_order) 
-            self.main_model._data = self.df_master # Ensure the model knows about the skeleton
-            self.main_model.endResetModel()
+            self.df_master = pd.DataFrame(columns=ui_order)
 
-        # 2. Shots Loading
+        self.main_model._data = self.df_master
+        self.main_model.endResetModel()
+
+        # 2. Shots Loading (Unchanged)
         if s_path and s_path != "." and os.path.exists(s_path): 
             try:
-                # ENSURE dtype=str is here for the main UI mapping
                 self.df_shots = pd.read_csv(s_path, encoding='cp1252', dtype=str).fillna("")
             except: 
                 self.df_shots = pd.DataFrame(columns=['SEQUENCE', 'SHOTNAME', 'ALTSHOTNAME', 'HEROPLATE'])
         else:
             self.df_shots = pd.DataFrame(columns=['SEQUENCE', 'SHOTNAME', 'ALTSHOTNAME', 'HEROPLATE'])
 
-        # 3. Session & Playlist Cache Update
+        # 3. Session & Playlist Cache Update (Unchanged)
         m_dir = os.path.dirname(m_path) if m_path else ""
         if m_dir and os.path.exists(m_dir):
             session_glob = os.path.join(m_dir, ".autosaves/sessions/*.csv")
             self.session_cache = [os.path.basename(f).replace(".csv", "") for f in glob.glob(session_glob)]
             
-            # --- NEW: Populate Playlist Cache ---
             playlist_glob = os.path.join(m_dir, ".autosaves/playlists/*.csv")
             self.playlist_cache = sorted([os.path.basename(f).replace(".csv", "") for f in glob.glob(playlist_glob)])
         
         # 4. Refresh Data & Logic
-        # This calls refresh_logic -> finalize_ui where the FILENAME sizing happens.
         self.refresh_logic()
         self.update_status_stats()
 
