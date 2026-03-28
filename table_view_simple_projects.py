@@ -4521,6 +4521,30 @@ class ConfigHub(QDialog):
     def exec_(self):
         return super().exec_()
 
+class CatalogProvider:
+    """
+    The dedicated bridge for fetching raw catalog data. 
+    Currently reads a single CSV, but designed to scale to multiple Data Roots.
+    """
+    def __init__(self, engine):
+        self.engine = engine
+
+    def get_raw_catalog(self):
+        """Returns a tuple: (Raw DataFrame, Master Path)."""
+        raw_m = str(self.engine.settings.get('catalog_csv', '')).strip()
+        m_path = PathSwapper.translate(raw_m)
+
+        if m_path and m_path != "." and os.path.exists(m_path):
+            try:
+                # We return the raw, unadulterated CSV
+                df = pd.read_csv(m_path, encoding='cp1252')
+                return df, m_path
+            except Exception as e:
+                print(f"DEBUG: Catalog Load Error: {e}")
+                
+        # Fallback: Return empty dataframe and whatever path we had
+        return pd.DataFrame(), m_path
+    
 class AssetManager(QMainWindow):
     def __init__(self, master_path="", shot_path="", engine=None, project_label="Generic Project"):
         super().__init__()
