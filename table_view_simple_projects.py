@@ -7,7 +7,7 @@ import hashlib
 import glob
 from PySide6.QtWidgets import (QApplication, QMainWindow, QTableView, QStyledItemDelegate, QComboBox, QButtonGroup, QStackedWidget,
                                QVBoxLayout, QHBoxLayout, QPushButton, QFrame, QHeaderView, QTextEdit, QListWidgetItem, QTableWidget, QTableWidgetItem,
-                               QWidget, QLabel, QLineEdit, QFileDialog, QCheckBox, QDateEdit, QMessageBox, QStyleOptionViewItem, QStyle,
+                               QWidget, QLabel, QLineEdit, QFileDialog, QCheckBox, QDateEdit, QMessageBox, QStyleOptionViewItem, QStyle, QMenuBar,
                                QMenu, QDialog, QProgressBar, QDialogButtonBox, QSplitter, QListWidget, QFormLayout, QScrollArea)
 from PySide6.QtCore import QAbstractTableModel, Qt, QSortFilterProxyModel, QDate, QEvent, QTimer, QObject, Signal, QThread, QModelIndex
 from PySide6.QtGui import QKeySequence, QAction, QColor, QPalette
@@ -4395,10 +4395,19 @@ class ProjectLauncherDialog(QDialog):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Pipeline Control Center")
-        self.resize(600, 480) # Slight height bump for the new toggle
+        self.resize(600, 520) 
         self.active_windows = {} 
         
+        # --- THE FIX: Back to one clean layout ---
         layout = QVBoxLayout(self)
+        layout.setContentsMargins(15, 15, 15, 15)
+
+        # --- 0. BOOTSTRAP USER PREFS ---
+        self.prefs_path = os.path.normpath(os.path.join(os.path.expanduser("~"), ".simplepipemanager", "user_prefs.csv"))
+        if not os.path.exists(self.prefs_path):
+            os.makedirs(os.path.dirname(self.prefs_path), exist_ok=True)
+            default_root = os.path.join(os.path.expanduser("~"), ".simplepipemanager", "projects").replace('\\', '/')
+            pd.DataFrame([["user_projects_default_dir", default_root]], columns=['Key', 'Value']).to_csv(self.prefs_path, index=False)
 
         # --- 1. ENSURE GLOBAL CONFIG EXISTS & SPIN UP ENGINE ---
         self.global_config_dir = os.path.normpath(os.path.join(os.path.expanduser("~"), ".simplepipemanager", "_pipe_config"))
@@ -4408,13 +4417,23 @@ class ProjectLauncherDialog(QDialog):
             
         self.global_engine = ConfigEngine(self.global_config_dir, bootstrap=False)
 
+        # --- NEW: TOP ROW WITH PREFERENCES BUTTON ---
+        top_row = QHBoxLayout()
+        top_row.addWidget(QLabel("<b>Registered Projects:</b>"))
+        top_row.addStretch()
+        
+        btn_user_prefs = QPushButton("⚙ Preferences")
+        btn_user_prefs.setFixedWidth(120)
+        btn_user_prefs.setStyleSheet("background-color: #444; color: #eee; font-size: 11px; padding: 4px;")
+        btn_user_prefs.clicked.connect(self.open_user_prefs)
+        top_row.addWidget(btn_user_prefs)
+        
+        layout.addLayout(top_row)
+
         # --- ADDITIVE: Lifecycle Filter ---
         self.check_show_retired = QCheckBox("Show Retired Projects")
         self.check_show_retired.stateChanged.connect(self._load_projects)
-        
-        layout.addWidget(QLabel("Registered Projects:"))
-        layout.addWidget(self.check_show_retired) # Placed for clear visibility
-        
+        layout.addWidget(self.check_show_retired)
         self.list_widget = QListWidget()
         self.list_widget.doubleClicked.connect(self.launch)
         layout.addWidget(self.list_widget)
@@ -4495,6 +4514,11 @@ class ProjectLauncherDialog(QDialog):
 
         # Perform the initial load AFTER UI is wired up
         self._load_projects()
+
+    def open_user_prefs(self):
+        """Launches the dynamic editor for the user's local preferences."""
+        dlg = DynamicKeyValueEditor(self.prefs_path, preset="user_prefs", parent=self)
+        dlg.exec()
 
     def _load_projects(self):
         manager_dir = os.path.normpath(os.path.join(os.path.expanduser("~"), ".simplepipemanager"))
@@ -4868,20 +4892,30 @@ class ProjectLauncherDialog(QDialog):
         else: subprocess.run(["open" if sys.platform == "darwin" else "xdg-open", path])
 
     def create_new(self):
+        # 1. Fetch the preference
+        current_default = os.path.expanduser("~") # Fallback
+        try:
+            df_p = pd.read_csv(self.prefs_path, dtype=str)
+            current_default = df_p.loc[df_p['Key'] == 'user_projects_default_dir', 'Value'].values[0]
+        except: pass
+
+        # 2. Pass it into the dialog
         dlg = NewProjectDialog(self)
+        dlg.edit_parent.setText(current_default)
+        dlg.update_preview()
+        
         if dlg.exec() == QDialog.Accepted:
+            # ... keep your existing creation logic exactly as it is ...
             path = dlg.full_config_path
             name = dlg.project_name
 
-            # --- REVERTED TO EXPLICIT 2-LINER ---
-            # 1. Initialize with use_pointers=True so the safety net doesn't ruin anything
+            # --- KEEPING YOUR WORKING EXPLICIT 2-LINER ---
             engine = ConfigEngine(
                 path, 
                 bootstrap=False, 
                 use_pointers=True, 
                 template_name="_pipe_config_default"
             )
-            # 2. Explicitly force the skeleton creation mode
             engine.bootstrap_template(mode='create', use_pointers=True)
 
             # Register in the Home Ledger
@@ -5093,7 +5127,6 @@ class CatalogProvider:
         return pd.DataFrame()
 
 class DynamicKeyValueEditor(QDialog):
-    # (PRESETS remain the same)
     PRESETS = {
         "project_settings": {
             "title": "Project Settings",
@@ -5108,6 +5141,10 @@ class DynamicKeyValueEditor(QDialog):
         },
         "notes_config": {
             "title": "Notes Configuration"
+        },
+        "user_prefs": {
+            "title": "User Preferences",
+            "dir_browse_keys": ["user_projects_default_dir"]
         }
     }
 
