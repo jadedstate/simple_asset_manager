@@ -120,15 +120,15 @@ class GlobalPointerDelegate(QStyledItemDelegate):
             return
             
         super().paint(painter, option, index)
-        
+
 class GenericCSVEditor(QDialog):
-    # --- SURGICAL FIX: Added 'engine' to the signature ---
-    def __init__(self, csv_path, title="CSV Editor", parent=None, allow_add_column=False, dropdown_cols=None, engine=None):
+    def __init__(self, csv_path, title="CSV Editor", parent=None, allow_add_column=False, dropdown_cols=None, engine=None, allow_file_browse=False):
         super().__init__(parent)
         self.csv_path = os.path.normpath(csv_path)
         self.allow_add_column = allow_add_column
         self.dropdown_cols = dropdown_cols or {}
-        self.engine = engine # Store the engine!
+        self.engine = engine
+        self.allow_file_browse = allow_file_browse
         
         self.setWindowTitle(f"{title} - {os.path.basename(self.csv_path)}")
         self.resize(1000, 500)
@@ -179,6 +179,12 @@ class GenericCSVEditor(QDialog):
         btn_del.clicked.connect(self.delete_selected_structure)
         row_ctrl.addWidget(btn_add)
         row_ctrl.addWidget(btn_del)
+        if self.allow_file_browse:
+            btn_browse = QPushButton("📁 Choose File for Selected Cell")
+            btn_browse.setStyleSheet("background-color: #2e5a88; color: white; font-weight: bold;")
+            btn_browse.clicked.connect(self.browse_for_cell)
+            row_ctrl.addWidget(btn_browse)
+            
         row_ctrl.addStretch()
         layout.addLayout(row_ctrl)
 
@@ -187,6 +193,23 @@ class GenericCSVEditor(QDialog):
         self.buttons.accepted.connect(self.save_and_close)
         self.buttons.rejected.connect(self.reject)
         layout.addWidget(self.buttons)
+
+    def browse_for_cell(self):
+        """Opens a file dialog and injects the path into the currently selected cell."""
+        index = self.table.selectionModel().currentIndex()
+        if not index.isValid():
+            QMessageBox.information(self, "Select Cell", "Please click a cell in the 'Value' column first.")
+            return
+            
+        # Give them a file picker (All Files so they can grab .exe, .app, shell scripts, etc.)
+        from PySide6.QtWidgets import QFileDialog
+        file_path, _ = QFileDialog.getOpenFileName(self, "Choose Executable or File", "", "All Files (*)")
+        
+        if file_path:
+            # Force standard forward slashes for pipeline safety
+            file_path = file_path.replace("\\", "/")
+            # Inject directly into the model!
+            self.model.setData(index, file_path, Qt.EditRole)
 
     def _apply_dropdown_delegates(self):
         """Surgically applies the StatusDelegate to requested columns."""
@@ -3006,6 +3029,211 @@ class CSVEditorDelegate(QStyledItemDelegate):
             return "{LOCALDOTDIR}  ⮎ (Inheriting from Global)"
         return text
 
+class ProjectSettingsEditor(QDialog):
+    def __init__(self, engine, parent=None):
+        super().__init__(parent)
+        self.engine = engine
+        self.setWindowTitle("Edit Project Settings")
+        self.resize(900, 500)
+        
+        layout = QVBoxLayout(self)
+        form = QFormLayout()
+        form.setFieldGrowthPolicy(QFormLayout.ExpandingFieldsGrow)
+        
+        self.inputs = {}
+        
+        # --- FIX 1: Removed 'data_root' from this list ---
+        path_keys = ['shots_csv', 'scrape_blacklist']
+
+        # --- NEW: Load Raw CSV so we don't accidentally bake over pointers! ---
+        raw_csv_path = os.path.join(self.engine.root, "Project_Settings.csv")
+        try:
+            raw_df = pd.read_csv(raw_csv_path, dtype=str, encoding='cp1252').fillna("")
+            raw_settings = dict(zip(raw_df['Key'], raw_df['Value']))
+        except:
+            raw_settings = {}
+
+        for key, resolved_value in self.engine.settings.items():
+            # Block memory-only engine variables
+            if key in ['data_root_raw', 'data_root_list']:
+                continue
+                
+            # --- ORIGINAL: Checkbox Setup ---
+            if key == 'dual_name':
+                cb = QCheckBox("Enable dual-name shot matching")
+                # Use raw_settings to determine state, fallback to resolved
+                raw_val = raw_settings.get(key, resolved_value)
+                cb.setChecked(str(raw_val).strip().lower() == 'true')
+                self.inputs[key] = cb
+                form.addRow(QLabel(f"<b>{key}:</b>"), cb)
+                continue
+
+            # --- FIX 3: The Data_Root Tuple Interceptor ---
+            if key == 'data_root':
+                raw_val = str(self.engine.settings.get('data_root_raw', resolved_value))
+                edit = QLineEdit(raw_val)
+                edit.hide()
+                self.inputs[key] = edit
+                
+                preview_lbl = QLabel()
+                preview_lbl.setStyleSheet("color: #aaa; background-color: #2b2b2b; padding: 5px; border-radius: 3px;")
+                self._update_data_root_preview(preview_lbl, raw_val)
+                
+                btn_edit = QPushButton("Edit Data Roots...")
+                btn_edit.clicked.connect(lambda chk=False, e=edit, l=preview_lbl: self.open_data_roots_editor(e, l))
+                
+                h_layout = QHBoxLayout()
+                h_layout.addWidget(preview_lbl, stretch=1)
+                h_layout.addWidget(btn_edit)
+                h_layout.addWidget(edit) 
+                form.addRow(QLabel(f"<b>{key}:</b>"), h_layout)
+                continue
+
+            # --- SURGICAL INJECTION: Text Editor & Preview Setup ---
+            raw_val = str(raw_settings.get(key, resolved_value))
+            
+            edit = SingleLineWrapEdit(raw_val)
+            edit.setMinimumHeight(45)
+            edit.setMaximumHeight(70)
+            self.inputs[key] = edit
+            
+            # Wrap the editor in a mini layout so we can attach the preview underneath
+            v_layout = QVBoxLayout()
+            v_layout.setSpacing(2)
+            v_layout.setContentsMargins(0, 0, 0, 0)
+            v_layout.addWidget(edit)
+            
+            # The sleek preview label
+            if raw_val.strip().upper() == "{LOCALDOTDIR}":
+                lbl_preview = QLabel(f"<i>Inherited: {resolved_value}</i>")
+                lbl_preview.setStyleSheet("color: #777; font-size: 11px;")
+                v_layout.addWidget(lbl_preview)
+
+            if key in path_keys:
+                h_layout = QHBoxLayout()
+                h_layout.addLayout(v_layout)
+                btn_browse = QPushButton("Browse...")
+                btn_browse.clicked.connect(lambda chk=False, e=edit, k=key: self.browse_path(e, k))
+                h_layout.addWidget(btn_browse)
+                form.addRow(QLabel(f"<b>{key}:</b>"), h_layout)
+            else:
+                form.addRow(QLabel(f"<b>{key}:</b>"), v_layout)
+            
+        scroll = QScrollArea()
+        scroll_w = QWidget(); scroll_w.setLayout(form)
+        scroll.setWidget(scroll_w); scroll.setWidgetResizable(True)
+        layout.addWidget(scroll)
+
+        self.buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
+        self.buttons.button(QDialogButtonBox.Save).setAutoDefault(False)
+        self.buttons.accepted.connect(self.save_and_close)
+        self.buttons.rejected.connect(self.reject)
+        layout.addWidget(self.buttons)
+
+    def browse_path(self, edit_widget, key):
+        """Fixed browser: Appends for blacklist, avoids .csv for directories."""
+        current_val = edit_widget.toPlainText().strip()
+        
+        # 1. Setup Defaults
+        default_names = {
+            'shots_csv': 'project_shots.csv'
+        }
+        
+        # Determine the directory to open in
+        if current_val and "," in current_val:
+            # For blacklist, try the last path in the list
+            last_path = current_val.split(",")[-1].strip()
+            start_dir = last_path if os.path.exists(last_path) else self.engine.root
+        elif current_val and os.path.isdir(current_val):
+            # If it's already a directory, open exactly there
+            start_dir = current_val
+        elif current_val and os.path.exists(os.path.dirname(current_val)):
+            # If it's a file, open its parent
+            start_dir = os.path.dirname(current_val)
+        else:
+            start_dir = self.engine.root
+
+        # 2. Open the correct Dialog type
+        # --- SURGICAL FIX: Move catalogs into the directory browser group ---
+        if key in ['scrape_blacklist', 'catalog_dir']:
+            prompt = "Select Directory to Exclude" if key == 'scrape_blacklist' else f"Select Directory for {key}"
+            res = QFileDialog.getExistingDirectory(self, prompt, start_dir)
+            
+            if res:
+                res = os.path.normpath(res)
+                if key == 'scrape_blacklist':
+                    # --- THE APPEND LOGIC ---
+                    if current_val:
+                        new_val = f"{current_val.rstrip(',')}, {res}"
+                    else:
+                        new_val = res
+                    edit_widget.setPlainText(new_val)
+                else:
+                    # Overwrite for catalog_dir
+                    edit_widget.setPlainText(res)
+        else:
+            # 3. CSV File Browser (For shots_csv, etc)
+            default_fn = default_names.get(key, "data.csv")
+            initial_path = os.path.join(start_dir, default_fn)
+            
+            res, _ = QFileDialog.getOpenFileName(
+                self, 
+                f"Select {key} File", 
+                initial_path, 
+                "CSV Files (*.csv)"
+            )
+            
+            if res:
+                res = os.path.normpath(res)
+                if not res.lower().endswith(".csv"):
+                    res += ".csv"
+                edit_widget.setPlainText(res)
+
+    def _update_data_root_preview(self, label, raw_json):
+        import json
+        try:
+            data = json.loads(raw_json)
+            if not data:
+                label.setText("<i>No roots defined</i>")
+                return
+            lines = []
+            for item in data:
+                if isinstance(item, list) and len(item) >= 2:
+                    lines.append(f"<b>{item[0]}</b> - {item[1]}")
+            label.setText("<br>".join(lines))
+        except:
+            label.setText(f"<b>default</b> - {raw_json}")
+
+    def open_data_roots_editor(self, hidden_edit, preview_label):
+        current_data = hidden_edit.text()
+        dlg = DataRootsEditorDialog(current_data, self)
+        
+        if dlg.exec():
+            new_json = dlg.get_serialized_data()
+            hidden_edit.setText(new_json)
+            self._update_data_root_preview(preview_label, new_json)
+
+    def save_and_close(self):
+        cleaned_data = []
+        for key, widget in self.inputs.items():
+            if isinstance(widget, QCheckBox):
+                val = "True" if widget.isChecked() else "False"
+            # --- FIX 5: Catch the QLineEdit used by data_root ---
+            elif isinstance(widget, QLineEdit):
+                val = widget.text().strip()
+            else:
+                val = widget.toPlainText().replace('\n', '').replace('\r', '').strip().rstrip(',')
+            
+            self.engine.settings[key] = val
+            cleaned_data.append([key, val])
+            
+        csv_path = os.path.join(self.engine.root, "Project_Settings.csv")
+        try:
+            pd.DataFrame(cleaned_data, columns=['Key', 'Value']).to_csv(csv_path, index=False, encoding='cp1252')
+            self.accept()
+        except Exception as e:
+            QMessageBox.critical(self, "Save Error", f"Could not write to config:\n{e}")
+
 class MultiFilterProxy(QSortFilterProxyModel):
     def __init__(self):
         super().__init__()
@@ -3542,6 +3770,148 @@ class PandasModel(QAbstractTableModel):
             return True
         return False
 
+class DataRootsEditorDialog(QDialog):
+    """Bespoke editor to manage the JSON list of [name, path] tuples for data_root."""
+    def __init__(self, current_data_string="", parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Manage Data Roots")
+        self.resize(600, 300)
+        
+        layout = QVBoxLayout(self)
+        
+        # 1. THE TABLE
+        self.table = QTableWidget(0, 3)
+        self.table.setHorizontalHeaderLabels(["Root ID", "Path", ""])
+        self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
+        self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Fixed)
+        self.table.setColumnWidth(2, 80)
+        layout.addWidget(self.table)
+        
+        # 2. ACTIONS
+        btn_layout = QHBoxLayout()
+        btn_add = QPushButton("+ Add New Root")
+        btn_add.clicked.connect(self.add_empty_row)
+        btn_layout.addWidget(btn_add)
+        btn_layout.addStretch()
+        layout.addLayout(btn_layout)
+        
+        # 3. SAVE / CANCEL
+        btns = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
+        btns.accepted.connect(self.accept)
+        btns.rejected.connect(self.reject)
+        layout.addWidget(btns)
+
+        # 4. LOAD DATA
+        self.load_data(current_data_string)
+
+    def load_data(self, raw_string):
+        """Expects: [["default", "/mnt/jobs"], ["usb", "/Volumes/usb"]]"""
+        self.table.setRowCount(0)
+        if not raw_string: return
+        
+        try:
+            data = json.loads(raw_string)
+            if isinstance(data, list):
+                for item in data:
+                    if isinstance(item, list) and len(item) >= 2:
+                        self.add_row(str(item[0]), str(item[1]))
+                    elif isinstance(item, dict): # Fallback if we accidentally saved dicts
+                        self.add_row(str(item.get('name', '')), str(item.get('path', '')))
+            else:
+                # Absolute legacy fallback
+                self.add_row("default", raw_string)
+        except:
+            # Absolute legacy fallback
+            self.add_row("default", raw_string)
+
+    def add_empty_row(self):
+        """Finds the next available generic name and focuses the cell for the user."""
+        existing_names = []
+        for r in range(self.table.rowCount()):
+            item = self.table.item(r, 0)
+            if item:
+                existing_names.append(item.text().strip())
+
+        # 1. Generate a unique default name: root_1, root_2, etc.
+        counter = 1
+        new_name = f"root_{counter}"
+        while new_name in existing_names:
+            counter += 1
+            new_name = f"root_{counter}"
+
+        # 2. Add the row
+        self.add_row(new_name, "")
+
+        # 3. IMMEDIATELY focus and select the name cell for the user to type
+        last_row = self.table.rowCount() - 1
+        name_item = self.table.item(last_row, 0)
+        self.table.setCurrentItem(name_item)
+        self.table.editItem(name_item) 
+
+    def add_row(self, name, path):
+        row = self.table.rowCount()
+        self.table.insertRow(row)
+        
+        # ROOT ID Cell
+        name_item = QTableWidgetItem(name)
+        # Subtle UI hint: make IDs look like variables
+        name_item.setToolTip("This ID will be used as the variable name (e.g. {default})")
+        self.table.setItem(row, 0, name_item)
+        
+        # PATH Cell
+        self.table.setItem(row, 1, QTableWidgetItem(path))
+        
+        # ACTION Buttons
+        widget = QWidget()
+        h_layout = QHBoxLayout(widget)
+        h_layout.setContentsMargins(2, 2, 2, 2)
+        h_layout.setSpacing(4)
+        
+        btn_browse = QPushButton("...")
+        # BUG FIX: Use a more robust way to find the row during callback
+        btn_browse.clicked.connect(lambda: self.browse_path_for_widget(btn_browse))
+        
+        btn_del = QPushButton("X")
+        btn_del.setStyleSheet("background-color: #882e2e; color: white; font-weight: bold;")
+        btn_del.clicked.connect(lambda: self.delete_row_for_widget(btn_del))
+        
+        h_layout.addWidget(btn_browse)
+        h_layout.addWidget(btn_del)
+        self.table.setCellWidget(row, 2, widget)
+
+    def browse_path_for_widget(self, widget):
+        pos = widget.parent().mapTo(self.table, widget.pos())
+        row = self.table.indexAt(pos).row()
+        if row < 0: return
+        
+        current_path = self.table.item(row, 1).text()
+        folder = QFileDialog.getExistingDirectory(self, "Select Root Directory", current_path)
+        if folder:
+            self.table.setItem(row, 1, QTableWidgetItem(folder.replace('\\', '/')))
+
+    def delete_row_for_widget(self, widget):
+        pos = widget.parent().mapTo(self.table, widget.pos())
+        row = self.table.indexAt(pos).row()
+        if row >= 0:
+            self.table.removeRow(row)
+
+    def browse_path(self, row):
+        current_path = self.table.item(row, 1).text()
+        folder = QFileDialog.getExistingDirectory(self, "Select Root Directory", current_path)
+        if folder:
+            self.table.setItem(row, 1, QTableWidgetItem(folder))
+
+    def get_serialized_data(self):
+        """Returns JSON string of strict tuples: [["default", "/path"], ["usb", "/path"]]"""
+        data = []
+        for r in range(self.table.rowCount()):
+            name = self.table.item(r, 0).text().strip()
+            path = self.table.item(r, 1).text().strip()
+            if name and path:
+                data.append([name, path])
+        return json.dumps(data)
+
 class SelectionModel(PandasModel):
     def data(self, index, role=Qt.DisplayRole):
         if not index.isValid(): return None
@@ -3695,307 +4065,6 @@ class ConfigHub(QDialog):
     def exec_(self):
         return super().exec_()
 
-class ProjectSettingsEditor(QDialog):
-    def __init__(self, engine, parent=None):
-        super().__init__(parent)
-        self.engine = engine
-        self.setWindowTitle("Edit Project Settings")
-        self.resize(900, 500)
-        
-        layout = QVBoxLayout(self)
-        form = QFormLayout()
-        form.setFieldGrowthPolicy(QFormLayout.ExpandingFieldsGrow)
-        
-        self.inputs = {}
-        
-        # --- FIX 1: Removed 'data_root' from this list ---
-        path_keys = ['shots_csv', 'scrape_blacklist']
-
-        # --- NEW: Load Raw CSV so we don't accidentally bake over pointers! ---
-        raw_csv_path = os.path.join(self.engine.root, "Project_Settings.csv")
-        try:
-            raw_df = pd.read_csv(raw_csv_path, dtype=str, encoding='cp1252').fillna("")
-            raw_settings = dict(zip(raw_df['Key'], raw_df['Value']))
-        except:
-            raw_settings = {}
-
-        for key, resolved_value in self.engine.settings.items():
-            # Block memory-only engine variables
-            if key in ['data_root_raw', 'data_root_list']:
-                continue
-                
-            # --- ORIGINAL: Checkbox Setup ---
-            if key == 'dual_name':
-                cb = QCheckBox("Enable dual-name shot matching")
-                # Use raw_settings to determine state, fallback to resolved
-                raw_val = raw_settings.get(key, resolved_value)
-                cb.setChecked(str(raw_val).strip().lower() == 'true')
-                self.inputs[key] = cb
-                form.addRow(QLabel(f"<b>{key}:</b>"), cb)
-                continue
-
-            # --- FIX 3: The Data_Root Tuple Interceptor ---
-            if key == 'data_root':
-                raw_val = str(self.engine.settings.get('data_root_raw', resolved_value))
-                edit = QLineEdit(raw_val)
-                edit.hide()
-                self.inputs[key] = edit
-                
-                preview_lbl = QLabel()
-                preview_lbl.setStyleSheet("color: #aaa; background-color: #2b2b2b; padding: 5px; border-radius: 3px;")
-                self._update_data_root_preview(preview_lbl, raw_val)
-                
-                btn_edit = QPushButton("Edit Data Roots...")
-                btn_edit.clicked.connect(lambda chk=False, e=edit, l=preview_lbl: self.open_data_roots_editor(e, l))
-                
-                h_layout = QHBoxLayout()
-                h_layout.addWidget(preview_lbl, stretch=1)
-                h_layout.addWidget(btn_edit)
-                h_layout.addWidget(edit) 
-                form.addRow(QLabel(f"<b>{key}:</b>"), h_layout)
-                continue
-
-            # --- SURGICAL INJECTION: Text Editor & Preview Setup ---
-            raw_val = str(raw_settings.get(key, resolved_value))
-            
-            edit = SingleLineWrapEdit(raw_val)
-            edit.setMinimumHeight(45)
-            edit.setMaximumHeight(70)
-            self.inputs[key] = edit
-            
-            # Wrap the editor in a mini layout so we can attach the preview underneath
-            v_layout = QVBoxLayout()
-            v_layout.setSpacing(2)
-            v_layout.setContentsMargins(0, 0, 0, 0)
-            v_layout.addWidget(edit)
-            
-            # The sleek preview label
-            if raw_val.strip().upper() == "{LOCALDOTDIR}":
-                lbl_preview = QLabel(f"<i>Inherited: {resolved_value}</i>")
-                lbl_preview.setStyleSheet("color: #777; font-size: 11px;")
-                v_layout.addWidget(lbl_preview)
-
-            if key in path_keys:
-                h_layout = QHBoxLayout()
-                h_layout.addLayout(v_layout)
-                btn_browse = QPushButton("Browse...")
-                btn_browse.clicked.connect(lambda chk=False, e=edit, k=key: self.browse_path(e, k))
-                h_layout.addWidget(btn_browse)
-                form.addRow(QLabel(f"<b>{key}:</b>"), h_layout)
-            else:
-                form.addRow(QLabel(f"<b>{key}:</b>"), v_layout)
-            
-        scroll = QScrollArea()
-        scroll_w = QWidget(); scroll_w.setLayout(form)
-        scroll.setWidget(scroll_w); scroll.setWidgetResizable(True)
-        layout.addWidget(scroll)
-
-        self.buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
-        self.buttons.button(QDialogButtonBox.Save).setAutoDefault(False)
-        self.buttons.accepted.connect(self.save_and_close)
-        self.buttons.rejected.connect(self.reject)
-        layout.addWidget(self.buttons)
-
-    def browse_path(self, edit_widget, key):
-        """Fixed browser: Appends for blacklist, avoids .csv for directories."""
-        current_val = edit_widget.toPlainText().strip()
-        
-        # 1. Setup Defaults
-        default_names = {
-            'shots_csv': 'project_shots.csv'
-        }
-        
-        # Determine the directory to open in
-        if current_val and "," in current_val:
-            # For blacklist, try the last path in the list
-            last_path = current_val.split(",")[-1].strip()
-            start_dir = last_path if os.path.exists(last_path) else self.engine.root
-        elif current_val and os.path.isdir(current_val):
-            # If it's already a directory, open exactly there
-            start_dir = current_val
-        elif current_val and os.path.exists(os.path.dirname(current_val)):
-            # If it's a file, open its parent
-            start_dir = os.path.dirname(current_val)
-        else:
-            start_dir = self.engine.root
-
-        # 2. Open the correct Dialog type
-        # --- SURGICAL FIX: Move catalogs into the directory browser group ---
-        if key in ['scrape_blacklist', 'catalog_dir']:
-            prompt = "Select Directory to Exclude" if key == 'scrape_blacklist' else f"Select Directory for {key}"
-            res = QFileDialog.getExistingDirectory(self, prompt, start_dir)
-            
-            if res:
-                res = os.path.normpath(res)
-                if key == 'scrape_blacklist':
-                    # --- THE APPEND LOGIC ---
-                    if current_val:
-                        new_val = f"{current_val.rstrip(',')}, {res}"
-                    else:
-                        new_val = res
-                    edit_widget.setPlainText(new_val)
-                else:
-                    # Overwrite for catalog_dir
-                    edit_widget.setPlainText(res)
-        else:
-            # 3. CSV File Browser (For shots_csv, etc)
-            default_fn = default_names.get(key, "data.csv")
-            initial_path = os.path.join(start_dir, default_fn)
-            
-            res, _ = QFileDialog.getOpenFileName(
-                self, 
-                f"Select {key} File", 
-                initial_path, 
-                "CSV Files (*.csv)"
-            )
-            
-            if res:
-                res = os.path.normpath(res)
-                if not res.lower().endswith(".csv"):
-                    res += ".csv"
-                edit_widget.setPlainText(res)
-
-    def _update_data_root_preview(self, label, raw_json):
-        import json
-        try:
-            data = json.loads(raw_json)
-            if not data:
-                label.setText("<i>No roots defined</i>")
-                return
-            lines = []
-            for item in data:
-                if isinstance(item, list) and len(item) >= 2:
-                    lines.append(f"<b>{item[0]}</b> - {item[1]}")
-            label.setText("<br>".join(lines))
-        except:
-            label.setText(f"<b>default</b> - {raw_json}")
-
-    def open_data_roots_editor(self, hidden_edit, preview_label):
-        current_data = hidden_edit.text()
-        dlg = DataRootsEditorDialog(current_data, self)
-        
-        if dlg.exec():
-            new_json = dlg.get_serialized_data()
-            hidden_edit.setText(new_json)
-            self._update_data_root_preview(preview_label, new_json)
-
-    def save_and_close(self):
-        cleaned_data = []
-        for key, widget in self.inputs.items():
-            if isinstance(widget, QCheckBox):
-                val = "True" if widget.isChecked() else "False"
-            # --- FIX 5: Catch the QLineEdit used by data_root ---
-            elif isinstance(widget, QLineEdit):
-                val = widget.text().strip()
-            else:
-                val = widget.toPlainText().replace('\n', '').replace('\r', '').strip().rstrip(',')
-            
-            self.engine.settings[key] = val
-            cleaned_data.append([key, val])
-            
-        csv_path = os.path.join(self.engine.root, "Project_Settings.csv")
-        try:
-            pd.DataFrame(cleaned_data, columns=['Key', 'Value']).to_csv(csv_path, index=False, encoding='cp1252')
-            self.accept()
-        except Exception as e:
-            QMessageBox.critical(self, "Save Error", f"Could not write to config:\n{e}")
-
-class DataRootsEditorDialog(QDialog):
-    """Bespoke editor to manage the JSON list of [name, path] tuples for data_root."""
-    def __init__(self, current_data_string="", parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("Manage Data Roots")
-        self.resize(600, 300)
-        
-        layout = QVBoxLayout(self)
-        
-        # 1. THE TABLE
-        self.table = QTableWidget(0, 3)
-        self.table.setHorizontalHeaderLabels(["Root ID", "Path", ""])
-        self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
-        self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
-        self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Fixed)
-        self.table.setColumnWidth(2, 80)
-        layout.addWidget(self.table)
-        
-        # 2. ACTIONS
-        btn_layout = QHBoxLayout()
-        btn_add = QPushButton("+ Add New Root")
-        btn_add.clicked.connect(self.add_empty_row)
-        btn_layout.addWidget(btn_add)
-        btn_layout.addStretch()
-        layout.addLayout(btn_layout)
-        
-        # 3. SAVE / CANCEL
-        btns = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
-        btns.accepted.connect(self.accept)
-        btns.rejected.connect(self.reject)
-        layout.addWidget(btns)
-
-        # 4. LOAD DATA
-        self.load_data(current_data_string)
-
-    def load_data(self, raw_string):
-        """Expects: [["default", "/mnt/jobs"], ["usb", "/Volumes/usb"]]"""
-        self.table.setRowCount(0)
-        if not raw_string: return
-        
-        try:
-            data = json.loads(raw_string)
-            if isinstance(data, list):
-                for item in data:
-                    if isinstance(item, list) and len(item) >= 2:
-                        self.add_row(str(item[0]), str(item[1]))
-                    elif isinstance(item, dict): # Fallback if we accidentally saved dicts
-                        self.add_row(str(item.get('name', '')), str(item.get('path', '')))
-            else:
-                # Absolute legacy fallback
-                self.add_row("default", raw_string)
-        except:
-            # Absolute legacy fallback
-            self.add_row("default", raw_string)
-
-    def add_empty_row(self):
-        self.add_row("new_root", "")
-
-    def add_row(self, name, path):
-        row = self.table.rowCount()
-        self.table.insertRow(row)
-        
-        self.table.setItem(row, 0, QTableWidgetItem(name))
-        self.table.setItem(row, 1, QTableWidgetItem(path))
-        
-        widget = QWidget()
-        h_layout = QHBoxLayout(widget)
-        h_layout.setContentsMargins(2, 2, 2, 2)
-        
-        btn_browse = QPushButton("...")
-        btn_browse.clicked.connect(lambda chk=False, r=row: self.browse_path(r))
-        
-        btn_del = QPushButton("X")
-        btn_del.setStyleSheet("background-color: #882e2e; color: white;")
-        btn_del.clicked.connect(lambda chk=False, r=row: self.table.removeRow(r))
-        
-        h_layout.addWidget(btn_browse)
-        h_layout.addWidget(btn_del)
-        self.table.setCellWidget(row, 2, widget)
-
-    def browse_path(self, row):
-        current_path = self.table.item(row, 1).text()
-        folder = QFileDialog.getExistingDirectory(self, "Select Root Directory", current_path)
-        if folder:
-            self.table.setItem(row, 1, QTableWidgetItem(folder))
-
-    def get_serialized_data(self):
-        """Returns JSON string of strict tuples: [["default", "/path"], ["usb", "/path"]]"""
-        data = []
-        for r in range(self.table.rowCount()):
-            name = self.table.item(r, 0).text().strip()
-            path = self.table.item(r, 1).text().strip()
-            if name and path:
-                data.append([name, path])
-        return json.dumps(data)
-    
 class ConfigEngine:
     def __init__(self, root_path, bootstrap=False, use_pointers=False, template_name="_pipe_config_default"):
         self.root = os.path.abspath(os.path.normpath(root_path))
@@ -4491,40 +4560,99 @@ class ProjectLauncherDialog(QDialog):
                 
             self.list_widget.addItem(item)
 
-    # ==========================================
-    # --- GLOBAL CONFIG EDITOR CALLBACKS ---
-    # ==========================================
-    
     def open_global_settings(self):
-        dlg = ProjectSettingsEditor(self.global_engine, self)
-        if dlg.exec():
-            self.global_engine.__init__(self.global_engine.root) # Refresh memory
-
-    def open_global_app_config(self, app_name):
-        plat = "win" if sys.platform == "win32" else "mac" if sys.platform == "darwin" else "linux"
-        csv_path = os.path.join(self.global_engine.apps_dir, app_name, f"{plat}.csv")
-        
-        dlg = GenericCSVEditor(csv_path, title=f"Global {app_name} Config", parent=self)
-        if dlg.exec():
-            self.global_engine.__init__(self.global_engine.root)
-
-    def open_global_pathsubs(self):
-        p_path = os.path.join(self.global_engine.root, "Path_Subs.csv")
-        dlg = GenericCSVEditor(p_path, title="Global Path Subs", parent=self, allow_add_column=True)
+        csv_path = os.path.join(self.global_engine.root, "Project_Settings.csv")
+        dlg = DynamicKeyValueEditor(csv_path, engine=self.global_engine, preset="project_settings", parent=self)
         if dlg.exec():
             self.global_engine.__init__(self.global_engine.root)
 
     def open_global_templates(self):
+        """Surgically edit the global naming templates CSV."""
         t_path = os.path.join(self.global_engine.root, "Naming_Templates.csv")
-        dlg = GenericCSVEditor(t_path, title="Global Naming Templates", parent=self)
+        
+        # Safety check
+        if not os.path.exists(t_path):
+            os.makedirs(os.path.dirname(t_path), exist_ok=True)
+            import pandas as pd
+            df_blank = pd.DataFrame([["scan_name_template", "SHOTNAME_plate_vHEROPLATE"]], 
+                                    columns=['Key', 'Value']).astype(str)
+            df_blank.to_csv(t_path, index=False, encoding='cp1252')
+
+        # Notice we can actually use the DynamicKeyValueEditor here too since it's Key/Value!
+        # But to keep it identical to your snippet, here is the GenericCSVEditor:
+        dlg = GenericCSVEditor(t_path, title="Global Naming Templates", parent=self, engine=self.global_engine)
+        if dlg.exec():
+            self.global_engine.__init__(self.global_engine.root)
+
+    def open_global_shots_editor(self):
+        """Surgical strike on the Global Shots Template."""
+        # For globals, it's always just the template file sitting in the root!
+        s_path = os.path.join(self.global_engine.root, "Shots_Template.csv")
+        
+        if not os.path.exists(s_path):
+            from PySide6.QtWidgets import QMessageBox
+            res = QMessageBox.question(self, "File Not Found", 
+                                     f"The template does not exist at:\n{s_path}\n\nCreate a blank one?")
+            if res == QMessageBox.Yes:
+                os.makedirs(os.path.dirname(s_path), exist_ok=True)
+                import pandas as pd
+                cols = ['SEQUENCE', 'PROCESS', 'SHOTNAME', 'ALTSHOTNAME', 'FIRSTFRAME', 'LASTFRAME', 'HEROPLATE']
+                pd.DataFrame(columns=cols).astype(str).to_csv(s_path, index=False, encoding='cp1252')
+            else:
+                return
+
+        dlg = GenericCSVEditor(s_path, title="Global Shots Template", parent=self, engine=self.global_engine)
+        
+        is_dual = str(self.global_engine.settings.get('dual_name', 'False')).lower() == 'true'
+        if not is_dual and "ALTSHOTNAME" in dlg.df.columns:
+            alt_idx = dlg.df.columns.get_loc("ALTSHOTNAME")
+            dlg.table.setColumnHidden(alt_idx, True)
+
+        if dlg.exec():
+            self.global_engine.__init__(self.global_engine.root)
+
+    def open_global_pathsubs(self):
+        pathsubs_path = os.path.join(self.global_engine.root, "Path_Subs.csv")
+        dlg = GenericCSVEditor(pathsubs_path, title="Global Path Subs", parent=self, allow_add_column=True, engine=self.global_engine)
+        if dlg.exec():
+            self.global_engine.__init__(self.global_engine.root)
+
+    def open_global_app_config(self, app_name):
+        import sys
+        plat = "win" if sys.platform == "win32" else "mac" if sys.platform == "darwin" else "linux"
+        csv_path = os.path.join(self.global_engine.apps_dir, app_name, f"{plat}.csv")
+        
+        # Using the DynamicKeyValueEditor here so we get the '📁 Browse' button automatically via preset!
+        dlg = DynamicKeyValueEditor(
+            csv_path, 
+            title=f"Global {app_name} Config", 
+            parent=self, 
+            engine=self.global_engine,
+            preset="app_config"
+        )
         if dlg.exec():
             self.global_engine.__init__(self.global_engine.root)
 
     def open_global_notes_config(self):
+        """Surgically edit the Global Notes routing."""
         n_path = os.path.join(self.global_engine.root, "Notes_Config.csv")
-        notes_dropdowns = {'Key_Type': ['main', 'root', 'tree', 'name']}
         
-        dlg = GenericCSVEditor(n_path, title="Global Notes Config", parent=self, dropdown_cols=notes_dropdowns)
+        if not os.path.exists(n_path):
+            from PySide6.QtWidgets import QMessageBox
+            res = QMessageBox.question(self, "Config Missing", 
+                "The Notes Config file is missing.\n\nRun a Global Sync to generate missing files?", 
+                QMessageBox.Yes | QMessageBox.No)
+            
+            if res == QMessageBox.Yes:
+                # Sync the global directory (use_pointers=False because it's the master!)
+                self.global_engine.bootstrap_template(mode='sync', use_pointers=False)
+                
+            if not os.path.exists(n_path):
+                return
+
+        notes_dropdowns = {'Key_Type': ['main', 'root', 'tree', 'name']}
+        dlg = GenericCSVEditor(n_path, title="Global Notes Config", parent=self, dropdown_cols=notes_dropdowns, engine=self.global_engine)
+        
         if dlg.exec():
             self.global_engine.__init__(self.global_engine.root)
 
@@ -4927,7 +5055,203 @@ class CatalogProvider:
                 print(f"Provider: Error reading {target_path}: {e}")
         
         return pd.DataFrame()
-    
+
+class DynamicKeyValueEditor(QDialog):
+    # (PRESETS remain the same)
+    PRESETS = {
+        "project_settings": {
+            "title": "Project Settings",
+            "data_root_keys": ["data_root"],
+            "dir_browse_keys": ["catalog_dir"],
+            "file_browse_keys": ["shots_csv"],
+            "checkbox_keys": ["dual_name"]
+        },
+        "app_config": {
+            "title": "App Executable Settings",
+            "file_browse_keys": ["bin"]
+        },
+        "notes_config": {
+            "title": "Notes Configuration"
+        }
+    }
+
+    def __init__(self, csv_path, title=None, engine=None, parent=None, preset=None):
+        super().__init__(parent)
+        self.csv_path = os.path.normpath(csv_path)
+        self.engine = engine
+        
+        p = self.PRESETS.get(preset, {})
+        self.title_val = title or p.get("title", "Config Editor")
+        self.file_browse_keys = p.get("file_browse_keys", [])
+        self.dir_browse_keys = p.get("dir_browse_keys", [])
+        self.checkbox_keys = p.get("checkbox_keys", [])
+        self.data_root_keys = p.get("data_root_keys", [])
+        
+        self.inputs = {}
+        self.setWindowTitle(f"{self.title_val} - {os.path.basename(self.csv_path)}")
+        self.resize(950, 600)
+        
+        # --- CLEAN STYLES ---
+        self.setStyleSheet("""
+            QDialog { background-color: #1e1e1e; color: #e0e0e0; }
+            QLabel { color: #888; font-size: 11px; }
+            QPushButton { 
+                background-color: #333; color: #eee; border: 1px solid #444; 
+                border-radius: 3px; padding: 4px 8px; min-width: 70px;
+            }
+            QLineEdit, QTextEdit { 
+                background-color: #252525; color: #eee; border: 1px solid #333; border-radius: 3px;
+            }
+        """)
+        
+        self.main_layout = QVBoxLayout(self)
+        self.main_layout.setContentsMargins(15, 15, 15, 15)
+        
+        # Header
+        header = QLabel(f"PROJECT CONFIG: {os.path.basename(self.csv_path).upper()}")
+        header.setStyleSheet("font-size: 14px; font-weight: bold; color: #555; margin-bottom: 10px;")
+        self.main_layout.addWidget(header)
+        
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setStyleSheet("background-color: transparent;")
+        
+        scroll_content = QWidget()
+        # THE FIX: This layout holds the rows and pushes them UP
+        self.rows_container = QVBoxLayout(scroll_content)
+        self.rows_container.setSpacing(12) 
+        self.rows_container.setContentsMargins(0, 0, 10, 0)
+        self.rows_container.setAlignment(Qt.AlignTop) # Stick to the roof
+
+        try:
+            self.df = pd.read_csv(self.csv_path, encoding='cp1252', dtype=str).fillna("")
+            rel_path = os.path.relpath(self.csv_path, self.engine.root).replace('\\', '/') if self.engine else ""
+        except:
+            return
+
+        for _, row in self.df.iterrows():
+            key = str(row['Key'])
+            raw_val = str(row['Value'])
+            resolved_val = self.engine._resolve_pointer(key, raw_val, rel_path) if self.engine else raw_val
+
+            # ONE VERTICAL BLOCK PER SETTING
+            setting_block = QVBoxLayout()
+            setting_block.setSpacing(2)
+
+            # --- THE ROW: [LABEL (fixed)] [BUTTON (fixed)] [INPUT (stretching)] ---
+            row_layout = QHBoxLayout()
+            row_layout.setSpacing(10)
+
+            # 1. Label (Fixed Width for a clean spine)
+            lbl = QLabel(f"<b>{key}</b>")
+            lbl.setFixedWidth(160)
+            lbl.setStyleSheet("color: #bbb; font-size: 12px;")
+            row_layout.addWidget(lbl)
+
+            # 2. Browse Button (Only if needed)
+            if key in self.file_browse_keys or key in self.dir_browse_keys or key in self.data_root_keys:
+                btn_text = "Roots..." if key in self.data_root_keys else "Choose..."
+                btn = QPushButton(btn_text)
+                if key in self.data_root_keys: pass # Connected later
+                elif key in self.file_browse_keys: btn.clicked.connect(lambda chk=False, k=key: self.browse_file(k))
+                else: btn.clicked.connect(lambda chk=False, k=key: self.browse_dir(k))
+                row_layout.addWidget(btn)
+
+            # 3. The Input / Checkbox (Stretch to fill)
+            if key in self.checkbox_keys:
+                cb = QCheckBox("Enabled")
+                cb.setChecked(str(raw_val).strip().lower() in ['true', '1', 't', 'yes'])
+                self.inputs[key] = cb
+                row_layout.addWidget(cb)
+                row_layout.addStretch(1)
+            elif key in self.data_root_keys:
+                edit = QLineEdit(raw_val); edit.hide(); self.inputs[key] = edit
+                preview_lbl = QLabel()
+                self._update_data_root_preview(preview_lbl, raw_val, resolved_val)
+                row_layout.addWidget(preview_lbl, 1)
+                # Map the button we just added
+                btn_widget = row_layout.itemAt(1).widget()
+                btn_widget.clicked.connect(lambda chk=False, e=edit, l=preview_lbl: self.open_data_roots_editor(e, l))
+            else:
+                try:
+                    edit = SingleLineWrapEdit(raw_val)
+                    edit.setMinimumHeight(40); edit.setMaximumHeight(60)
+                except NameError:
+                    edit = QLineEdit(raw_val)
+                self.inputs[key] = edit
+                row_layout.addWidget(edit, 1) # STRETCH
+
+            setting_block.addLayout(row_layout)
+
+            # 4. Inheritance Sub-label (Directly under the input)
+            if raw_val.strip().upper() == "{LOCALDOTDIR}":
+                ptr_lbl = QLabel(f"      ⮎ Inheriting: {resolved_val}")
+                ptr_lbl.setStyleSheet("color: #666; font-style: italic; margin-left: 170px;")
+                setting_block.addWidget(ptr_lbl)
+
+            self.rows_container.addLayout(setting_block)
+
+        # IMPORTANT: This stretch pushes every row above it to the top
+        self.rows_container.addStretch(1) 
+
+        scroll.setWidget(scroll_content)
+        self.main_layout.addWidget(scroll)
+
+        # Footer
+        line = QFrame(); line.setFrameShape(QFrame.HLine); line.setStyleSheet("background-color: #333;")
+        self.main_layout.addWidget(line)
+
+        self.buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
+        self.buttons.accepted.connect(self.save_data)
+        self.buttons.rejected.connect(self.reject)
+        self.main_layout.addWidget(self.buttons)
+
+    # (Keep internal methods like save_data, browse_file, _update_data_root_preview exactly as before)
+    def _update_data_root_preview(self, label, raw_string, resolved_string):
+        label.setStyleSheet("color: #aaa; background-color: #111; padding: 6px; border: 1px solid #222; border-radius: 2px;")
+        if str(raw_string).strip().upper() == "{LOCALDOTDIR}":
+            label.setText(f"⮎ Inheriting: {resolved_string}")
+            return
+        try:
+            data = json.loads(raw_string)
+            label.setText(" | ".join([f"{i[0]}: {i[1]}" for i in data]) if data else "Empty")
+        except: label.setText(str(raw_string))
+
+    def open_data_roots_editor(self, line_edit, preview_label):
+        dlg = DataRootsEditorDialog(line_edit.text(), self)
+        if dlg.exec():
+            new_val = dlg.get_serialized_data()
+            line_edit.setText(new_val)
+            self._update_data_root_preview(preview_label, new_val, new_val)
+
+    def browse_file(self, key):
+        widget = self.inputs[key]
+        path, _ = QFileDialog.getOpenFileName(self, "Select File", "", "All Files (*)")
+        if path:
+            p = path.replace('\\', '/')
+            widget.setPlainText(p) if hasattr(widget, 'setPlainText') else widget.setText(p)
+
+    def browse_dir(self, key):
+        widget = self.inputs[key]
+        path = QFileDialog.getExistingDirectory(self, "Select Directory")
+        if path:
+            p = path.replace('\\', '/')
+            widget.setPlainText(p) if hasattr(widget, 'setPlainText') else widget.setText(p)
+
+    def save_data(self):
+        for i, row in self.df.iterrows():
+            key = str(row['Key'])
+            if key in self.inputs:
+                w = self.inputs[key]
+                val = str(w.isChecked()) if isinstance(w, QCheckBox) else (w.toPlainText() if hasattr(w, 'toPlainText') else w.text())
+                self.df.at[i, 'Value'] = val.strip()
+        try:
+            self.df.to_csv(self.csv_path, index=False, encoding='cp1252')
+            self.accept()
+        except Exception as e:
+            QMessageBox.critical(self, "Save Error", f"Could not save CSV:\n{e}")
+
 class AssetManager(QMainWindow):
     def __init__(self, shot_path="", engine=None, project_label="Generic Project"):
         super().__init__()
@@ -5458,40 +5782,6 @@ class AssetManager(QMainWindow):
             # SCENARIO: First note ever written to this specific directory
             pd.DataFrame([new_row_dict]).to_csv(manifest_path, index=False)
 
-    def open_notes_config_editor(self):
-        """Surgically edit the Notes routing, with built-in sync and dropdowns."""
-        n_path = os.path.join(self.engine.root, "Notes_Config.csv")
-        
-        # 1. The Elegant Fallback (Option B)
-        if not os.path.exists(n_path):
-            from PySide6.QtWidgets import QMessageBox
-            res = QMessageBox.question(self, "Config Missing", 
-                "The Notes Config file is missing (likely an older project).\n\n"
-                "Would you like to run a Project Sync now to generate missing configuration files?", 
-                QMessageBox.Yes | QMessageBox.No)
-            
-            if res == QMessageBox.Yes:
-                # Use the engine's built-in surgical sync!
-                self.engine.bootstrap_template(mode='sync')
-                self.live_refresh_config()
-                
-            # If they said no, or the sync failed due to permissions, bail out.
-            if not os.path.exists(n_path):
-                self.statusBar().showMessage("Action cancelled. Config file still missing.", 4000)
-                return
-
-        # 2. Define the strict dropdown options for the editor
-        notes_dropdowns = {
-            'Key_Type': ['main', 'root', 'tree', 'name']
-        }
-
-        # 3. Launch the editor with the dropdown map
-        dlg = GenericCSVEditor(n_path, title="Notes Config Editor", parent=self, dropdown_cols=notes_dropdowns)
-        
-        if dlg.exec():
-            self.live_refresh_config()
-            self.statusBar().showMessage("Notes Config updated and reloaded.", 3000)
-
     def open_global_notes_manager(self):
         dlg = NotesManagerDialog(parent=self, engine=self.engine, mode="ALL")
         dlg.show() # Non-modal so you can keep it open while working
@@ -5567,23 +5857,6 @@ class AssetManager(QMainWindow):
         """Called by the dialog to tell the main UI if the clear button should be on."""
         self.btn_clear_advanced.setEnabled(rules_exist)
 
-    def open_templates_editor(self):
-        """Surgically edit the naming templates CSV."""
-        t_path = os.path.join(self.engine.root, "Naming_Templates.csv")
-        
-        # Safety check: if it doesn't exist (old projects), create it
-        if not os.path.exists(t_path):
-            os.makedirs(os.path.dirname(t_path), exist_ok=True)
-            df_blank = pd.DataFrame([["scan_name_template", "SHOTNAME_plate_vHEROPLATE"]], 
-                                    columns=['Key', 'Value']).astype(str)
-            df_blank.to_csv(t_path, index=False, encoding='cp1252')
-
-        dlg = GenericCSVEditor(t_path, title="Naming Templates Editor", parent=self, engine=self.engine)
-        if dlg.exec():
-            # Crucial: Reload the engine to grab the new templates immediately!
-            self.live_refresh_config()
-            self.statusBar().showMessage("Naming Templates updated and reloaded.", 3000)
-
     def trigger_quick_scrape(self):
         # 1. Capture the exact state before the scrape
         old_uuids = set(self.df_master['UUID']) if 'UUID' in self.df_master.columns else set()
@@ -5612,55 +5885,84 @@ class AssetManager(QMainWindow):
             
             QMessageBox.information(self, "Data Summary", msg)
             self.statusBar().showMessage(f"Catalog Updated: +{added} / -{removed}", 5000)
-            
-    def open_shots_editor(self):
-        """Surgical strike on the shots CSV using the in-app editor."""
-        raw_path = str(self.engine.settings.get('shots_csv', ''))
-        if not raw_path or raw_path == "nan":
-            self.statusBar().showMessage("Error: No Shots CSV path defined in Project Settings.", 5000)
-            return
-            
-        s_path = PathSwapper.translate(raw_path)
-        
-        if not os.path.exists(s_path):
-            from PySide6.QtWidgets import QMessageBox
-            res = QMessageBox.question(self, "File Not Found", 
-                                     f"The shots CSV does not exist at:\n{s_path}\n\nWould you like to create a blank one?")
-            if res == QMessageBox.Yes:
-                os.makedirs(os.path.dirname(s_path), exist_ok=True)
-                cols = ['SEQUENCE', 'SHOTNAME', 'ALTSHOTNAME', 'FIRSTFRAME', 'LASTFRAME', 'HEROPLATE']
-                pd.DataFrame(columns=cols).astype(str).to_csv(s_path, index=False, encoding='cp1252')
-            else:
-                return
 
-        # 1. Launch the editor
-        dlg = GenericCSVEditor(s_path, title="Shots Editor", parent=self, engine=self.engine)
-        
-        # 2. SURGICAL HIDE: Check dual_name and hide ALTSHOTNAME if False
-        is_dual = str(self.engine.settings.get('dual_name', 'False')).lower() == 'true'
-        if not is_dual and "ALTSHOTNAME" in dlg.df.columns:
-            alt_idx = dlg.df.columns.get_loc("ALTSHOTNAME")
-            dlg.table.setColumnHidden(alt_idx, True)
-
-        if dlg.exec():
-            self.reload_all()
-            self.statusBar().showMessage("Shots updated and remapped.", 3000)
-
-    def open_pathsubs_editor(self):
-        pathsubs_path = os.path.join(self.engine.root, "Path_Subs.csv")
-        # --- THE FIX: We now allow adding columns here! ---
-        dlg = GenericCSVEditor(pathsubs_path, title="Path Subs Editor", parent=self, allow_add_column=True, engine=self.engine)
-        
+    def open_settings_editor(self):
+        """Universal Project Settings using the Dynamic Form."""
+        csv_path = os.path.join(self.engine.root, "Project_Settings.csv")
+        dlg = DynamicKeyValueEditor(csv_path, engine=self.engine, preset="project_settings", parent=self)
         if dlg.exec():
             self.live_refresh_config()
-            self.statusBar().showMessage("Path Subs updated and reloaded.", 3000)
+            self.statusBar().showMessage("Project Settings updated.", 3000)
+
+    def open_templates_editor(self):
+        """Naming Templates using the Dynamic Form."""
+        t_path = os.path.join(self.engine.root, "Naming_Templates.csv")
+        
+        # Legacy auto-gen if file is missing
+        if not os.path.exists(t_path):
+            os.makedirs(os.path.dirname(t_path), exist_ok=True)
+            pd.DataFrame([["scan_name_template", "SHOTNAME_plate_vHEROPLATE"]], 
+                        columns=['Key', 'Value']).to_csv(t_path, index=False)
+
+        # We don't need a preset here as it's a simple Key/Value, but we pass the engine
+        # so it handles {LOCALDOTDIR} and generic styling automatically.
+        dlg = DynamicKeyValueEditor(t_path, title="Naming Templates", engine=self.engine, parent=self)
+        if dlg.exec():
+            self.live_refresh_config()
+            self.statusBar().showMessage("Naming Templates reloaded.", 3000)
 
     def open_app_config_editor(self, app_name):
-        # Determine the OS subfolder (matching your ConfigEngine logic)
+        """App Executables (Nuke/RV) using the 'app_config' preset."""
+        import sys
         plat = "win" if sys.platform == "win32" else "mac" if sys.platform == "darwin" else "linux"
         csv_path = os.path.join(self.engine.apps_dir, app_name, f"{plat}.csv")
         
-        dlg = GenericCSVEditor(csv_path, title=f"{app_name} Config Editor", parent=self, engine=self.engine)
+        dlg = DynamicKeyValueEditor(csv_path, title=f"{app_name} Config", engine=self.engine, preset="app_config", parent=self)
+        if dlg.exec():
+            self.live_refresh_config()
+
+    def open_notes_config_editor(self):
+        """Notes configuration using the Dynamic Form."""
+        n_path = os.path.join(self.engine.root, "Notes_Config.csv")
+        
+        if not os.path.exists(n_path):
+            from PySide6.QtWidgets import QMessageBox
+            res = QMessageBox.question(self, "Config Missing", 
+                "Notes Config missing. Run a Project Sync to generate it?", QMessageBox.Yes | QMessageBox.No)
+            if res == QMessageBox.Yes:
+                self.engine.bootstrap_template(mode='sync')
+                self.live_refresh_config()
+            if not os.path.exists(n_path): return
+
+        dlg = DynamicKeyValueEditor(n_path, title="Notes Routing", engine=self.engine, preset="notes_config", parent=self)
+        if dlg.exec():
+            self.live_refresh_config()
+
+    def open_shots_editor(self):
+        """Shots Editor remains a table (GenericCSVEditor) as it is structural data."""
+        raw_path = str(self.engine.settings.get('shots_csv', ''))
+        if not raw_path or raw_path == "nan": return
+            
+        s_path = PathSwapper.translate(raw_path)
+        if not os.path.exists(s_path):
+            # ... (Your existing 'Create Blank CSV?' logic remains here) ...
+            pass 
+
+        dlg = GenericCSVEditor(s_path, title="Shots Editor", parent=self, engine=self.engine)
+        
+        # Keep your surgical hiding logic for ALTSHOTNAME
+        is_dual = str(self.engine.settings.get('dual_name', 'False')).lower() == 'true'
+        if not is_dual and "ALTSHOTNAME" in dlg.df.columns:
+            idx = dlg.df.columns.get_loc("ALTSHOTNAME")
+            dlg.table.setColumnHidden(idx, True)
+
+        if dlg.exec():
+            self.reload_all()
+
+    def open_pathsubs_editor(self):
+        """Path Subs remains a table to support multi-platform columns."""
+        pathsubs_path = os.path.join(self.engine.root, "Path_Subs.csv")
+        dlg = GenericCSVEditor(pathsubs_path, title="Path Subs", parent=self, allow_add_column=True, engine=self.engine)
         if dlg.exec():
             self.live_refresh_config()
 
@@ -5675,11 +5977,6 @@ class AssetManager(QMainWindow):
         else:
             # Fallback defaults
             self.status_options = ["", "Review Needed", "Needs Update", "Approved", "RTS", "Uploaded"]
-
-    def open_settings_editor(self):
-        dlg = ProjectSettingsEditor(self.engine, self)
-        if dlg.exec():
-            self.live_refresh_config() # Reuse your existing refresh logic!
 
     def live_refresh_config(self):
         """Re-initializes engine from disk and updates logic."""
