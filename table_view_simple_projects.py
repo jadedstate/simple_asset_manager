@@ -4961,55 +4961,91 @@ class NewProjectDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Create New Project Configuration")
-        self.setMinimumWidth(450)
+        self.setMinimumWidth(550)
         layout = QVBoxLayout(self)
 
+        # --- THE HARD-CODED NUDGE ---
+        # 1. Define the "Sanctuary" root
+        self.default_root = os.path.normpath(
+            os.path.join(os.path.expanduser("~"), ".simplepipemanager", "projects")
+        ).replace('\\', '/')
+        
+        # 2. Ensure it exists so the user doesn't have to manually create it
+        os.makedirs(self.default_root, exist_ok=True)
+
         # Name Input
-        layout.addWidget(QLabel("Project Name:"))
+        layout.addWidget(QLabel("<b>Project Name:</b>"))
         self.edit_name = QLineEdit()
-        self.edit_name.setPlaceholderText("e.g. Rage, Dasein, Project_X")
+        self.edit_name.setPlaceholderText("e.g. Rage, Project_X")
         layout.addWidget(self.edit_name)
 
         # Parent Directory Input
-        layout.addWidget(QLabel("Parent Directory (where the config folder will be created):"))
+        layout.addWidget(QLabel("<b>Parent Directory:</b> (Defaulting to the Studio 'Sanctuary')"))
         h_layout = QHBoxLayout()
-        self.edit_parent = QLineEdit(os.path.expanduser("~"))
+        # Nudge the user by pre-filling the default_root
+        self.edit_parent = QLineEdit(self.default_root)
+        
         btn_browse = QPushButton("Browse...")
+        btn_browse.setStyleSheet("padding: 4px 10px;")
         btn_browse.clicked.connect(self.browse_parent)
+        
         h_layout.addWidget(self.edit_parent)
         h_layout.addWidget(btn_browse)
         layout.addLayout(h_layout)
 
-        # Result Path Preview
-        self.label_preview = QLabel("Result: ")
-        self.label_preview.setStyleSheet("color: #888;")
+        # Result Path Preview (Crucial for visual confirmation)
+        self.label_preview = QLabel("The configuration will be built in:")
+        self.label_preview.setStyleSheet("color: #666; font-size: 11px; margin-top: 10px;")
         layout.addWidget(self.label_preview)
+        
+        self.path_preview = QLabel("...")
+        self.path_preview.setStyleSheet("color: #77aa77; font-family: monospace; font-size: 11px;")
+        self.path_preview.setWordWrap(True)
+        layout.addWidget(self.path_preview)
+
+        # Wiring
         self.edit_name.textChanged.connect(self.update_preview)
         self.edit_parent.textChanged.connect(self.update_preview)
+
+        # Divider
+        line = QFrame(); line.setFrameShape(QFrame.HLine); line.setStyleSheet("color: #333;")
+        layout.addWidget(line)
 
         # Buttons
         self.buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         self.buttons.accepted.connect(self.validate_and_accept)
         self.buttons.rejected.connect(self.reject)
         layout.addWidget(self.buttons)
+        
+        self.update_preview()
 
     def browse_parent(self):
-        res = QFileDialog.getExistingDirectory(self, "Select Parent Directory", self.edit_parent.text())
-        if res: self.edit_parent.setText(res)
+        # Open the browser at the current text (or default if empty)
+        start_dir = self.edit_parent.text() if self.edit_parent.text() else self.default_root
+        res = QFileDialog.getExistingDirectory(self, "Select Parent Directory", start_dir)
+        if res: 
+            self.edit_parent.setText(res.replace('\\', '/'))
 
     def update_preview(self):
-        full_path = os.path.join(self.edit_parent.text(), self.edit_name.text(), "_pipe_config")
-        self.label_preview.setText(f"Result: {full_path}")
+        name = self.edit_name.text().strip()
+        parent = self.edit_parent.text().strip()
+        
+        if not name:
+            self.path_preview.setText("<i>Waiting for project name...</i>")
+            return
+
+        # Explicitly showing the folder structure we've standardized on
+        full_path = os.path.join(parent, name, "_pipe_config").replace('\\', '/')
+        self.path_preview.setText(full_path)
 
     def validate_and_accept(self):
         name = self.edit_name.text().strip()
         parent = self.edit_parent.text().strip()
         
         if not name or not parent:
-            return # Maybe add a shake effect or red border here
+            return
 
-        # The actual config root we intend to build
-        target_dir = os.path.join(parent, name, "_pipe_config")
+        target_dir = os.path.join(parent, name, "_pipe_config").replace('\\', '/')
         
         if os.path.exists(target_dir):
             from PySide6.QtWidgets import QMessageBox
