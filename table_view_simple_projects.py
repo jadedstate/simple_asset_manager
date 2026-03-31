@@ -2122,6 +2122,10 @@ class SubmissionReviewDialog(QDialog):
 
     def quick_save(self):
         """Saves current state to the designated target_path."""
+        # --- NEW: Ensure DataFrame is synced with the Model's current state ---
+        if hasattr(self.model, '_data'):
+            self.review_df = self.model._data 
+
         # Ensure directory exists
         session_dir = os.path.dirname(self.target_path)
         if not os.path.exists(session_dir): 
@@ -2134,15 +2138,18 @@ class SubmissionReviewDialog(QDialog):
             # 2. Sync 'Pending' status back to main window
             parent = self.parent()
             if parent and hasattr(parent, 'df_master'):
-                # Update statuses in the main dataframe
                 sent_uuids = self.review_df['UUID'].tolist()
                 mask = parent.df_master['UUID'].isin(sent_uuids)
                 parent.df_master.loc[mask, 'SUBSTATUS'] = "Pending"
                 
                 # 3. Force the main window to update its session JSON
-                parent.run_autosave()
-                parent.statusBar().showMessage(f"Progress saved to {os.path.basename(self.target_path)}", 3000)
+                if hasattr(parent, 'run_autosave'):
+                    parent.run_autosave()
+                
+                if hasattr(parent, 'statusBar') and parent.statusBar():
+                    parent.statusBar().showMessage(f"Progress saved to {os.path.basename(self.target_path)}", 3000)
         except Exception as e:
+            from PySide6.QtWidgets import QMessageBox
             QMessageBox.critical(self, "Save Error", f"Failed to save session:\n{e}")
 
     def get_target_path(self):
@@ -2277,6 +2284,15 @@ class SubmissionReviewDialog(QDialog):
         return Qt.ItemIsEnabled | Qt.ItemIsSelectable
 
     def save_for_later_action(self):
+        """Surgically commits active edits and saves before closing."""
+        # 1. Force the table to finish any active typing/editing in the current cell
+        if self.table.currentIndex().isValid():
+            self.table.commitData(self.table.viewport())
+            
+        # 2. Run the actual save logic
+        self.quick_save()
+        
+        # 3. Exit with custom code 2 (Save for Later)
         self.done(2)
 
     def setup_ui_polish(self):
@@ -2296,6 +2312,40 @@ class SubmissionReviewDialog(QDialog):
     def get_data(self):
         return self.review_df
     
+    def accept(self):
+        """Custom confirmation before finalizing the submission."""
+        # 1. Force commit any active cell edit
+        if self.table.currentIndex().isValid():
+            self.table.commitData(self.table.viewport())
+        
+        # 2. Gather stats for the summary
+        count = len(self.review_df)
+        dest_name = f"submission_data_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+        
+        # 3. Create the custom Confirmation Dialog
+        msg = QMessageBox(self)
+        msg.setIcon(QMessageBox.Question)
+        msg.setWindowTitle("Confirm Submission")
+        msg.setText(f"You are about to submit <b>{count}</b> items.")
+        msg.setInformativeText(f"Destination: <br/><code style='color: #77aa77;'>{dest_name}</code>")
+        
+        btn_submit_open = msg.addButton("Submit & Open Folder", QMessageBox.AcceptRole)
+        btn_submit = msg.addButton("Submit Only", QMessageBox.AcceptRole)
+        btn_cancel = msg.addButton("Cancel", QMessageBox.RejectRole)
+        
+        msg.setDefaultButton(btn_submit)
+        msg.exec()
+        
+        if msg.clickedButton() == btn_cancel:
+            return # Don't close the review dialog
+
+        # Store the user's choice so the AssetManager can see it
+        self.open_folder_requested = (msg.clickedButton() == btn_submit_open)
+        
+        # Save progress to disk and proceed
+        self.quick_save()
+        super().accept()
+        
     def reject(self):
         """Intercept Cancel to drop the model before hiding the UI."""
         if hasattr(self, 'table') and self.table:
@@ -2778,14 +2828,11 @@ class SessionManagerDialog(QDialog):
             files = sorted(glob.glob(os.path.join(target, "*.csv")), reverse=True)
             self.list_widget.addItems([os.path.basename(f).replace(".csv", "") for f in files])
             
-        # 2. Aggressively strip any Qt auto-selection
+        # Ensure nothing is selected so the preview doesn't show ghost data
         self.list_widget.setCurrentRow(-1)
         self.list_widget.clearSelection()
-        
-        # 3. Wipe the preview pane clean
         self.clear_preview()
         
-        # 4. Unmute the list now that it is stable and empty
         self.list_widget.blockSignals(False)
 
     def load_preview(self, row):
@@ -6165,20 +6212,97 @@ class AssetManager(QMainWindow):
         elif mode == "WIP":
             session_path = os.path.join(base_dir, ".autosaves", "sessions", f"{session_name}.csv")
             df_wip = pd.read_csv(session_path, encoding='cp1252')
-            if 'ABSPATH' in df_wip.columns:
-                df_wip['ABSPATH'] = df_wip['ABSPATH'].apply(PathSwapper.translate)
             
-            # Launch Submission Review
             dlg_review = SubmissionReviewDialog(df_wip, self, engine=self.engine, target_path=session_path)
             result = dlg_review.exec()
             
             if result == 1: # Submit
-                self.process_final_submission(dlg_review.get_data(), session_path=session_path)
-                # Refresh the Manager list if it's open
-                if hasattr(self, 'session_manager_win'): self.session_manager_win.refresh_list()
+                # --- SURGICAL FIX: Match the process_final_submission signature ---
+                request_reveal = getattr(dlg_review, 'open_folder_requested', False)
+                self.process_final_submission(
+                    dlg_review.get_data(), 
+                    session_path=session_path, 
+                    open_folder=request_reveal # Passing the flag here!
+                )
+                
+                # Refresh Manager
+                for widget in self.children():
+                    if isinstance(widget, SessionManagerDialog):
+                        widget.switch_mode("WIP")
+                        break
+                        
             elif result == 2: # Save for Later
                 dlg_review.get_data().to_csv(session_path, index=False)
                 self.run_autosave()
+                for widget in self.children():
+                    if isinstance(widget, SessionManagerDialog):
+                        widget.refresh_list()
+                        break
+
+    def process_final_submission(self, final_df, session_path=None, open_folder=False):
+        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        base_dir = self.engine.project_root
+        
+        if not base_dir:
+            self.statusBar().showMessage("Submission Failed: No base directory found.", 5000)
+            return
+
+        # --- DYNAMIC OUTPUT COLUMNS ---
+        raw_csv_headers = str(self.engine.settings.get('submission_csv_headers', 'LOCALPATH,ALTSHOTNAME,SHOTNAME,FILENAME,FIRST,LAST,SUBNOTES,SUBTYPE'))
+        output_cols = [c.strip() for c in raw_csv_headers.split(',') if c.strip()]
+        
+        is_dual = str(self.engine.settings.get('dual_name', 'False')).lower() == 'true'
+        if not is_dual and 'ALTSHOTNAME' in output_cols:
+            output_cols.remove('ALTSHOTNAME')
+        
+        # 1. Write the External Data CSV
+        data_dir = os.path.join(base_dir, "submission_data")
+        os.makedirs(data_dir, exist_ok=True)
+        
+        final_filename = f"submission_data_{timestamp}.csv"
+        final_data_path = os.path.join(data_dir, final_filename)
+        
+        existing_output = [c for c in output_cols if c in final_df.columns]
+        final_df[existing_output].to_csv(final_data_path, index=False, encoding='cp1252')
+
+        # 2. Update Audit Trail
+        if 'UUID' in final_df.columns:
+            final_df['UUID'] = final_df.apply(lambda x: generate_uuid(x['LOCALPATH'], x['FILENAME']), axis=1)
+            sent_uuids = final_df['UUID'].tolist()
+            
+            log_dir = os.path.join(base_dir, "submission_logs")
+            os.makedirs(log_dir, exist_ok=True)
+            
+            log_df = final_df.copy()
+            log_df['SUBSENT'] = now_str
+            save_cols = [c for c in ['UUID', 'LOCALPATH', 'FILENAME', 'SUBSENT'] if c in log_df.columns]
+            log_df[save_cols].to_csv(os.path.join(log_dir, f"send_{timestamp}.csv"), index=False)
+
+            # Update Main DataFrame
+            mask = self.df_master['UUID'].isin(sent_uuids)
+            self.df_master.loc[mask, 'SUBSTATUS'] = ""
+            def append_ts(val): return now_str if not val or val == "" else f"{val}, {now_str}"
+            self.df_master.loc[mask, 'SUBSENT'] = self.df_master.loc[mask, 'SUBSENT'].apply(append_ts)
+
+        # --- THE REVEAL LOGIC (Simplified to use the argument) ---
+        if open_folder:
+            self.trigger_os_reveal(data_dir, final_filename)
+        
+        # 3. Final Step: Cleanup the Session file
+        if session_path and os.path.exists(session_path):
+            try:
+                os.remove(session_path)
+                session_name = os.path.basename(session_path).replace(".csv", "")
+                if session_name in self.session_cache:
+                    self.session_cache.remove(session_name)
+            except Exception as e:
+                print(f"Cleanup Error: {e}")
+
+        # Refresh the UI
+        self.main_model.dataChanged.emit(self.main_model.index(0,0), self.main_model.index(self.main_model.rowCount()-1, self.main_model.columnCount()-1))
+        self.run_autosave()
+        self.statusBar().showMessage(f"Submission Complete: {timestamp}", 5000)
 
     def add_to_session(self, row_indices, session_name):
         if session_name == "NEW":
@@ -6745,79 +6869,6 @@ class AssetManager(QMainWindow):
         """Helper to find index by name in df_master."""
         try: return self.df_master.columns.get_loc(name)
         except: return -1
-
-    def process_final_submission(self, final_df, session_path=None):
-        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        
-        base_dir = self.engine.project_root
-        
-        if not base_dir:
-            self.statusBar().showMessage("Submission Failed: No base directory found.", 5000)
-            return
-
-        # --- DYNAMIC OUTPUT COLUMNS ---
-        raw_csv_headers = str(self.engine.settings.get('submission_csv_headers', 'LOCALPATH,ALTSHOTNAME,SHOTNAME,FILENAME,FIRST,LAST,SUBNOTES,SUBTYPE'))
-        output_cols = [c.strip() for c in raw_csv_headers.split(',') if c.strip()]
-        
-        # SURGICAL CHECK: Respect dual_name setting and scrub ALTSHOTNAME if it's disabled
-        is_dual = str(self.engine.settings.get('dual_name', 'False')).lower() == 'true'
-        if not is_dual and 'ALTSHOTNAME' in output_cols:
-            output_cols.remove('ALTSHOTNAME')
-        # ------------------------------
-        
-        # Write the External Data CSV
-        data_dir = os.path.join(base_dir, "submission_data")
-        if not os.path.exists(data_dir): os.makedirs(data_dir)
-        
-        # Ensure we only try to write columns that actually exist in the dataframe
-        existing_output = [c for c in output_cols if c in final_df.columns]
-        final_df[existing_output].to_csv(
-            os.path.join(data_dir, f"submission_data_{timestamp}.csv"), 
-            index=False, 
-            encoding='cp1252'
-        )
-
-        # 2. Update Audit Trail (Ensuring local IDs match for logging)
-        if 'UUID' in final_df.columns:
-            # We use the deterministic ID for the log
-            final_df['UUID'] = final_df.apply(lambda x: generate_uuid(x['LOCALPATH'], x['FILENAME']), axis=1)
-            sent_uuids = final_df['UUID'].tolist()
-            
-            log_dir = os.path.join(base_dir, "submission_logs")
-            if not os.path.exists(log_dir): os.makedirs(log_dir)
-            
-            # Save UUID, LOCALPATH, and FILENAME to the log so it can be re-hashed on any OS
-            log_cols = ['UUID', 'LOCALPATH', 'FILENAME', 'SUBSENT']
-            log_df = final_df.copy()
-            log_df['SUBSENT'] = now_str
-            save_cols = [c for c in log_cols if c in log_df.columns]
-            log_df[save_cols].to_csv(os.path.join(log_dir, f"send_{timestamp}.csv"), index=False)
-
-            # Update Main DataFrame
-            mask = self.df_master['UUID'].isin(sent_uuids)
-            self.df_master.loc[mask, 'SUBSTATUS'] = ""
-            def append_ts(val): return now_str if not val or val == "" else f"{val}, {now_str}"
-            self.df_master.loc[mask, 'SUBSENT'] = self.df_master.loc[mask, 'SUBSENT'].apply(append_ts)
-
-        
-        # 3. Final Step: Cleanup the Session file if it exists
-        if session_path and os.path.exists(session_path):
-            try:
-                os.remove(session_path)
-                # Also remove from our internal memory cache so the UI stays in sync
-                session_name = os.path.basename(session_path).replace(".csv", "")
-                if session_name in self.session_cache:
-                    self.session_cache.remove(session_name)
-                
-                self.statusBar().showMessage(f"Submission Complete. Session '{session_name}' cleaned up.", 5000)
-            except Exception as e:
-                print(f"Cleanup Error: Could not delete {session_path}. {e}")
-
-        # Refresh the UI
-        self.main_model.dataChanged.emit(self.main_model.index(0,0), self.main_model.index(self.main_model.rowCount()-1, self.main_model.columnCount()-1))
-        self.run_autosave()
-        self.statusBar().showMessage(f"Submission Complete: {timestamp}", 5000)
 
     def apply_sequence_filter(self, t):
         self.proxy_model.set_sequence_filter(t)
