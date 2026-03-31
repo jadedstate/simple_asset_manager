@@ -2164,7 +2164,11 @@ class SubmissionReviewDialog(QDialog):
         # --- NEW: RV ACTION ---
         rv_act = menu.addAction("Play selection in RV")
         menu.addSeparator()
+
+        rv_scans_act = menu.addAction("Play selection + Hero Scans in RV")
         
+        menu.addSeparator()
+
         remove_act = menu.addAction("Remove from Submission")
 
         menu.addSeparator()
@@ -2188,6 +2192,59 @@ class SubmissionReviewDialog(QDialog):
 
         elif action == rv_act:
             self.launch_rv_from_dialog()
+        elif action == rv_scans_act:
+            self.launch_rv_with_scans_from_dialog()
+
+    def launch_rv_with_scans_from_dialog(self):
+        """Surgically gathers paths using the same robust logic as the simple Play action."""
+        selection = self.table.selectionModel().selectedIndexes()
+        if not selection: return
+
+        rows = sorted({self.proxy.mapToSource(idx).row() for idx in selection})
+        parent = self.parent()
+        
+        final_paths = []
+        target_shots = set()
+        target_ext = "exr" # Default fallback
+
+        for r in rows:
+            path_found = False
+            
+            # --- 1. ROBUST ORIGINALS COLLECTION (Same as simple Play) ---
+            # A. Try ABSPATH first
+            if 'ABSPATH' in self.review_df.columns:
+                folder = str(self.review_df.iat[r, self.review_df.columns.get_loc("ABSPATH")])
+                filename = str(self.review_df.iat[r, self.review_df.columns.get_loc("FILENAME")])
+                if folder and folder != "nan":
+                    final_paths.append(os.path.normpath(os.path.join(folder, filename)))
+                    path_found = True
+            
+            # B. Reconstruct Fallback
+            if not path_found:
+                lp = str(self.review_df.iat[r, self.review_df.columns.get_loc("LOCALPATH")])
+                fn = str(self.review_df.iat[r, self.review_df.columns.get_loc("FILENAME")])
+                final_paths.append(os.path.normpath(os.path.join(self.engine.project_root, lp, fn)))
+
+            # --- 2. GATHER SHOT NAMES FOR SCANS ---
+            shot = str(self.review_df.iat[r, self.review_df.columns.get_loc("SHOTNAME")])
+            if shot and shot != "nan" and shot != "":
+                target_shots.add(shot)
+            
+            # Grab extension for the scan resolver
+            if r == rows[0] and 'FILETYPE' in self.review_df.columns:
+                target_ext = str(self.review_df.iat[r, self.review_df.columns.get_loc("FILETYPE")])
+
+        # --- 3. GATHER HERO SCANS (Using Parent Logic) ---
+        if hasattr(parent, 'resolve_scan_path'):
+            for shot in target_shots:
+                scan_path = parent.resolve_scan_path(shot, target_ext=target_ext)
+                if scan_path:
+                    final_paths.append(os.path.normpath(scan_path))
+
+        # --- 4. TRIGGER VIA PARENT GUARD ---
+        if final_paths:
+            if parent.confirm_missing_files(final_paths, "RV"):
+                parent.trigger_app(final_paths, "RV")
 
     def reveal_selected_in_os(self):
         selection = self.table.selectionModel().selectedIndexes()
