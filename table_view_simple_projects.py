@@ -7,8 +7,9 @@ import hashlib
 import glob
 from PySide6.QtWidgets import (QApplication, QMainWindow, QTableView, QStyledItemDelegate, QComboBox, QButtonGroup, QStackedWidget,
                                QVBoxLayout, QHBoxLayout, QPushButton, QFrame, QHeaderView, QTextEdit, QListWidgetItem, QTableWidget, QTableWidgetItem,
-                               QWidget, QLabel, QLineEdit, QFileDialog, QCheckBox, QDateEdit, QMessageBox, QStyleOptionViewItem, QStyle, QMenuBar,
-                               QMenu, QDialog, QProgressBar, QDialogButtonBox, QSplitter, QListWidget, QFormLayout, QScrollArea)
+                               QWidget, QLabel, QLineEdit, QFileDialog, QCheckBox, QDateEdit, QMessageBox, QStyleOptionViewItem, QStyle, QSpacerItem,
+                               QMenu, QDialog, QProgressBar, QDialogButtonBox, QSplitter, QListWidget, QFormLayout, QScrollArea, QGridLayout,
+                               QSizePolicy)
 from PySide6.QtCore import QAbstractTableModel, Qt, QSortFilterProxyModel, QDate, QEvent, QTimer, QObject, Signal, QThread, QModelIndex
 from PySide6.QtGui import QKeySequence, QAction, QColor, QPalette
 from datetime import datetime
@@ -58,6 +59,144 @@ class ClipboardHelper:
 
         clipboard_text = "\n".join(copy_data)
         QApplication.clipboard().setText(clipboard_text)
+
+class CSVImporter:
+    """The 'Mundane' CSV implementation of our import contract."""
+    def __init__(self, file_path):
+        self.file_path = file_path
+
+    def get_raw_df(self):
+        try:
+            return pd.read_csv(self.file_path, encoding='cp1252', dtype=str).fillna("")
+        except Exception as e:
+            print(f"Import Error: {e}")
+            return None
+
+class AdvancedImportMapperDialog(QDialog):
+    def __init__(self, incoming_df, target_cols, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Surgical Data Importer")
+        self.resize(1200, 800)
+        
+        self.incoming_df = incoming_df
+        self.target_cols = target_cols
+        self.column_mapping_widgets = []
+
+        layout = QVBoxLayout(self)
+        
+        # --- HEADER SECTION ---
+        header_info = QLabel("<b>Mapping Engine:</b> Match columns to Project Headers. Redundant mappings are blocked.")
+        header_info.setStyleSheet("color: #888; margin-bottom: 5px;")
+        layout.addWidget(header_info)
+
+        # --- THE TABLE (The Driver) ---
+        self.table = QTableView()
+        self.table.setAlternatingRowColors(True)
+        self.table.setEditTriggers(QTableView.NoEditTriggers)
+        self.table.horizontalHeader().setStretchLastSection(True)
+        # Make the table expand with the window
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
+        
+        self.model = PandasModel(self.incoming_df, self)
+        self.table.setModel(self.model)
+
+        # --- THE MAPPING BAR (The Passenger) ---
+        self.mapping_bar = QWidget()
+        self.mapping_bar.setStyleSheet("background-color: #222;")
+        self.mapping_layout = QHBoxLayout(self.mapping_bar)
+        self.mapping_layout.setContentsMargins(0, 5, 0, 5)
+        self.mapping_layout.setSpacing(0)
+        
+        # Spacer for vertical header
+        self.v_spacer = QSpacerItem(self.table.verticalHeader().width(), 20, QSizePolicy.Fixed, QSizePolicy.Minimum)
+        self.mapping_layout.addSpacerItem(self.v_spacer)
+
+        for i, col_name in enumerate(self.incoming_df.columns):
+            combo = QComboBox()
+            # We use a custom "Update" method to handle the exclusion logic
+            combo.addItems(["-- Skip --"] + self.target_cols)
+            combo.currentIndexChanged.connect(self.validate_unique_mappings)
+            
+            # Initial Smart Guess
+            if col_name.upper() in [t.upper() for t in self.target_cols]:
+                match = next(t for t in self.target_cols if t.upper() == col_name.upper())
+                combo.setCurrentText(match)
+            
+            self.column_mapping_widgets.append(combo)
+            self.mapping_layout.addWidget(combo)
+
+        layout.addWidget(self.mapping_bar)
+        layout.addWidget(self.table)
+
+        # --- FOOTER ---
+        footer = QHBoxLayout()
+        footer.addWidget(QLabel("<b>Index/Match Column:</b>"))
+        self.index_combo = QComboBox()
+        self.index_combo.addItems(self.target_cols)
+        if "SHOTNAME" in self.target_cols: self.index_combo.setCurrentText("SHOTNAME")
+        footer.addWidget(self.index_combo)
+        footer.addStretch()
+
+        self.buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        self.buttons.accepted.connect(self.accept)
+        self.buttons.rejected.connect(self.reject)
+        footer.addWidget(self.buttons)
+        layout.addLayout(footer)
+
+        # --- EVENT LINKING ---
+        # Sync widths when columns are resized OR window is resized
+        self.table.horizontalHeader().sectionResized.connect(self.sync_column_widths)
+        # Force an initial sync after the window renders
+        QTimer.singleShot(50, self.sync_column_widths)
+        
+        # Run initial validation
+        self.validate_unique_mappings()
+
+    def resizeEvent(self, event):
+        """Ensures the mapping bar stays in sync when the user stretches the window."""
+        super().resizeEvent(event)
+        self.sync_column_widths()
+
+    def sync_column_widths(self):
+        """Strictly aligns dropdowns to the table's header geometry."""
+        # Update the leading spacer to match current vertical header width
+        v_width = self.table.verticalHeader().width()
+        self.v_spacer.changeSize(v_width, 20, QSizePolicy.Fixed, QSizePolicy.Minimum)
+        
+        for i, combo in enumerate(self.column_mapping_widgets):
+            w = self.table.columnWidth(i)
+            combo.setFixedWidth(w)
+        self.mapping_layout.invalidate()
+
+    def validate_unique_mappings(self):
+        """Prevents the user from selecting the same target header twice."""
+        # 1. See what is currently selected across all boxes
+        selected_targets = [
+            c.currentText() for c in self.column_mapping_widgets 
+            if c.currentText() != "-- Skip --"
+        ]
+        
+        # 2. Check for duplicates to disable the OK button
+        has_duplicates = len(selected_targets) != len(set(selected_targets))
+        self.buttons.button(QDialogButtonBox.Ok).setEnabled(not has_duplicates)
+        
+        # 3. Visual feedback: Turn duplicated combos red
+        for combo in self.column_mapping_widgets:
+            val = combo.currentText()
+            if val != "-- Skip --" and selected_targets.count(val) > 1:
+                combo.setStyleSheet("background-color: #662222; color: white;")
+                combo.setToolTip(f"Duplicate mapping: '{val}' is assigned multiple times!")
+            else:
+                combo.setStyleSheet("background-color: #333; color: #eee;")
+                combo.setToolTip("")
+
+    def get_map_config(self):
+        final_map = {}
+        for i, combo in enumerate(self.column_mapping_widgets):
+            target = combo.currentText()
+            if target != "-- Skip --":
+                final_map[target] = self.incoming_df.columns[i]
+        return final_map, self.index_combo.currentText()
 
 class GlobalPointerDelegate(QStyledItemDelegate):
     def __init__(self, engine, csv_path, parent=None):
@@ -1928,24 +2067,38 @@ class SubmissionReviewDialog(QDialog):
             ts = datetime.now().strftime('%Y%m%d_%H%M%S')
             self.target_path = os.path.join(base_dir, ".autosaves", "sessions", f"session_{ts}.csv")
 
-        # 2. SET UNIFIED TITLE
+        self.resize(1800, 600)
         display_name = os.path.basename(self.target_path).replace(".csv", "")
         self.setWindowTitle(f"[{self.project_name}] - Review Submission: {display_name}")
 
-        self.resize(1800, 600)
-
         layout = QVBoxLayout(self)
 
-        self.review_df = df_to_review.copy()
-    
+        # --- TOP TOOLBAR ---
+        top_layout = QHBoxLayout()
+        self.btn_validate = QPushButton("Flag Range Mismatches")
+        self.btn_validate.setCheckable(True)
+        self.btn_validate.setAutoDefault(False)
+        self.btn_validate.setFixedWidth(200)
+        self.btn_validate.setStyleSheet("QPushButton:checked { background-color: #882e2e; color: white; font-weight: bold; }")
+        
+        # Sync initial state from parent AssetManager
+        parent_toggle = getattr(self.parent(), 'btn_validate_ranges', None)
+        if parent_toggle and parent_toggle.isChecked():
+            self.btn_validate.setChecked(True)
 
-        # --- DATA PREP (NOTES & SUBTYPE) ---
+        self.btn_validate.toggled.connect(self.toggle_validation)
+        top_layout.addWidget(self.btn_validate)
+        top_layout.addStretch()
+        layout.addLayout(top_layout)
+
+        self.review_df = df_to_review.copy()    
+
+        # ... (Your existing Data Prep & Re-ordering Logic) ...
         if 'SUBNOTES' not in self.review_df.columns:
             self.review_df['SUBNOTES'] = ""
         else:
             self.review_df['SUBNOTES'] = self.review_df['SUBNOTES'].astype(object).fillna("")
 
-        # Get dropdown options from Project_Settings.csv
         raw_types = str(self.parent().engine.settings.get('submission_types', 'WIP, Final Pending QC, Final QC Approved'))
         self.sub_types = [s.strip() for s in raw_types.split(',') if s.strip()]
         
@@ -1954,90 +2107,79 @@ class SubmissionReviewDialog(QDialog):
         else:
             self.review_df['SUBTYPE'] = self.review_df['SUBTYPE'].astype(object).fillna("")
 
-        # --- DYNAMIC COLUMN RE-ORDERING ---
-        # 1. Fetch the viewing order from settings
         raw_review_headers = str(self.parent().engine.settings.get('submission_review_headers', 'LOCALPATH,ALTSHOTNAME,FILENAME,FIRST,LAST,SUBTYPE,SUBNOTES'))
         priority_cols = [c.strip() for c in raw_review_headers.split(',') if c.strip()]
-        
-        # 2. Get priority columns that actually exist in the DataFrame
         existing_priority = [c for c in priority_cols if c in self.review_df.columns]
-        
-        # 3. Gather leftovers (UUID, ABSPATH, HAS_SHOT, etc.)
         leftovers = [c for c in self.review_df.columns if c not in existing_priority]
-        
-        # 4. Rebuild the DataFrame with the new order
         self.review_df = self.review_df[existing_priority + leftovers]
-        # ----------------------------------
 
-        # --- TABLE SETUP ---
+        # --- TABLE & MODEL SETUP ---
         self.table = QTableView()
         self.table.setAlternatingRowColors(True)
         self.table.setSortingEnabled(True)
         self.table.setEditTriggers(QTableView.AllEditTriggers)
-        self.table.setWordWrap(True)
-        self.table.verticalHeader().setSectionResizeMode(QHeaderView.Interactive)
         
-        # --- MODEL SETUP ---
+        # --- THE FIX: Instantiate model THEN set the flag ---
         self.model = PandasModel(self.review_df, self)
+        self.model.validation_enabled = self.btn_validate.isChecked() # <--- SYNC HERE
         self.model.flags = self.review_dialog_flags 
         
         self.proxy = QSortFilterProxyModel()
         self.proxy.setSourceModel(self.model)
         self.table.setModel(self.proxy)
 
-        # --- DELEGATE INJECTION ---
+        # ... (Rest of your Table/Button/Layout logic) ...
         self.note_idx = self.review_df.columns.get_loc("SUBNOTES")
         self.table.setItemDelegateForColumn(self.note_idx, MultilineDelegate(self.table))
-
         self.type_idx = self.review_df.columns.get_loc("SUBTYPE")
         self.table.setItemDelegateForColumn(self.type_idx, StatusDelegate(self.sub_types, self.table))
-
-        # --- CONTEXT MENU & LAYOUT ---
+        
         self.table.setContextMenuPolicy(Qt.CustomContextMenu)
         self.table.customContextMenuRequested.connect(self.show_row_menu)
-        
         layout.addWidget(self.table)
 
         # --- COLUMN HIDING ---
-        # 1. Hide anything that wasn't explicitly requested in the settings
         cols_to_hide = [c for c in self.review_df.columns if c not in priority_cols]
-        
-        # 2. Maintain the safety check for ALTSHOTNAME (in case it was left in settings but dual_name is off)
-        parent = self.parent()
-        if parent and hasattr(parent, 'engine'):
-            is_dual = str(parent.engine.settings.get('dual_name', 'False')).lower() == 'true'
+        mgr_parent = self.parent()
+        if mgr_parent and hasattr(mgr_parent, 'engine'):
+            is_dual = str(mgr_parent.engine.settings.get('dual_name', 'False')).lower() == 'true'
             if not is_dual and 'ALTSHOTNAME' not in cols_to_hide:
                 cols_to_hide.append('ALTSHOTNAME')
 
-        # 3. Apply the hiding
-        for col in set(cols_to_hide): # Use set to avoid redundant calls
+        for col in set(cols_to_hide):
             if col in self.review_df.columns:
                 idx = self.review_df.columns.get_loc(col)
                 self.table.setColumnHidden(idx, True)
 
-        # --- BUTTONS ---
         btn_layout = QHBoxLayout()
         self.btn_just_save = QPushButton("Save")
         self.btn_just_save.clicked.connect(self.quick_save)
-        
         self.btn_save_exit = QPushButton("Save and Exit")
         self.btn_save_exit.clicked.connect(self.save_for_later_action)
-        
         self.buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         self.buttons.button(QDialogButtonBox.Ok).setText("Submit")
         self.buttons.button(QDialogButtonBox.Cancel).setText("Exit")
-        
-        btn_layout.addWidget(self.btn_just_save)
-        btn_layout.addWidget(self.btn_save_exit)
-        btn_layout.addStretch()
-        btn_layout.addWidget(self.buttons)
+        btn_layout.addWidget(self.btn_just_save); btn_layout.addWidget(self.btn_save_exit); btn_layout.addStretch(); btn_layout.addWidget(self.buttons)
         layout.addLayout(btn_layout)
-
-        self.buttons.accepted.connect(self.accept)
-        self.buttons.rejected.connect(self.reject)
-        
+        self.buttons.accepted.connect(self.accept); self.buttons.rejected.connect(self.reject)
         self.setup_ui_polish()
 
+    def toggle_validation(self, enabled):
+        """Surgically toggles the red highlights in the table."""
+        if hasattr(self, 'model'):
+            self.model.validation_enabled = enabled
+            self.model.layoutChanged.emit()
+    
+    def validate_row_range(self, row_data):
+        """Bridge: Passes the validation request up to the AssetManager."""
+        parent = self.parent()
+        # Keep walking up the tree until we find the AssetManager
+        while parent:
+            if hasattr(parent, 'validate_row_range'):
+                return parent.validate_row_range(row_data)
+            parent = parent.parent()
+        return True, [] # Fallback
+    
     def keyPressEvent(self, event):
         """Surgically intercepts Copy before the Editor can steal the focus."""
         
@@ -2427,7 +2569,7 @@ class PlaylistReviewEditor(QDialog):
         super().__init__(parent)
         self.read_only = read_only
         self.engine = engine
-        
+
         self.project_name = getattr(parent, 'project_label', 'Generic Project')
         self.target_path = target_path
         
@@ -2436,48 +2578,59 @@ class PlaylistReviewEditor(QDialog):
             ts = datetime.now().strftime('%Y%m%d_%H%M%S')
             self.target_path = os.path.join(base_dir, ".autosaves", "playlists", f"playlist_{ts}.csv")
 
-        # 2. SET UNIFIED TITLE
+        self.resize(1800, 600)
         display_name = os.path.basename(self.target_path).replace(".csv", "")
         self.setWindowTitle(f"[{self.project_name}] - Edit Playlist: {display_name}")
 
-        self.resize(1800, 600)
-
         layout = QVBoxLayout(self)
+
+        # --- TOP TOOLBAR ---
+        top_layout = QHBoxLayout()
+        self.btn_validate = QPushButton("Flag Range Mismatches")
+        self.btn_validate.setCheckable(True)
+        self.btn_validate.setAutoDefault(False)
+        self.btn_validate.setFixedWidth(200)
+        self.btn_validate.setStyleSheet("QPushButton:checked { background-color: #882e2e; color: white; font-weight: bold; }")
+        
+        # Sync initial state from parent AssetManager
+        parent_toggle = getattr(self.parent(), 'btn_validate_ranges', None)
+        if parent_toggle and parent_toggle.isChecked():
+            self.btn_validate.setChecked(True)
+
+        self.btn_validate.toggled.connect(self.toggle_validation)
+        top_layout.addWidget(self.btn_validate)
+        top_layout.addStretch()
+        layout.addLayout(top_layout)
 
         self.review_df = df_to_review.copy()
 
-        # --- DATA PREP (NOTES) ---
+        # ... (Data Prep & Column Ordering Logic) ...
         if 'SUBNOTES' not in self.review_df.columns:
             self.review_df['SUBNOTES'] = ""
         else:
             self.review_df['SUBNOTES'] = self.review_df['SUBNOTES'].astype(object).fillna("")
 
-        # --- DYNAMIC COLUMN RE-ORDERING ---
-        # Look for playlist_review_headers, fallback to submission headers if missing
         fallback_headers = str(self.parent().engine.settings.get('submission_review_headers', 'LOCALPATH,ALTSHOTNAME,FILENAME,FIRST,LAST,SUBNOTES'))
         raw_review_headers = str(self.parent().engine.settings.get('playlist_review_headers', fallback_headers))
         priority_cols = [c.strip() for c in raw_review_headers.split(',') if c.strip()]
-        
         existing_priority = [c for c in priority_cols if c in self.review_df.columns]
         leftovers = [c for c in self.review_df.columns if c not in existing_priority]
         self.review_df = self.review_df[existing_priority + leftovers]
 
-        # --- TABLE SETUP ---
+        # --- TABLE & MODEL SETUP ---
         self.table = QTableView()
         self.table.setAlternatingRowColors(True)
         self.table.setSortingEnabled(True)
-        self.table.setEditTriggers(QTableView.AllEditTriggers)
-        self.table.setWordWrap(True)
-        self.table.verticalHeader().setSectionResizeMode(QHeaderView.Interactive)
         
         self.model = PandasModel(self.review_df, self)
+        self.model.validation_enabled = self.btn_validate.isChecked() # <--- SYNC HERE
         self.model.flags = self.review_dialog_flags 
         
         self.proxy = QSortFilterProxyModel()
         self.proxy.setSourceModel(self.model)
         self.table.setModel(self.proxy)
 
-        # Handle Notes (Multiline)
+        # ... (Rest of Buttons & UI Polish) ...
         if "SUBNOTES" in self.review_df.columns:
             self.note_idx = self.review_df.columns.get_loc("SUBNOTES")
             self.table.setItemDelegateForColumn(self.note_idx, MultilineDelegate(self.table))
@@ -2486,38 +2639,37 @@ class PlaylistReviewEditor(QDialog):
         self.table.customContextMenuRequested.connect(self.show_row_menu)
         layout.addWidget(self.table)
 
-        # --- COLUMN HIDING ---
         cols_to_hide = [c for c in self.review_df.columns if c not in priority_cols]
         for col in set(cols_to_hide):
             if col in self.review_df.columns:
                 self.table.setColumnHidden(self.review_df.columns.get_loc(col), True)
 
-        # --- BUTTONS ---
         btn_layout = QHBoxLayout()
-        self.btn_save = QPushButton("Save Playlist")
-        self.btn_save.clicked.connect(self.quick_save)
-        
-        # --- NEW: CREATE SUBMISSION BUTTON ---
+        self.btn_save = QPushButton("Save Playlist"); self.btn_save.clicked.connect(self.quick_save)
         self.btn_create_sub = QPushButton("Create Submission from Playlist")
         self.btn_create_sub.setStyleSheet("background-color: #2e885a; color: white; font-weight: bold;")
         self.btn_create_sub.clicked.connect(self.create_submission_from_playlist)
-        
-        self.btn_play_all = QPushButton("Play All in RV")
-        self.btn_play_all.setStyleSheet("background-color: #2e5a88; color: white; font-weight: bold;")
-        self.btn_play_all.clicked.connect(self.play_all_rv)
-        
-        self.btn_close = QPushButton("Close")
-        self.btn_close.clicked.connect(self.accept)
-        
-        btn_layout.addWidget(self.btn_save)
-        btn_layout.addWidget(self.btn_create_sub) # <--- ADDED
-        btn_layout.addWidget(self.btn_play_all)
-        btn_layout.addStretch()
-        btn_layout.addWidget(self.btn_close)
+        self.btn_play_all = QPushButton("Play All in RV"); self.btn_play_all.setStyleSheet("background-color: #2e5a88; color: white; font-weight: bold;"); self.btn_play_all.clicked.connect(self.play_all_rv)
+        self.btn_close = QPushButton("Close"); self.btn_close.clicked.connect(self.accept)
+        btn_layout.addWidget(self.btn_save); btn_layout.addWidget(self.btn_create_sub); btn_layout.addWidget(self.btn_play_all); btn_layout.addStretch(); btn_layout.addWidget(self.btn_close)
         layout.addLayout(btn_layout)
-
         self.setup_ui_polish()
 
+    def toggle_validation(self, enabled):
+        if hasattr(self, 'model'):
+            self.model.validation_enabled = enabled
+            self.model.layoutChanged.emit()
+    
+    def validate_row_range(self, row_data):
+        """Bridge: Passes the validation request up to the AssetManager."""
+        parent = self.parent()
+        # Keep walking up the tree until we find the AssetManager
+        while parent:
+            if hasattr(parent, 'validate_row_range'):
+                return parent.validate_row_range(row_data)
+            parent = parent.parent()
+        return True, [] # Fallback
+    
     def keyPressEvent(self, event):
         """Surgically intercepts Copy before the Editor can steal the focus."""
         
@@ -3035,7 +3187,7 @@ class SessionManagerDialog(QDialog):
         if current_row >= 0:
             # We call the existing logic, passing the current row index
             self.load_preview(current_row)
-            
+
     def switch_mode(self, mode):
         self.current_mode = mode
 
@@ -3999,20 +4151,33 @@ class PandasModel(QAbstractTableModel):
         if not index.isValid(): return None
         row, col = index.row(), index.column()
         
-        # --- THE DIMMING LOGIC ---
+        # --- THE BACKGROUND / DIMMING / VALIDATION LOGIC ---
         if role == Qt.BackgroundRole:
-            # Check if this row is set to IGNORE in the Source_Type column
+            col_name = self._data.columns[col]
+            
+            # 1. Check for Range Validation (Highest Priority Highlight)
+            if getattr(self, 'validation_enabled', False) and col_name in ['FIRST', 'LAST']:
+                row_data = self._data.iloc[row]
+                # We ask the parent (AssetManager) for the verdict
+                # Note: Parent must implement validate_row_range
+                parent = self.parent()
+                if hasattr(parent, 'validate_row_range'):
+                    is_valid, error_cols = parent.validate_row_range(row_data)
+                    if not is_valid and col_name in error_cols:
+                        return QColor(130, 40, 40) # Muted Red Alert
+
+            # 2. Existing DIMMING Logic
             if "Source_Type" in self._data.columns:
                 src_val = self._data.iat[row, self._data.columns.get_loc("Source_Type")]
                 if src_val == "IGNORE":
                     return QColor(50, 50, 50) # Dark Grey for the whole row
                 
                 # Contextual dimming for SCAN redundant keys
-                col_name = self._data.columns[col]
                 if col_name == "Lookup_Key" and src_val == ["SCAN"]:
-                    return QColor(45, 45, 45) # Slightly different grey for redundancy
+                    return QColor(45, 45, 45) # Slightly different grey
             return None
-        col = index.column()
+
+        # --- DATA EXTRACTION ---
         col_name = self._data.columns[col]
         val = self._data.iloc[row, col]
 
@@ -4021,10 +4186,11 @@ class PandasModel(QAbstractTableModel):
             if role == Qt.CheckStateRole:
                 return Qt.Checked if val is True else Qt.Unchecked
             elif role in (Qt.DisplayRole, Qt.EditRole):
-                return None # Don't show "True/False" text
+                return None 
 
         if role in (Qt.DisplayRole, Qt.EditRole):
             return str(val) if pd.notna(val) else ""
+            
         return None
 
     def flags(self, index):
@@ -5902,7 +6068,17 @@ class AssetManager(QMainWindow):
         date_layout.addWidget(self.cb_latest_only)
         
         # Pushes the date controls tightly to the left
-        date_layout.addStretch() 
+        date_layout.addStretch()
+
+        self.btn_validate_ranges = QPushButton("Flag Range Mismatches")
+        self.btn_validate_ranges.setCheckable(True)
+        self.btn_validate_ranges.setStyleSheet("""
+            QPushButton:checked { background-color: #882e2e; color: white; font-weight: bold; }
+        """)
+        self.btn_validate_ranges.toggled.connect(self.toggle_range_validation)
+        # Add it to your search_layout or actions_layout
+        date_layout.addWidget(self.btn_validate_ranges)
+
         self.layout.addLayout(date_layout)
         
         line = QFrame(); line.setFrameShape(QFrame.HLine); line.setFrameShadow(QFrame.Sunken); self.layout.addWidget(line)
@@ -5974,6 +6150,9 @@ class AssetManager(QMainWindow):
         
         # Build the Menu
         config_menu = QMenu(self)
+        import_menu = config_menu.addMenu("Import...")
+        import_menu.addAction(f"Import Shots data", self.action_import_shots)
+        config_menu.addSeparator()
         config_menu.addAction("Edit Project Settings", self.open_settings_editor)
         config_menu.addSeparator()
         
@@ -6001,6 +6180,41 @@ class AssetManager(QMainWindow):
 
         # Initialize the numbers
         self.update_status_stats()
+
+    def action_import_shots(self):
+        file_path, _ = QFileDialog.getOpenFileName(self, "Select CSV to Import", "", "CSV Files (*.csv)")
+        if not file_path: return
+
+        importer = CSVImporter(file_path)
+        incoming_df = importer.get_raw_df()
+        if incoming_df is None: return
+
+        target_headers = ['SEQUENCE', 'SHOTNAME', 'ALTSHOTNAME', 'FIRSTFRAME', 'LASTFRAME', 'HEROPLATE']
+        
+        # Use the NEW advanced mapper
+        mapper = AdvancedImportMapperDialog(incoming_df, target_headers, self)
+        if mapper.exec() != QDialog.Accepted: return
+        
+        mapping_dict, index_col = mapper.get_map_config()
+        if not mapping_dict: return
+
+        # Transform and Merge (Keep your existing logic here)
+        renamed_df = incoming_df[list(mapping_dict.values())].copy()
+        inv_map = {v: k for k, v in mapping_dict.items()}
+        renamed_df.rename(columns=inv_map, inplace=True)
+
+        self.df_shots = pd.concat([self.df_shots, renamed_df]).drop_duplicates(subset=[index_col], keep='last')
+        
+        s_path = PathSwapper.translate(str(self.engine.settings.get('shots_csv', '')))
+        self.df_shots.to_csv(s_path, index=False)
+        
+        self.reload_all()
+        self.statusBar().showMessage(f"Successfully imported {len(renamed_df)} shots.", 5000)
+        
+    def toggle_range_validation(self, enabled):
+        self.main_model.validation_enabled = enabled
+        # Force the table to repaint everything
+        self.main_model.layoutChanged.emit()
 
     def open_config_hub(self):
         """Launches the new unified configuration interface."""
@@ -7124,6 +7338,37 @@ class AssetManager(QMainWindow):
         # Re-apply the shot filter to the table view
         self.filter_table(self.shot_selector.currentText())
  
+    def validate_row_range(self, row_data):
+        """
+        Compares master row (FIRST/LAST) against shot metadata (FIRSTFRAME/LASTFRAME).
+        Returns (is_valid, error_cols)
+        """
+        shot_name = str(row_data.get('SHOTNAME', '')).strip()
+        if not shot_name or shot_name == "nan" or self.df_shots.empty:
+            return True, []
+
+        # Find the matching shot in metadata
+        match = self.df_shots[
+            (self.df_shots['SHOTNAME'] == shot_name) | 
+            (self.df_shots['ALTSHOTNAME'] == shot_name)
+        ]
+        
+        if match.empty:
+            return True, []
+
+        target = match.iloc[0]
+        error_cols = []
+        
+        # Compare FIRST to FIRSTFRAME
+        if str(row_data.get('FIRST', '')) != str(target.get('FIRSTFRAME', '')):
+            error_cols.append('FIRST')
+            
+        # Compare LAST to LASTFRAME
+        if str(row_data.get('LAST', '')) != str(target.get('LASTFRAME', '')):
+            error_cols.append('LAST')
+
+        return len(error_cols) == 0, error_cols
+    
     def finalize_ui(self):
         """Restored to original logic: precise FILENAME sizing, no global autosize."""
         fabric_columns = [
