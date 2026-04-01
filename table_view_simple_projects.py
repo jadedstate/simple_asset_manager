@@ -6537,8 +6537,17 @@ class AssetManager(QMainWindow):
         self.btn_sessions = QPushButton("Session Manager")
         self.btn_sessions.setStyleSheet("background-color: #5a2e88; font-weight: bold; color: white;")
         self.btn_sessions.clicked.connect(self.open_session_manager)
+
+        self.btn_os_open = QPushButton("Open using OS"); self.btn_os_open.setStyleSheet("background-color: #2e5a88; font-weight: bold; color: white;"); self.btn_os_open.clicked.connect(self.open_file_os_default)
         
-        actions_layout.addWidget(self.btn_rv); actions_layout.addWidget(self.btn_rv_add_scans); actions_layout.addWidget(self.btn_nuke); actions_layout.addWidget(self.btn_send); actions_layout.addWidget(self.btn_sessions); actions_layout.addStretch(); self.layout.addLayout(actions_layout)
+        actions_layout.addWidget(self.btn_rv)
+        actions_layout.addWidget(self.btn_rv_add_scans)
+        actions_layout.addWidget(self.btn_nuke)
+        actions_layout.addWidget(self.btn_send)
+        actions_layout.addWidget(self.btn_sessions)
+        actions_layout.addWidget(self.btn_os_open)
+        actions_layout.addStretch()
+        self.layout.addLayout(actions_layout)
 
         # Inside AssetManager.init_ui
         self.table = QTableView()
@@ -7376,6 +7385,10 @@ class AssetManager(QMainWindow):
 
         # 1. FIXED: Removed the conflicting Ctrl+C shortcut from here
         main_menu.addAction("Open File Location").triggered.connect(self.open_file_location)
+        
+        # --- SURGICAL INJECTION: THE OS OPENER ---
+        main_menu.addAction("Open File (OS Default)").triggered.connect(self.open_file_os_default)
+        # -----------------------------------------
 
         main_menu.addSeparator()
         copy_action = QAction("Copy Selection", self)
@@ -8092,6 +8105,33 @@ class AssetManager(QMainWindow):
              return
              
         self.trigger_os_reveal(folder, filename)
+
+    def open_file_os_default(self):
+        """Opens the selected files in the host OS's default application."""
+        import sys, subprocess, os
+        
+        paths = self.get_selected_paths()
+        if not paths: return
+        
+        for p in paths:
+            # The OS doesn't know how to "double click" a sequence pattern
+            if '%' in p:
+                self.statusBar().showMessage("Cannot open sequence patterns directly. Use 'Open File Location' instead.", 4000)
+                continue
+                
+            if not os.path.exists(p):
+                self.statusBar().showMessage(f"File not found: {p}", 3000)
+                continue
+                
+            try:
+                if sys.platform == "win32":
+                    os.startfile(p) # Windows native 'double-click'
+                elif sys.platform == "darwin":
+                    subprocess.run(['open', p]) # Mac native
+                else:
+                    subprocess.run(['xdg-open', p]) # Linux native
+            except Exception as e:
+                self.statusBar().showMessage(f"Failed to open file: {e}", 4000)
 
     def get_selected_paths(self):
         """Surgical helper to grab absolute paths from selection."""
