@@ -4608,7 +4608,7 @@ class ConfigEngine:
         if not os.path.exists(target_template_dir):
             target_template_dir = os.path.join(manager_dir, "_pipe_config_templates", "_pipe_config_default")
             
-        self.local_dot_dir = target_template_dir
+        self.local_dot_dir = os.path.join(manager_dir, "_pipe_config")
         self.apps_dir = os.path.join(self.root, "Media_Actions")
         
         if bootstrap or not os.path.exists(self.apps_dir):
