@@ -4623,9 +4623,10 @@ class ConfigEngine:
         self.settings = {}
         
         for k, v in raw.items():
-            # CRITICAL FIX: Do NOT pass the JSON string through PathSwapper!
             if k == 'data_root':
-                self.settings[k] = str(v) 
+                # CRITICAL: Preserve the exact JSON string before any swapping
+                self.settings['data_root_raw'] = str(v) 
+                self.settings[k] = str(v)
             elif "/" in str(v) or "\\" in str(v):
                 self.settings[k] = PathSwapper.translate(str(v))
             else:
@@ -4633,21 +4634,20 @@ class ConfigEngine:
 
         # --- THE MULTI-ROOT INTERCEPTOR ---
         self.data_roots = []
-        raw_dr = str(self.settings.get('data_root', '')).strip()
+        # Always read from our protected raw string
+        raw_dr = str(self.settings.get('data_root_raw', '')).strip()
 
         if raw_dr and raw_dr != "nan":
             if "[" in raw_dr:
                 try:
                     import json
-                    # The JSON string is now safe because normpath hasn't ruined it
                     json_ready = raw_dr.replace('\\', '/')
                     dr_list = json.loads(json_ready)
                     
                     if isinstance(dr_list, list):
                         for item in dr_list:
                             if isinstance(item, list) and len(item) >= 2:
-                                r_name = str(item[0])
-                                # NOW we translate the actual path, safely extracted!
+                                r_name = str(item[0]) # Extract the name (e.g., "root_1")
                                 r_path_local = PathSwapper.translate(str(item[1]))
                                 self.data_roots.append((r_name, r_path_local))
                 except Exception as e:
@@ -5641,13 +5641,11 @@ class CatalogProvider:
 
     def get_raw_csv_df(self):
         """The Authority: Decides which catalogs to load based on engine settings."""
-        # 1. Ask the Engine for the clean, already-parsed list we just fixed!
+        # 1. Ask the Engine for the clean, already-parsed list!
         if not hasattr(self.engine, 'data_roots') or not self.engine.data_roots:
-            print("CatalogProvider: No data roots found in engine.")
             return pd.DataFrame()
 
-        # 2. Logic: Get the key from the first tuple (Default Catalog)
-        # e.g., "root_1"
+        # 2. Get the name from the FIRST tuple (e.g., "root_1")
         catalog_key = self.engine.data_roots[0][0]
 
         # 3. Resolve the path (beside _pipe_config)
@@ -5656,18 +5654,15 @@ class CatalogProvider:
         # 4. Load and return
         if os.path.exists(target_path):
             try:
-                print(f"CatalogProvider: Loading UI from {target_path}")
                 return pd.read_csv(target_path, encoding='cp1252', dtype=str).fillna("")
             except Exception as e:
                 print(f"CatalogProvider: Error reading {target_path}: {e}")
-        else:
-            print(f"CatalogProvider: Could not find catalog at {target_path}")
         
         return pd.DataFrame()
     
     def get_catalog_path(self, catalog_name):
         """Resolves a catalog key to a physical CSV path beside the _pipe_config folder."""
-        # self.engine.project_root ensures we are looking at ProjectName/catalogs/
+        # Project_root ensures we look at ProjectName/catalogs/root_1.csv
         full_path = os.path.join(self.engine.project_root, "catalogs", f"{catalog_name}.csv")
         return os.path.normpath(full_path)
 
