@@ -4159,8 +4159,13 @@ class DataRootsEditorDialog(QDialog):
         
         current_path = self.table.item(row, 1).text()
         folder = QFileDialog.getExistingDirectory(self, "Select Root Directory", current_path)
+        
         if folder:
-            self.table.setItem(row, 1, QTableWidgetItem(folder.replace('\\', '/')))
+            # --- THE MANDATORY SANITIZATION ---
+            # We force forward slashes here so the JSON string 
+            # is identical and valid on Mac, Windows, and Linux.
+            clean_path = folder.replace('\\', '/')
+            self.table.setItem(row, 1, QTableWidgetItem(clean_path))
 
     def delete_row_for_widget(self, widget):
         pos = widget.parent().mapTo(self.table, widget.pos())
@@ -4175,13 +4180,17 @@ class DataRootsEditorDialog(QDialog):
             self.table.setItem(row, 1, QTableWidgetItem(folder))
 
     def get_serialized_data(self):
-        """Returns JSON string of strict tuples: [["default", "/path"], ["usb", "/path"]]"""
+        """Returns a strict JSON-compliant list of lists."""
         data = []
         for r in range(self.table.rowCount()):
             name = self.table.item(r, 0).text().strip()
-            path = self.table.item(r, 1).text().strip()
+            # Final safety check: ensure no rogue backslashes enter the JSON string
+            path = self.table.item(r, 1).text().strip().replace('\\', '/')
             if name and path:
                 data.append([name, path])
+        
+        # This now produces [["root_1", "F:/jobs/rage"]] 
+        # instead of [["root_1", "F:\jobs\rage"]]
         return json.dumps(data)
 
 class SelectionModel(PandasModel):
@@ -4616,26 +4625,28 @@ class ConfigEngine:
                          for k, v in raw.items()}
 
         # --- THE MULTI-ROOT INTERCEPTOR ---
-        if 'data_root' in self.settings:
-            raw_dr = str(self.settings['data_root']).strip()
-            
-            # 1. Store the untouched payload for future multi-root scrapers
-            self.settings['data_root_raw'] = raw_dr 
+        self.data_roots = []
+        raw_dr = str(self.settings.get('data_root_raw', self.settings.get('data_root', ''))).strip()
 
-            # 2. Try to extract the first tuple's path for primary pipeline write actions
+        if raw_dr and raw_dr != "nan":
             try:
                 import json
-                dr_list = json.loads(raw_dr)
+                # PRE-PROCESS: Handle potential manual-edit 'garbage'
+                # 1. Convert any tuples () to lists []
+                # 2. Convert any backslashes to forward slashes for JSON safety
+                json_ready = raw_dr.replace('(', '[').replace(')', ']').replace('\\', '/')
                 
-                if isinstance(dr_list, list) and len(dr_list) > 0:
-                    first_item = dr_list[0]
-                    # We expect format: [["name", "/path"], ["name2", "/path2"]]
-                    if isinstance(first_item, (list, tuple)) and len(first_item) >= 2:
-                        self.settings['data_root'] = str(first_item[1])
-            except Exception:
-                # It's a legacy flat string (e.g. "/Volumes/jobs"). 
-                # Do nothing, leave self.settings['data_root'] exactly as it is!
-                pass
+                dr_list = json.loads(json_ready)
+                
+                if isinstance(dr_list, list):
+                    for item in dr_list:
+                        if isinstance(item, list) and len(item) >= 2:
+                            # 3. TRANSLATE: Hand the normalized path to the Swapper
+                            # The Swapper turns "F:/jobs" into "F:\jobs" for Windows tools.
+                            self.data_roots.append((item[0], PathSwapper.translate(item[1])))
+            except:
+                # Legacy Fallback
+                self.data_roots.append(("default", PathSwapper.translate(raw_dr)))
                 
         self.apps = self._discover_apps()
         # Load Naming Templates
@@ -5829,6 +5840,7 @@ class UpdateScrapeDialog(QDialog):
         # --- NEW: PRE-FLIGHT ACCESSIBILITY CHECK ---
         missing_roots = []
         for name, r_path in self.roots_list:
+            print("R_PATH: ", r_path)
             if not os.path.exists(r_path):
                 missing_roots.append(f"{name}: {r_path}")
 
