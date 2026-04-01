@@ -5982,6 +5982,9 @@ class DataSourcesDock(QDockWidget):
 
     def setup_ui(self):
         self.container = QWidget()
+
+        self.container.setMinimumWidth(250)
+
         self.layout = QVBoxLayout(self.container)
 
         # 1. HEADER
@@ -6277,7 +6280,7 @@ class AssetManager(QMainWindow):
         self.catalog_provider = CatalogProvider(self.engine)
         
         self.setWindowTitle(f"[{self.project_label}] - Pipeline Asset Manager")
-        self.resize(1500, 850)
+        self.resize(1800, 1200)
 
         # Status Options Logic
         status_raw = self.engine.settings.get('status_options', "")
@@ -6635,13 +6638,12 @@ class AssetManager(QMainWindow):
 
     def setup_data_dock(self):
         self.data_dock = DataSourcesDock(self, self.engine)
-        self.addDockWidget(Qt.LeftDockWidgetArea, self.data_dock)
+        self.addDockWidget(Qt.RightDockWidgetArea, self.data_dock)
+
+        self.resizeDocks([self.data_dock], [275], Qt.Horizontal)
+
         self.data_dock.hide()
         self.data_dock.visibilityChanged.connect(self.btn_data_dock.setChecked)
-        
-        # --- SURGICAL INJECTION: Wire the dock directly to your reload method! ---
-        # When "UPDATE VIEW" is clicked, it sends the active_ids list, but reload_all 
-        # just pulls them directly, so we just call self.reload_all()
         self.data_dock.request_reload.connect(lambda active_ids: self.reload_all())
 
     def toggle_data_dock(self, checked):
