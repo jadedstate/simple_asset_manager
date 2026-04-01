@@ -5829,7 +5829,7 @@ class UpdateScrapeDialog(QDialog):
         # --- NEW: PRE-FLIGHT ACCESSIBILITY CHECK ---
         missing_roots = []
         for name, r_path in self.roots_list:
-            if not os.path.exists(os.path.normpath(r_path)):
+            if not os.path.exists(r_path):
                 missing_roots.append(f"{name}: {r_path}")
 
         if missing_roots:
