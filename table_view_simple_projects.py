@@ -4609,7 +4609,6 @@ class ConfigEngine:
             target_template_dir = os.path.join(manager_dir, "_pipe_config_templates", "_pipe_config_default")
             
         self.local_dot_dir = target_template_dir
-        
         self.apps_dir = os.path.join(self.root, "Media_Actions")
         
         if bootstrap or not os.path.exists(self.apps_dir):
@@ -4624,32 +4623,38 @@ class ConfigEngine:
         self.settings = {k: PathSwapper.translate(str(v)) if ("/" in str(v) or "\\" in str(v)) else v 
                          for k, v in raw.items()}
 
-        # --- THE MULTI-ROOT INTERCEPTOR ---
+        # --- THE MULTI-ROOT INTERCEPTOR (Restored & Fixed) ---
         self.data_roots = []
+        # Look for data_root_raw first, fall back to data_root
         raw_dr = str(self.settings.get('data_root_raw', self.settings.get('data_root', ''))).strip()
 
         if raw_dr and raw_dr != "nan":
-            try:
-                import json
-                # PRE-PROCESS: Handle potential manual-edit 'garbage'
-                # 1. Convert any tuples () to lists []
-                # 2. Convert any backslashes to forward slashes for JSON safety
-                json_ready = raw_dr.replace('(', '[').replace(')', ']').replace('\\', '/')
+            # SURGICAL CHECK: If it contains brackets, try to parse JSON
+            if "[" in raw_dr:
+                try:
+                    import json
+                    # Pre-clean for JSON parser safety
+                    json_ready = raw_dr.replace('(', '[').replace(')', ']').replace('\\', '/')
+                    dr_list = json.loads(json_ready)
+                    
+                    if isinstance(dr_list, list):
+                        for item in dr_list:
+                            if isinstance(item, list) and len(item) >= 2:
+                                # TRANSLATE: Swapper turns "F:/jobs" into "F:\jobs"
+                                self.data_roots.append((str(item[0]), PathSwapper.translate(str(item[1]))))
+                except:
+                    # If JSON fails, it might be a weirdly formatted single path
+                    self.data_roots = [("default", PathSwapper.translate(raw_dr))]
+            else:
+                # Standard legacy flat string
+                self.data_roots = [("default", PathSwapper.translate(raw_dr))]
+        
+        # Ensure self.settings['data_root'] is a clean string for legacy tool compatibility
+        if self.data_roots:
+            self.settings['data_root'] = self.data_roots[0][1]
                 
-                dr_list = json.loads(json_ready)
-                
-                if isinstance(dr_list, list):
-                    for item in dr_list:
-                        if isinstance(item, list) and len(item) >= 2:
-                            # 3. TRANSLATE: Hand the normalized path to the Swapper
-                            # The Swapper turns "F:/jobs" into "F:\jobs" for Windows tools.
-                            self.data_roots.append((item[0], PathSwapper.translate(item[1])))
-            except:
-                # Legacy Fallback
-                self.data_roots.append(("default", PathSwapper.translate(raw_dr)))
-                
+        # --- CRITICAL: THESE MUST RUN TO FINISH INIT ---
         self.apps = self._discover_apps()
-        # Load Naming Templates
         self.naming_templates = self._load_kv_csv("Naming_Templates.csv")
 
     def _resolve_pointer(self, key, value, filename):
