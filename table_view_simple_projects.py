@@ -4800,7 +4800,10 @@ class ConfigEngine:
             ["data_root", ptr("", force_local=True)],
             # catalog_dir physically lives in the local project, so force local
             ["catalog_dir", ptr(self.project_root.replace('\\', '/'), force_local=True)], 
-            ["shots_csv", ptr("Shots_Template.csv")],
+            
+            # --- THE UPDATE: Absolute path to the generated Shots_Template.csv ---
+            ["shots_csv", ptr(os.path.join(target_dir, "Shots_Template.csv").replace('\\', '/'), force_local=True)],
+            
             ["dual_name", ptr("False")],
             ["submission_types", ptr("WIP, Final Pending QC, Final QC Approved")],
             ["status_options", ptr("Ready for Review, Needs Update, Approved, RTS, Pending")],
