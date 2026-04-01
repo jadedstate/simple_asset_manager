@@ -5641,39 +5641,34 @@ class CatalogProvider:
 
     def get_raw_csv_df(self):
         """The Authority: Decides which catalogs to load based on engine settings."""
-        # 1. Demand the raw list of data roots
-        raw_dr = self.engine.settings.get('data_root_raw', [])
-        
-        # 2. Safe evaluation if it's a string from the CSV
-        if isinstance(raw_dr, str):
-            try:
-                import ast
-                raw_dr = ast.literal_eval(raw_dr)
-            except:
-                return pd.DataFrame()
-
-        if not raw_dr or not isinstance(raw_dr, list):
+        # 1. Ask the Engine for the clean, already-parsed list we just fixed!
+        if not hasattr(self.engine, 'data_roots') or not self.engine.data_roots:
+            print("CatalogProvider: No data roots found in engine.")
             return pd.DataFrame()
 
-        # 3. Logic: Get the key from the first tuple (Default Catalog)
-        catalog_key = raw_dr[0][0]
+        # 2. Logic: Get the key from the first tuple (Default Catalog)
+        # e.g., "root_1"
+        catalog_key = self.engine.data_roots[0][0]
 
-        # 4. Ask the Engine for the path to this specific key
-        target_path = self.engine.get_catalog_path(catalog_key)
+        # 3. Resolve the path (beside _pipe_config)
+        target_path = self.get_catalog_path(catalog_key)
 
-        # 5. Load and return
+        # 4. Load and return
         if os.path.exists(target_path):
             try:
+                print(f"CatalogProvider: Loading UI from {target_path}")
                 return pd.read_csv(target_path, encoding='cp1252', dtype=str).fillna("")
             except Exception as e:
-                print(f"Provider: Error reading {target_path}: {e}")
+                print(f"CatalogProvider: Error reading {target_path}: {e}")
+        else:
+            print(f"CatalogProvider: Could not find catalog at {target_path}")
         
         return pd.DataFrame()
     
     def get_catalog_path(self, catalog_name):
-        """Resolves a catalog key to a physical CSV path in the _pipe_config/catalogs folder."""
-        # The engine.root IS the _pipe_config folder.
-        full_path = os.path.join(self.engine.root, "catalogs", f"{catalog_name}.csv")
+        """Resolves a catalog key to a physical CSV path beside the _pipe_config folder."""
+        # self.engine.project_root ensures we are looking at ProjectName/catalogs/
+        full_path = os.path.join(self.engine.project_root, "catalogs", f"{catalog_name}.csv")
         return os.path.normpath(full_path)
 
 class Scraper(QObject):
