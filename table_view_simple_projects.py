@@ -1859,200 +1859,6 @@ class MultilineDelegate(QStyledItemDelegate):
     def setModelData(self, editor, model, index):
         model.setData(index, editor.toPlainText(), Qt.EditRole)
 
-class Scraper(QObject):
-    progress = Signal(int)
-    finished = Signal()
-
-    def __init__(self, roots_list, output_dir, blacklist_str=""):
-        super().__init__()
-        # List of [name, path] tuples
-        self.roots_list = roots_list 
-        self.output_dir = PathSwapper.translate(output_dir)
-        
-        self.blacklist = [os.path.normpath(p.strip()) for p in blacklist_str.split(',') if p.strip()]
-        self.ext_singles = {".nk", ".mov", ".mp4", ".ods", ".zip"}
-        self.ext_sequences = {".exr", ".jpg", ".png", ".tiff", ".dpx"}
-
-    def run(self):
-        # 1. PRE-FLIGHT: Validate roots and count total directories for the single progress bar
-        valid_roots = []
-        total_dirs = 0
-        for name, r_path in self.roots_list:
-            clean_root = os.path.normpath(PathSwapper.translate(r_path))
-            if os.path.exists(clean_root):
-                valid_roots.append((name, clean_root))
-                total_dirs += sum([len(dirs) for _, dirs, _ in os.walk(clean_root)])
-                
-        processed_dirs = 0
-        clean_blacklist = [p.lower() for p in self.blacklist]
-
-        # Ensure output directory exists once
-        if self.output_dir and not os.path.exists(self.output_dir):
-            os.makedirs(self.output_dir, exist_ok=True)
-
-        # 2. THE MAIN LOOP: Iterate over each valid root
-        for root_name, current_root_dir in valid_roots:
-            potential_sequences = defaultdict(list)
-            final_rows = []
-            
-            for root, dirs, files in os.walk(current_root_dir):
-                # --- THE BLACKLIST PRUNING ---
-                for d in list(dirs):
-                    full_dir_path = os.path.normpath(os.path.join(root, d))
-                    if d.lower() in clean_blacklist or full_dir_path.lower() in clean_blacklist:
-                        dirs.remove(d)
-                
-                # --- UPDATE PROGRESS ---
-                processed_dirs += 1
-                self.progress.emit(int((processed_dirs / (total_dirs + 1)) * 100))
-                
-                # Use current_root_dir to calculate relative path
-                local_p = self.get_local_path(root, current_root_dir)
-                
-                for f in files:
-                    ext = os.path.splitext(f)[1].lower()
-                    full_path = os.path.join(root, f)
-                    if ext in self.ext_singles:
-                        stat = os.stat(full_path)
-                        final_rows.append(self.format_row(root, local_p, f, ext, "-", "-", stat.st_ctime, stat.st_mtime))
-                    elif ext in self.ext_sequences:
-                        match = re.search(r'^(.*?)([._])(\d+)(\.[^.]+)$', f)
-                        if match:
-                            prefix, separator, frame, extension = match.groups()
-                            potential_sequences[(root, local_p, prefix, separator, extension)].append({
-                                "frame": int(frame), "pad": len(frame), "path": full_path, "original_name": f
-                            })
-                        else:
-                            stat = os.stat(full_path)
-                            final_rows.append(self.format_row(root, local_p, f, ext, "-", "-", stat.st_ctime, stat.st_mtime))
-
-            # --- PROCESS SEQUENCES ---
-            for (folder, local_folder, prefix, separator, ext), items in potential_sequences.items():
-                if len(items) > 1:
-                    items.sort(key=lambda x: x["frame"])
-                    all_stats = [os.stat(i["path"]) for i in items]
-                    formatted_name = f"{prefix}{separator}%0{items[0]['pad']}d{ext}"
-                    final_rows.append(self.format_row(folder, local_folder, formatted_name, ext, min(i["frame"] for i in items), max(i["frame"] for i in items), 
-                                                    min(s.st_ctime for s in all_stats), max(s.st_mtime for s in all_stats)))
-                else:
-                    item = items[0]
-                    stat = os.stat(item["path"])
-                    final_rows.append(self.format_row(folder, local_folder, item["original_name"], ext, "-", "-", stat.st_ctime, stat.st_mtime))
-
-            # --- 3. WRITE THE ISOLATED CSV ---
-            output_csv = os.path.join(self.output_dir, f"{root_name}.csv")
-            headers = ["ABSPATH", "LOCALPATH", "FILENAME", "FILETYPE", "FIRST", "LAST", "CREATION", "MODDATE"]
-            
-            with open(output_csv, "w", newline="", encoding='cp1252') as f:
-                writer = csv.DictWriter(f, fieldnames=headers)
-                writer.writeheader()
-                writer.writerows(final_rows)
-                
-        self.finished.emit()
-
-    def get_local_path(self, full_root, base_dir):
-        """Surgical removal of current base_dir from the ABSPATH."""
-        rel = os.path.relpath(full_root, base_dir)
-        return "" if rel == "." else rel
-
-    def format_row(self, root, local_root, name, ext, first, last, ctime, mtime):
-        return {
-            "ABSPATH": root, 
-            "LOCALPATH": local_root,
-            "FILENAME": name, 
-            "FILETYPE": ext.lstrip('.'),
-            "FIRST": first, "LAST": last,
-            "CREATION": datetime.fromtimestamp(ctime).strftime("%Y-%m-%d %H:%M:%S"),
-            "MODDATE": datetime.fromtimestamp(mtime).strftime("%Y-%m-%d %H:%M:%S")
-        }
-
-class UpdateScrapeDialog(QDialog):
-    def __init__(self, parent=None, engine=None):
-        super().__init__(parent)
-        self.engine = engine
-        self.setWindowTitle("Update Data")
-        self.setMinimumWidth(450)
-        layout = QVBoxLayout(self)
-
-        # 1. PARSE THE DATA ROOTS
-        raw_dr = str(self.engine.settings.get('data_root_raw', ''))
-        self.roots_list = []
-        try:
-            import json
-            parsed_dr = json.loads(raw_dr)
-            if isinstance(parsed_dr, list):
-                for item in parsed_dr:
-                    if isinstance(item, list) and len(item) >= 2:
-                        self.roots_list.append((str(item[0]), str(item[1])))
-        except:
-            # Legacy flat string fallback
-            flat_root = str(self.engine.settings.get('data_root', ''))
-            if flat_root:
-                self.roots_list.append(("default", flat_root))
-
-        # 2. RESOLVE THE CATALOG DIRECTORY
-        base_output_dir = self.engine.project_root
-        self.output_dir = os.path.join(base_output_dir, "catalogs")
-
-        # 3. BUILD THE UI PREVIEW
-        layout.addWidget(QLabel("<b>Ready to update data from the following roots:</b>"))
-        
-        roots_text = ""
-        for name, path in self.roots_list:
-            roots_text += f"• <b>{name}</b>: {path}<br>"
-        if not roots_text:
-            roots_text = "<i>No data roots configured.</i>"
-            
-        lbl_roots = QLabel(roots_text)
-        lbl_roots.setStyleSheet("padding-left: 10px; color: #aaa;")
-        layout.addWidget(lbl_roots)
-        
-        layout.addWidget(QLabel(f"<br><b>To Catalog Directory:</b><br>{self.output_dir}<br>"))
-
-        self.pbar = QProgressBar()
-        self.pbar.setVisible(False)
-        layout.addWidget(self.pbar)
-
-        self.buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        self.buttons.button(QDialogButtonBox.Ok).setText("Proceed")
-        
-        if not self.roots_list:
-            self.buttons.button(QDialogButtonBox.Ok).setEnabled(False)
-            
-        self.buttons.accepted.connect(self.start_scrape)
-        self.buttons.rejected.connect(self.reject)
-        layout.addWidget(self.buttons)
-
-    def start_scrape(self):
-        # We don't check os.path.exists here anymore, as the Scraper does a pre-flight check internally
-        self.pbar.setVisible(True)
-        self.buttons.setEnabled(False)
-        
-        blacklist_val = str(self.engine.settings.get('scrape_blacklist', ''))
-        
-        self.thread = QThread()
-        # Pass the parsed roots list and output directory
-        self.worker = Scraper(self.roots_list, self.output_dir, blacklist_str=blacklist_val)
-        
-        self.worker.moveToThread(self.thread)
-        self.thread.started.connect(self.worker.run)
-        self.worker.progress.connect(self.pbar.setValue)
-        self.worker.finished.connect(self.on_finished)
-        self.thread.start()
-
-    def on_finished(self):
-        self.thread.quit()
-        self.thread.wait()
-        self.accept()
-
-    def closeEvent(self, event):
-        if hasattr(self, 'thread') and self.thread.isRunning():
-            from PySide6.QtWidgets import QMessageBox
-            QMessageBox.warning(self, "Scrape in Progress", "Please wait for the scrape to finish before closing.")
-            event.ignore() 
-        else:
-            event.accept()
-
 class SubmissionReviewDialog(QDialog):
     def __init__(self, df_to_review, parent=None, engine=None, target_path=None, read_only=False):
         super().__init__(parent)
@@ -4531,6 +4337,205 @@ class ConfigHub(QDialog):
     def exec_(self):
         return super().exec_()
 
+class DynamicKeyValueEditor(QDialog):
+    PRESETS = {
+        "project_settings": {
+            "title": "Project Settings",
+            "data_root_keys": ["data_root"],
+            "dir_browse_keys": ["catalog_dir"],
+            "file_browse_keys": ["shots_csv"],
+            "checkbox_keys": ["dual_name"]
+        },
+        "app_config": {
+            "title": "App Executable Settings",
+            "file_browse_keys": ["bin"]
+        },
+        "notes_config": {
+            "title": "Notes Configuration"
+        },
+        "user_prefs": {
+            "title": "User Preferences",
+            "dir_browse_keys": ["user_projects_default_dir"]
+        }
+    }
+
+    def __init__(self, csv_path, title=None, engine=None, parent=None, preset=None):
+        super().__init__(parent)
+        self.csv_path = os.path.normpath(csv_path)
+        self.engine = engine
+        
+        p = self.PRESETS.get(preset, {})
+        self.title_val = title or p.get("title", "Config Editor")
+        self.file_browse_keys = p.get("file_browse_keys", [])
+        self.dir_browse_keys = p.get("dir_browse_keys", [])
+        self.checkbox_keys = p.get("checkbox_keys", [])
+        self.data_root_keys = p.get("data_root_keys", [])
+        
+        self.inputs = {}
+        self.setWindowTitle(f"{self.title_val} - {os.path.basename(self.csv_path)}")
+        self.resize(950, 600)
+        
+        # --- CLEAN STYLES ---
+        self.setStyleSheet("""
+            QDialog { background-color: #1e1e1e; color: #e0e0e0; }
+            QLabel { color: #888; font-size: 11px; }
+            QPushButton { 
+                background-color: #333; color: #eee; border: 1px solid #444; 
+                border-radius: 3px; padding: 4px 8px; min-width: 70px;
+            }
+            QLineEdit, QTextEdit { 
+                background-color: #252525; color: #eee; border: 1px solid #333; border-radius: 3px;
+            }
+        """)
+        
+        self.main_layout = QVBoxLayout(self)
+        self.main_layout.setContentsMargins(15, 15, 15, 15)
+        
+        # Header
+        header = QLabel(f"PROJECT CONFIG: {os.path.basename(self.csv_path).upper()}")
+        header.setStyleSheet("font-size: 14px; font-weight: bold; color: #555; margin-bottom: 10px;")
+        self.main_layout.addWidget(header)
+        
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setStyleSheet("background-color: transparent;")
+        
+        scroll_content = QWidget()
+        # THE FIX: This layout holds the rows and pushes them UP
+        self.rows_container = QVBoxLayout(scroll_content)
+        self.rows_container.setSpacing(12) 
+        self.rows_container.setContentsMargins(0, 0, 10, 0)
+        self.rows_container.setAlignment(Qt.AlignTop) # Stick to the roof
+
+        try:
+            self.df = pd.read_csv(self.csv_path, encoding='cp1252', dtype=str).fillna("")
+            rel_path = os.path.relpath(self.csv_path, self.engine.root).replace('\\', '/') if self.engine else ""
+        except:
+            return
+
+        for _, row in self.df.iterrows():
+            key = str(row['Key'])
+            raw_val = str(row['Value'])
+            resolved_val = self.engine._resolve_pointer(key, raw_val, rel_path) if self.engine else raw_val
+
+            # ONE VERTICAL BLOCK PER SETTING
+            setting_block = QVBoxLayout()
+            setting_block.setSpacing(2)
+
+            # --- THE ROW: [LABEL (fixed)] [BUTTON (fixed)] [INPUT (stretching)] ---
+            row_layout = QHBoxLayout()
+            row_layout.setSpacing(10)
+
+            # 1. Label (Fixed Width for a clean spine)
+            lbl = QLabel(f"<b>{key}</b>")
+            lbl.setFixedWidth(160)
+            lbl.setStyleSheet("color: #bbb; font-size: 12px;")
+            row_layout.addWidget(lbl)
+
+            # 2. Browse Button (Only if needed)
+            if key in self.file_browse_keys or key in self.dir_browse_keys or key in self.data_root_keys:
+                btn_text = "Roots..." if key in self.data_root_keys else "Choose..."
+                btn = QPushButton(btn_text)
+                if key in self.data_root_keys: pass # Connected later
+                elif key in self.file_browse_keys: btn.clicked.connect(lambda chk=False, k=key: self.browse_file(k))
+                else: btn.clicked.connect(lambda chk=False, k=key: self.browse_dir(k))
+                row_layout.addWidget(btn)
+
+            # 3. The Input / Checkbox (Stretch to fill)
+            if key in self.checkbox_keys:
+                cb = QCheckBox("Enabled")
+                cb.setChecked(str(raw_val).strip().lower() in ['true', '1', 't', 'yes'])
+                self.inputs[key] = cb
+                row_layout.addWidget(cb)
+                row_layout.addStretch(1)
+            elif key in self.data_root_keys:
+                edit = QLineEdit(raw_val); edit.hide(); self.inputs[key] = edit
+                preview_lbl = QLabel()
+                self._update_data_root_preview(preview_lbl, raw_val, resolved_val)
+                row_layout.addWidget(preview_lbl, 1)
+                # Map the button we just added
+                btn_widget = row_layout.itemAt(1).widget()
+                btn_widget.clicked.connect(lambda chk=False, e=edit, l=preview_lbl: self.open_data_roots_editor(e, l))
+            else:
+                try:
+                    edit = SingleLineWrapEdit(raw_val)
+                    edit.setMinimumHeight(40); edit.setMaximumHeight(60)
+                except NameError:
+                    edit = QLineEdit(raw_val)
+                self.inputs[key] = edit
+                row_layout.addWidget(edit, 1) # STRETCH
+
+            setting_block.addLayout(row_layout)
+
+            # 4. Inheritance Sub-label (Directly under the input)
+            if raw_val.strip().upper() == "{LOCALDOTDIR}":
+                ptr_lbl = QLabel(f"      ⮎ Inheriting: {resolved_val}")
+                ptr_lbl.setStyleSheet("color: #666; font-style: italic; margin-left: 170px;")
+                setting_block.addWidget(ptr_lbl)
+
+            self.rows_container.addLayout(setting_block)
+
+        # IMPORTANT: This stretch pushes every row above it to the top
+        self.rows_container.addStretch(1) 
+
+        scroll.setWidget(scroll_content)
+        self.main_layout.addWidget(scroll)
+
+        # Footer
+        line = QFrame(); line.setFrameShape(QFrame.HLine); line.setStyleSheet("background-color: #333;")
+        self.main_layout.addWidget(line)
+
+        self.buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
+        self.buttons.accepted.connect(self.save_data)
+        self.buttons.rejected.connect(self.reject)
+        self.main_layout.addWidget(self.buttons)
+
+    # (Keep internal methods like save_data, browse_file, _update_data_root_preview exactly as before)
+    def _update_data_root_preview(self, label, raw_string, resolved_string):
+        label.setStyleSheet("color: #aaa; background-color: #111; padding: 6px; border: 1px solid #222; border-radius: 2px;")
+        if str(raw_string).strip().upper() == "{LOCALDOTDIR}":
+            label.setText(f"⮎ Inheriting: {resolved_string}")
+            return
+        try:
+            data = json.loads(raw_string)
+            label.setText(" | ".join([f"{i[0]}: {i[1]}" for i in data]) if data else "Empty")
+        except: label.setText(str(raw_string))
+
+    def open_data_roots_editor(self, line_edit, preview_label):
+        dlg = DataRootsEditorDialog(line_edit.text(), self)
+        if dlg.exec():
+            new_val = dlg.get_serialized_data()
+            line_edit.setText(new_val)
+            self._update_data_root_preview(preview_label, new_val, new_val)
+
+    def browse_file(self, key):
+        widget = self.inputs[key]
+        path, _ = QFileDialog.getOpenFileName(self, "Select File", "", "All Files (*)")
+        if path:
+            p = path.replace('\\', '/')
+            widget.setPlainText(p) if hasattr(widget, 'setPlainText') else widget.setText(p)
+
+    def browse_dir(self, key):
+        widget = self.inputs[key]
+        path = QFileDialog.getExistingDirectory(self, "Select Directory")
+        if path:
+            p = path.replace('\\', '/')
+            widget.setPlainText(p) if hasattr(widget, 'setPlainText') else widget.setText(p)
+
+    def save_data(self):
+        for i, row in self.df.iterrows():
+            key = str(row['Key'])
+            if key in self.inputs:
+                w = self.inputs[key]
+                val = str(w.isChecked()) if isinstance(w, QCheckBox) else (w.toPlainText() if hasattr(w, 'toPlainText') else w.text())
+                self.df.at[i, 'Value'] = val.strip()
+        try:
+            self.df.to_csv(self.csv_path, index=False, encoding='cp1252')
+            self.accept()
+        except Exception as e:
+            QMessageBox.critical(self, "Save Error", f"Could not save CSV:\n{e}")
+
 class PathSwapper:
     PATHSUBS = [] 
     HEADERS = [] # We store the CSV headers here now
@@ -5641,205 +5646,234 @@ class CatalogProvider:
                 print(f"Provider: Error reading {target_path}: {e}")
         
         return pd.DataFrame()
+    
+    def get_catalog_path(self, catalog_name):
+        """Resolves a catalog key to a physical CSV path in the _pipe_config/catalogs folder."""
+        # The engine.root IS the _pipe_config folder.
+        full_path = os.path.join(self.engine.root, "catalogs", f"{catalog_name}.csv")
+        return os.path.normpath(full_path)
 
-class DynamicKeyValueEditor(QDialog):
-    PRESETS = {
-        "project_settings": {
-            "title": "Project Settings",
-            "data_root_keys": ["data_root"],
-            "dir_browse_keys": ["catalog_dir"],
-            "file_browse_keys": ["shots_csv"],
-            "checkbox_keys": ["dual_name"]
-        },
-        "app_config": {
-            "title": "App Executable Settings",
-            "file_browse_keys": ["bin"]
-        },
-        "notes_config": {
-            "title": "Notes Configuration"
-        },
-        "user_prefs": {
-            "title": "User Preferences",
-            "dir_browse_keys": ["user_projects_default_dir"]
+class Scraper(QObject):
+    progress = Signal(int)
+    finished = Signal()
+
+    def __init__(self, roots_list, output_dir, blacklist_str=""):
+        super().__init__()
+        # List of [name, path] tuples
+        self.roots_list = roots_list 
+        self.output_dir = PathSwapper.translate(output_dir)
+        
+        self.blacklist = [os.path.normpath(p.strip()) for p in blacklist_str.split(',') if p.strip()]
+        self.ext_singles = {".nk", ".mov", ".mp4", ".ods", ".zip"}
+        self.ext_sequences = {".exr", ".jpg", ".png", ".tiff", ".dpx"}
+
+    def run(self):
+        # 1. PRE-FLIGHT: Validate roots
+        valid_roots = []
+        total_dirs = 0
+        
+        for name, r_path in self.roots_list:
+            # SURGICAL FIX: Do NOT translate the root path here. 
+            # The root path in roots_list is already the local path for this OS.
+            clean_root = os.path.normpath(r_path) 
+            
+            if os.path.exists(clean_root):
+                valid_roots.append((name, clean_root))
+                # Count directories for progress
+                for _, dirs, _ in os.walk(clean_root):
+                    total_dirs += len(dirs)
+        
+        if not valid_roots:
+            print("Scraper: No valid roots found to scan.")
+            self.finished.emit()
+            return
+
+        processed_dirs = 0
+        clean_blacklist = [p.lower() for p in self.blacklist]
+
+        # 2. THE MAIN LOOP
+        for root_name, current_root_dir in valid_roots:
+            potential_sequences = defaultdict(list)
+            final_rows = []
+            
+            for root, dirs, files in os.walk(current_root_dir):
+                # Blacklist pruning
+                for d in list(dirs):
+                    if d.lower() in clean_blacklist:
+                        dirs.remove(d)
+                
+                processed_dirs += 1
+                if total_dirs > 0:
+                    self.progress.emit(int((processed_dirs / total_dirs) * 100))
+                
+                local_p = self.get_local_path(root, current_root_dir)
+                
+                for f in files:
+                    ext = os.path.splitext(f)[1].lower()
+                    full_path = os.path.join(root, f)
+                    
+                    if ext in self.ext_singles:
+                        try:
+                            stat = os.stat(full_path)
+                            final_rows.append(self.format_row(root, local_p, f, ext, "-", "-", stat.st_ctime, stat.st_mtime))
+                        except: continue
+                    elif ext in self.ext_sequences:
+                        match = re.search(r'^(.*?)([._])(\d+)(\.[^.]+)$', f)
+                        if match:
+                            prefix, separator, frame, extension = match.groups()
+                            potential_sequences[(root, local_p, prefix, separator, extension)].append({
+                                "frame": int(frame), "pad": len(frame), "path": full_path, "original_name": f
+                            })
+                        else:
+                            stat = os.stat(full_path)
+                            final_rows.append(self.format_row(root, local_p, f, ext, "-", "-", stat.st_ctime, stat.st_mtime))
+
+            # --- PROCESS SEQUENCES ---
+            for (folder, local_folder, prefix, separator, ext), items in potential_sequences.items():
+                if len(items) > 1:
+                    items.sort(key=lambda x: x["frame"])
+                    all_stats = [os.stat(i["path"]) for i in items]
+                    formatted_name = f"{prefix}{separator}%0{items[0]['pad']}d{ext}"
+                    final_rows.append(self.format_row(folder, local_folder, formatted_name, ext, min(i["frame"] for i in items), max(i["frame"] for i in items), 
+                                                    min(s.st_ctime for s in all_stats), max(s.st_mtime for s in all_stats)))
+                else:
+                    item = items[0]
+                    stat = os.stat(item["path"])
+                    final_rows.append(self.format_row(folder, local_folder, item["original_name"], ext, "-", "-", stat.st_ctime, stat.st_mtime))
+
+            # --- 3. WRITE THE ISOLATED CSV ---
+            output_csv = os.path.join(self.output_dir, f"{root_name}.csv")
+            headers = ["ABSPATH", "LOCALPATH", "FILENAME", "FILETYPE", "FIRST", "LAST", "CREATION", "MODDATE"]
+            
+            with open(output_csv, "w", newline="", encoding='cp1252') as f:
+                writer = csv.DictWriter(f, fieldnames=headers)
+                writer.writeheader()
+                writer.writerows(final_rows)
+                
+        self.finished.emit()
+
+    def get_local_path(self, full_root, base_dir):
+        """Surgical removal of current base_dir from the ABSPATH."""
+        rel = os.path.relpath(full_root, base_dir)
+        return "" if rel == "." else rel
+
+    def format_row(self, root, local_root, name, ext, first, last, ctime, mtime):
+        return {
+            "ABSPATH": root, 
+            "LOCALPATH": local_root,
+            "FILENAME": name, 
+            "FILETYPE": ext.lstrip('.'),
+            "FIRST": first, "LAST": last,
+            "CREATION": datetime.fromtimestamp(ctime).strftime("%Y-%m-%d %H:%M:%S"),
+            "MODDATE": datetime.fromtimestamp(mtime).strftime("%Y-%m-%d %H:%M:%S")
         }
-    }
 
-    def __init__(self, csv_path, title=None, engine=None, parent=None, preset=None):
+class UpdateScrapeDialog(QDialog):
+    def __init__(self, parent=None, engine=None):
         super().__init__(parent)
-        self.csv_path = os.path.normpath(csv_path)
         self.engine = engine
-        
-        p = self.PRESETS.get(preset, {})
-        self.title_val = title or p.get("title", "Config Editor")
-        self.file_browse_keys = p.get("file_browse_keys", [])
-        self.dir_browse_keys = p.get("dir_browse_keys", [])
-        self.checkbox_keys = p.get("checkbox_keys", [])
-        self.data_root_keys = p.get("data_root_keys", [])
-        
-        self.inputs = {}
-        self.setWindowTitle(f"{self.title_val} - {os.path.basename(self.csv_path)}")
-        self.resize(950, 600)
-        
-        # --- CLEAN STYLES ---
-        self.setStyleSheet("""
-            QDialog { background-color: #1e1e1e; color: #e0e0e0; }
-            QLabel { color: #888; font-size: 11px; }
-            QPushButton { 
-                background-color: #333; color: #eee; border: 1px solid #444; 
-                border-radius: 3px; padding: 4px 8px; min-width: 70px;
-            }
-            QLineEdit, QTextEdit { 
-                background-color: #252525; color: #eee; border: 1px solid #333; border-radius: 3px;
-            }
-        """)
-        
-        self.main_layout = QVBoxLayout(self)
-        self.main_layout.setContentsMargins(15, 15, 15, 15)
-        
-        # Header
-        header = QLabel(f"PROJECT CONFIG: {os.path.basename(self.csv_path).upper()}")
-        header.setStyleSheet("font-size: 14px; font-weight: bold; color: #555; margin-bottom: 10px;")
-        self.main_layout.addWidget(header)
-        
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setFrameShape(QFrame.NoFrame)
-        scroll.setStyleSheet("background-color: transparent;")
-        
-        scroll_content = QWidget()
-        # THE FIX: This layout holds the rows and pushes them UP
-        self.rows_container = QVBoxLayout(scroll_content)
-        self.rows_container.setSpacing(12) 
-        self.rows_container.setContentsMargins(0, 0, 10, 0)
-        self.rows_container.setAlignment(Qt.AlignTop) # Stick to the roof
+        self.setWindowTitle("Update Data")
+        self.setMinimumWidth(450)
+        layout = QVBoxLayout(self)
 
+        # 1. PARSE THE DATA ROOTS
+        raw_dr = str(self.engine.settings.get('data_root_raw', ''))
+        self.roots_list = []
         try:
-            self.df = pd.read_csv(self.csv_path, encoding='cp1252', dtype=str).fillna("")
-            rel_path = os.path.relpath(self.csv_path, self.engine.root).replace('\\', '/') if self.engine else ""
+            import json
+            parsed_dr = json.loads(raw_dr)
+            if isinstance(parsed_dr, list):
+                for item in parsed_dr:
+                    if isinstance(item, list) and len(item) >= 2:
+                        self.roots_list.append((str(item[0]), str(item[1])))
         except:
-            return
+            # Legacy flat string fallback
+            flat_root = str(self.engine.settings.get('data_root', ''))
+            if flat_root:
+                self.roots_list.append(("default", flat_root))
 
-        for _, row in self.df.iterrows():
-            key = str(row['Key'])
-            raw_val = str(row['Value'])
-            resolved_val = self.engine._resolve_pointer(key, raw_val, rel_path) if self.engine else raw_val
+        # 2. RESOLVE THE CATALOG DIRECTORY
+        base_output_dir = self.engine.project_root
+        self.output_dir = os.path.join(base_output_dir, "catalogs")
 
-            # ONE VERTICAL BLOCK PER SETTING
-            setting_block = QVBoxLayout()
-            setting_block.setSpacing(2)
+        # 3. BUILD THE UI PREVIEW
+        layout.addWidget(QLabel("<b>Ready to update data from the following roots:</b>"))
+        
+        roots_text = ""
+        for name, path in self.roots_list:
+            roots_text += f"• <b>{name}</b>: {path}<br>"
+        if not roots_text:
+            roots_text = "<i>No data roots configured.</i>"
+            
+        lbl_roots = QLabel(roots_text)
+        lbl_roots.setStyleSheet("padding-left: 10px; color: #aaa;")
+        layout.addWidget(lbl_roots)
+        
+        layout.addWidget(QLabel(f"<br><b>To Catalog Directory:</b><br>{self.output_dir}<br>"))
 
-            # --- THE ROW: [LABEL (fixed)] [BUTTON (fixed)] [INPUT (stretching)] ---
-            row_layout = QHBoxLayout()
-            row_layout.setSpacing(10)
+        self.pbar = QProgressBar()
+        self.pbar.setVisible(False)
+        layout.addWidget(self.pbar)
 
-            # 1. Label (Fixed Width for a clean spine)
-            lbl = QLabel(f"<b>{key}</b>")
-            lbl.setFixedWidth(160)
-            lbl.setStyleSheet("color: #bbb; font-size: 12px;")
-            row_layout.addWidget(lbl)
-
-            # 2. Browse Button (Only if needed)
-            if key in self.file_browse_keys or key in self.dir_browse_keys or key in self.data_root_keys:
-                btn_text = "Roots..." if key in self.data_root_keys else "Choose..."
-                btn = QPushButton(btn_text)
-                if key in self.data_root_keys: pass # Connected later
-                elif key in self.file_browse_keys: btn.clicked.connect(lambda chk=False, k=key: self.browse_file(k))
-                else: btn.clicked.connect(lambda chk=False, k=key: self.browse_dir(k))
-                row_layout.addWidget(btn)
-
-            # 3. The Input / Checkbox (Stretch to fill)
-            if key in self.checkbox_keys:
-                cb = QCheckBox("Enabled")
-                cb.setChecked(str(raw_val).strip().lower() in ['true', '1', 't', 'yes'])
-                self.inputs[key] = cb
-                row_layout.addWidget(cb)
-                row_layout.addStretch(1)
-            elif key in self.data_root_keys:
-                edit = QLineEdit(raw_val); edit.hide(); self.inputs[key] = edit
-                preview_lbl = QLabel()
-                self._update_data_root_preview(preview_lbl, raw_val, resolved_val)
-                row_layout.addWidget(preview_lbl, 1)
-                # Map the button we just added
-                btn_widget = row_layout.itemAt(1).widget()
-                btn_widget.clicked.connect(lambda chk=False, e=edit, l=preview_lbl: self.open_data_roots_editor(e, l))
-            else:
-                try:
-                    edit = SingleLineWrapEdit(raw_val)
-                    edit.setMinimumHeight(40); edit.setMaximumHeight(60)
-                except NameError:
-                    edit = QLineEdit(raw_val)
-                self.inputs[key] = edit
-                row_layout.addWidget(edit, 1) # STRETCH
-
-            setting_block.addLayout(row_layout)
-
-            # 4. Inheritance Sub-label (Directly under the input)
-            if raw_val.strip().upper() == "{LOCALDOTDIR}":
-                ptr_lbl = QLabel(f"      ⮎ Inheriting: {resolved_val}")
-                ptr_lbl.setStyleSheet("color: #666; font-style: italic; margin-left: 170px;")
-                setting_block.addWidget(ptr_lbl)
-
-            self.rows_container.addLayout(setting_block)
-
-        # IMPORTANT: This stretch pushes every row above it to the top
-        self.rows_container.addStretch(1) 
-
-        scroll.setWidget(scroll_content)
-        self.main_layout.addWidget(scroll)
-
-        # Footer
-        line = QFrame(); line.setFrameShape(QFrame.HLine); line.setStyleSheet("background-color: #333;")
-        self.main_layout.addWidget(line)
-
-        self.buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
-        self.buttons.accepted.connect(self.save_data)
+        self.buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        self.buttons.button(QDialogButtonBox.Ok).setText("Proceed")
+        
+        if not self.roots_list:
+            self.buttons.button(QDialogButtonBox.Ok).setEnabled(False)
+            
+        self.buttons.accepted.connect(self.start_scrape)
         self.buttons.rejected.connect(self.reject)
-        self.main_layout.addWidget(self.buttons)
+        layout.addWidget(self.buttons)
 
-    # (Keep internal methods like save_data, browse_file, _update_data_root_preview exactly as before)
-    def _update_data_root_preview(self, label, raw_string, resolved_string):
-        label.setStyleSheet("color: #aaa; background-color: #111; padding: 6px; border: 1px solid #222; border-radius: 2px;")
-        if str(raw_string).strip().upper() == "{LOCALDOTDIR}":
-            label.setText(f"⮎ Inheriting: {resolved_string}")
-            return
-        try:
-            data = json.loads(raw_string)
-            label.setText(" | ".join([f"{i[0]}: {i[1]}" for i in data]) if data else "Empty")
-        except: label.setText(str(raw_string))
+    def start_scrape(self):
+        # --- NEW: PRE-FLIGHT ACCESSIBILITY CHECK ---
+        missing_roots = []
+        for name, r_path in self.roots_list:
+            if not os.path.exists(os.path.normpath(r_path)):
+                missing_roots.append(f"{name}: {r_path}")
 
-    def open_data_roots_editor(self, line_edit, preview_label):
-        dlg = DataRootsEditorDialog(line_edit.text(), self)
-        if dlg.exec():
-            new_val = dlg.get_serialized_data()
-            line_edit.setText(new_val)
-            self._update_data_root_preview(preview_label, new_val, new_val)
+        if missing_roots:
+            from PySide6.QtWidgets import QMessageBox
+            msg = "The following Data Roots are currently inaccessible:\n\n"
+            msg += "\n".join(missing_roots)
+            msg += "\n\nDo you want to skip these and scrape only reachable locations?"
+            
+            res = QMessageBox.warning(self, "Inaccessible Roots", msg, 
+                                    QMessageBox.Yes | QMessageBox.No)
+            if res == QMessageBox.No:
+                return # Abort the whole thing
 
-    def browse_file(self, key):
-        widget = self.inputs[key]
-        path, _ = QFileDialog.getOpenFileName(self, "Select File", "", "All Files (*)")
-        if path:
-            p = path.replace('\\', '/')
-            widget.setPlainText(p) if hasattr(widget, 'setPlainText') else widget.setText(p)
+        # Proceed with valid roots only
+        self.pbar.setVisible(True)
+        self.buttons.setEnabled(False)
+        
+        blacklist_val = str(self.engine.settings.get('scrape_blacklist', ''))
+        
+        # Ensure we point to project_root/catalogs
+        catalog_dir = os.path.join(self.engine.project_root, "catalogs")
+        os.makedirs(catalog_dir, exist_ok=True)
 
-    def browse_dir(self, key):
-        widget = self.inputs[key]
-        path = QFileDialog.getExistingDirectory(self, "Select Directory")
-        if path:
-            p = path.replace('\\', '/')
-            widget.setPlainText(p) if hasattr(widget, 'setPlainText') else widget.setText(p)
+        self.thread = QThread()
+        self.worker = Scraper(self.roots_list, catalog_dir, blacklist_str=blacklist_val)
+        
+        self.worker.moveToThread(self.thread)
+        self.thread.started.connect(self.worker.run)
+        self.worker.progress.connect(self.pbar.setValue)
+        self.worker.finished.connect(self.on_finished)
+        self.thread.start()
 
-    def save_data(self):
-        for i, row in self.df.iterrows():
-            key = str(row['Key'])
-            if key in self.inputs:
-                w = self.inputs[key]
-                val = str(w.isChecked()) if isinstance(w, QCheckBox) else (w.toPlainText() if hasattr(w, 'toPlainText') else w.text())
-                self.df.at[i, 'Value'] = val.strip()
-        try:
-            self.df.to_csv(self.csv_path, index=False, encoding='cp1252')
-            self.accept()
-        except Exception as e:
-            QMessageBox.critical(self, "Save Error", f"Could not save CSV:\n{e}")
+    def on_finished(self):
+        self.thread.quit()
+        self.thread.wait()
+        self.accept()
+
+    def closeEvent(self, event):
+        if hasattr(self, 'thread') and self.thread.isRunning():
+            from PySide6.QtWidgets import QMessageBox
+            QMessageBox.warning(self, "Scrape in Progress", "Please wait for the scrape to finish before closing.")
+            event.ignore() 
+        else:
+            event.accept()
 
 class AssetManager(QMainWindow):
     def __init__(self, shot_path="", engine=None, project_label="Generic Project"):
