@@ -4620,38 +4620,43 @@ class ConfigEngine:
 
         # Load and SWAP settings immediately
         raw = self._load_kv_csv("Project_Settings.csv")
-        self.settings = {k: PathSwapper.translate(str(v)) if ("/" in str(v) or "\\" in str(v)) else v 
-                         for k, v in raw.items()}
+        self.settings = {}
+        
+        for k, v in raw.items():
+            # CRITICAL FIX: Do NOT pass the JSON string through PathSwapper!
+            if k == 'data_root':
+                self.settings[k] = str(v) 
+            elif "/" in str(v) or "\\" in str(v):
+                self.settings[k] = PathSwapper.translate(str(v))
+            else:
+                self.settings[k] = v
 
         # --- THE MULTI-ROOT INTERCEPTOR ---
         self.data_roots = []
-        raw_dr = str(self.settings.get('data_root_raw', self.settings.get('data_root', ''))).strip()
+        raw_dr = str(self.settings.get('data_root', '')).strip()
 
         if raw_dr and raw_dr != "nan":
             if "[" in raw_dr:
                 try:
                     import json
-                    # 1. Clean brackets 
-                    # 2. ESCAPE BACKSLASHES for JSON safety: \ becomes \\
-                    json_ready = raw_dr.replace('(', '[').replace(')', ']').replace('\\', '\\\\')
-                    
+                    # The JSON string is now safe because normpath hasn't ruined it
+                    json_ready = raw_dr.replace('\\', '/')
                     dr_list = json.loads(json_ready)
                     
                     if isinstance(dr_list, list):
-                        new_roots = []
                         for item in dr_list:
                             if isinstance(item, list) and len(item) >= 2:
-                                # 3. TRANSLATE: Swapper turns the path into the local OS version
-                                # Note: We use normpath here to fix the double-slashes we just made
-                                clean_p = os.path.normpath(PathSwapper.translate(str(item[1])))
-                                new_roots.append((str(item[0]), clean_p))
-                        self.data_roots = new_roots
+                                r_name = str(item[0])
+                                # NOW we translate the actual path, safely extracted!
+                                r_path_local = PathSwapper.translate(str(item[1]))
+                                self.data_roots.append((r_name, r_path_local))
                 except Exception as e:
-                    print(f"ConfigEngine: JSON Fail: {e}")
+                    print(f"ConfigEngine: JSON Parse failed: {e}")
                     self.data_roots = [("default", PathSwapper.translate(raw_dr))]
             else:
                 self.data_roots = [("default", PathSwapper.translate(raw_dr))]
 
+        # Update the convenience setting for legacy tool compatibility
         if self.data_roots:
             self.settings['data_root'] = self.data_roots[0][1]
                 
