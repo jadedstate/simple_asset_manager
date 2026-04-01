@@ -10,7 +10,7 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QTableView, QStyledIte
                                QWidget, QLabel, QLineEdit, QFileDialog, QCheckBox, QDateEdit, QMessageBox, QStyleOptionViewItem, QStyle, QSpacerItem,
                                QMenu, QDialog, QProgressBar, QDialogButtonBox, QSplitter, QListWidget, QFormLayout, QScrollArea, QDockWidget,
                                QSizePolicy)
-from PySide6.QtCore import QAbstractTableModel, Qt, QSortFilterProxyModel, QDate, QEvent, QTimer, QObject, Signal, QThread, QModelIndex
+from PySide6.QtCore import QAbstractTableModel, Qt, QSortFilterProxyModel, QDate, QEvent, QTimer, QObject, Signal, QThread, QModelIndex, QProcess
 from PySide6.QtGui import QKeySequence, QAction, QColor, QPalette
 from datetime import datetime
 import subprocess
@@ -6317,6 +6317,274 @@ class DataSourcesDock(QDockWidget):
                 # --- ALWAYS RESTORE THE CURSOR, even if it crashes ---
                 QApplication.restoreOverrideCursor()
 
+class RcloneCopyTask(QProcess):
+    # Signals: (current_file_index, speed, current_filename)
+    progress_update = Signal(int, str, str)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setProcessChannelMode(QProcess.MergedChannels)
+        self.files_finished_in_this_run = 0
+        self.readyRead.connect(self.parse_output)
+
+    def parse_output(self):
+        raw = self.readAllStandardOutput().data().decode()
+        
+        # Look for rclone's "Transferred: 12 / 100" line
+        count_match = re.search(r'Transferred:\s+(\d+)\s+/\s+(\d+)', raw)
+        speed_match = re.search(r'([\d\.]+\s[KMGT]B/s)', raw)
+        file_match = re.search(r'\*\s+(.*?):', raw)
+
+        if count_match:
+            self.files_finished_in_this_run = int(count_match.group(1))
+            
+        speed = speed_match.group(1) if speed_match else "Checking..."
+        filename = file_match.group(1) if file_match else "Syncing..."
+
+        # Emit the count so the AssetManager can add it to the Global Total
+        self.progress_update.emit(self.files_finished_in_this_run, speed, filename)
+
+    def run_copy(self, source_list, destination, source_base_root, force_overwrite=False):
+        """
+        source_base_root: The 'anchor' point (e.g., 'G:/My Drive/Project')
+        Files will be recreated at destination relative to this anchor.
+        """
+        # We use rclone's 'files-from' feature to handle thousands of files safely
+        import tempfile
+        self.list_file = tempfile.NamedTemporaryFile(delete=False, mode='w', suffix='.txt')
+        
+        for p in source_list:
+            # Rclone needs paths relative to the source root
+            relative_p = os.path.relpath(p, source_base_root)
+            self.list_file.write(relative_p + "\n")
+        self.list_file.close()
+
+        # START WITH THE BASE ARGS
+        args = ["copy", source_base_root, destination, "--files-from", self.list_file.name,
+                "--transfers", "16", "--checkers", "16", "--progress", "--stats", "1s"] # Force 1s updates
+
+        if not force_overwrite:
+            args.extend(["--size-only", "--ignore-existing", "--exclude=._*", "--exclude=.DS_Store"])
+        else:
+            args.append("--ignore-times")
+
+        self.start("rclone", args)
+
+class WarpHubDialog(QDialog):
+    def __init__(self, selected_items, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("🚀 GDrive Warp Copy Hub")
+        self.resize(900, 700)
+        
+        layout = QVBoxLayout(self)
+        
+        # --- GLOBAL ACTIONS ---
+        global_lay = QHBoxLayout()
+        btn_sync_anchor = QPushButton("🔗 Match All Anchors to Top")
+        btn_sync_dest = QPushButton("🎯 Match All Destinations to Top")
+        btn_sync_anchor.clicked.connect(self.sync_anchors)
+        btn_sync_dest.clicked.connect(self.sync_dests)
+        
+        global_lay.addWidget(btn_sync_anchor)
+        global_lay.addWidget(btn_sync_dest)
+        global_lay.addStretch()
+        layout.addLayout(global_lay)
+
+        # --- SCROLLABLE LIST ---
+        self.scroll = QScrollArea()
+        self.scroll.setWidgetResizable(True)
+        self.container = QWidget()
+        self.cards_layout = QVBoxLayout(self.container)
+        self.cards_layout.setAlignment(Qt.AlignTop)
+        
+        self.cards = []
+        for path in selected_items:
+            card = WarpCard(path)
+            self.cards.append(card)
+            self.cards_layout.addWidget(card)
+            
+        self.scroll.setWidget(self.container)
+        layout.addWidget(self.scroll)
+
+        # --- FOOTER ---
+        btns = QHBoxLayout()
+        self.btn_run = QPushButton("🚀 START BATCH WARP")
+        self.btn_run.setStyleSheet("background-color: #2e885a; color: white; font-weight: bold; padding: 12px;")
+        self.btn_run.clicked.connect(self.accept)
+        
+        btn_cancel = QPushButton("Cancel")
+        btn_cancel.clicked.connect(self.reject)
+        
+        btns.addStretch()
+        btns.addWidget(btn_cancel)
+        btns.addWidget(self.btn_run)
+        layout.addLayout(btns)
+
+    def sync_anchors(self):
+        if not self.cards: return
+        master_val = self.cards[0].edit_anchor.text()
+        for card in self.cards:
+            card.edit_anchor.setText(master_val)
+
+    def sync_dests(self):
+        if not self.cards: return
+        master_val = self.cards[0].edit_dest.text()
+        for card in self.cards:
+            card.edit_dest.setText(master_val)
+
+    def get_mappings(self):
+        return [
+            {
+                'path': c.full_path, 
+                'anchor': c.edit_anchor.text(), 
+                'dest': c.edit_dest.text(),
+                'force': c.is_force_enabled() # <--- NEW FLAG
+            } for c in self.cards
+        ]
+    
+class WarpCard(QFrame):
+    def __init__(self, full_path, parent=None):
+        super().__init__(parent)
+        self.full_path = full_path
+        self.setFrameShape(QFrame.StyledPanel)
+        self.setStyleSheet("WarpCard { background-color: #333; border-radius: 5px; margin: 2px; }")
+
+        layout = QVBoxLayout(self)
+        
+        # 1. FILE NAME HEADER
+        self.lbl_name = QLabel(f"📦 <b>{os.path.basename(full_path)}</b>")
+        self.lbl_name.setStyleSheet("color: #58cc71; font-size: 13px;")
+        layout.addWidget(self.lbl_name)
+
+        # 2. ANCHOR ROW
+        anchor_lay = QHBoxLayout()
+        anchor_lay.addWidget(QLabel("Source Anchor:"))
+        self.edit_anchor = QLineEdit(os.path.dirname(full_path))
+        btn_browse_anchor = QPushButton("Browse...")
+        btn_browse_anchor.clicked.connect(self.browse_anchor)
+        anchor_lay.addWidget(self.edit_anchor)
+        anchor_lay.addWidget(btn_browse_anchor)
+        layout.addLayout(anchor_lay)
+
+        # 3. DESTINATION ROW
+        dest_lay = QHBoxLayout()
+        dest_lay.addWidget(QLabel("Destination:  ")) # Aligned spacing
+        self.edit_dest = QLineEdit()
+        btn_browse_dest = QPushButton("Browse...")
+        btn_browse_dest.clicked.connect(self.browse_dest)
+        dest_lay.addWidget(self.edit_dest)
+        dest_lay.addWidget(btn_browse_dest)
+        layout.addLayout(dest_lay)
+
+        # 4. OPTIONS ROW
+        opts_lay = QHBoxLayout()
+        self.chk_force = QCheckBox("Force Overwrite (Ignore Size-Match)")
+        self.chk_force.setToolTip("Enable this if you've re-rendered files and need to overwrite the destination.")
+        self.chk_force.setStyleSheet("color: #aaa; font-size: 11px;")
+        
+        opts_lay.addWidget(self.chk_force)
+        opts_lay.addStretch()
+        layout.addLayout(opts_lay)
+
+    def is_force_enabled(self):
+        return self.chk_force.isChecked()
+    
+    def browse_anchor(self):
+        path = QFileDialog.getExistingDirectory(self, "Select Source Anchor", self.edit_anchor.text())
+        if path: self.edit_anchor.setText(os.path.normpath(path))
+
+    def browse_dest(self):
+        path = QFileDialog.getExistingDirectory(self, "Select Destination", self.edit_dest.text())
+        if path: self.edit_dest.setText(os.path.normpath(path))
+
+class WarpProgressHUD(QFrame):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedSize(450, 150)
+        self.setWindowFlags(Qt.SubWindow) # Keeps it on top of the parent
+        
+        # Sleek dark HUD styling
+        self.setStyleSheet("""
+            WarpProgressHUD {
+                background-color: rgba(30, 30, 30, 230);
+                border: 2px solid #58cc71;
+                border-radius: 10px;
+            }
+            QLabel { color: white; font-family: 'Segoe UI', sans-serif; }
+        """)
+
+        layout = QVBoxLayout(self)
+        
+        self.lbl_title = QLabel("🚀 <b>GDrive Warp Transfer</b>")
+        self.lbl_title.setStyleSheet("font-size: 16px; color: #58cc71;")
+        self.lbl_title.setAlignment(Qt.AlignCenter)
+        
+        self.bar = QProgressBar()
+        self.bar.setStyleSheet("""
+            QProgressBar { border: 1px solid #555; border-radius: 5px; text-align: center; height: 20px; }
+            QProgressBar::chunk { background-color: #58cc71; }
+        """)
+        
+        self.lbl_speed = QLabel("Calculating speed...")
+        self.lbl_speed.setAlignment(Qt.AlignCenter)
+        
+        self.lbl_file = QLabel("Initializing...")
+        self.lbl_file.setStyleSheet("color: #aaa; font-size: 11px;")
+        self.lbl_file.setAlignment(Qt.AlignCenter)
+        self.lbl_file.setWordWrap(True)
+
+        layout.addWidget(self.lbl_title)
+        layout.addWidget(self.bar)
+        layout.addWidget(self.lbl_speed)
+        layout.addWidget(self.lbl_file)
+
+        self.lbl_batch = QLabel("Task 1 of 1")
+        self.lbl_batch.setStyleSheet("color: #888; font-size: 10px;")
+        self.lbl_batch.setAlignment(Qt.AlignRight)
+        
+        # Add it to your layout (perhaps at the very bottom or top-right)
+        self.layout().addWidget(self.lbl_batch)
+
+        self.btn_done = QPushButton("Close")
+        self.btn_done.hide()
+        self.btn_done.clicked.connect(self.hide)
+        self.btn_done.setStyleSheet("background-color: #2e885a; color: white; font-weight: bold;")
+        self.layout().addWidget(self.btn_done)
+
+    def show_summary(self, total_files, selected_item_count, dest_list):
+        """Transforms the HUD into an honest completion report."""
+        self.bar.hide()
+        self.lbl_speed.hide()
+        self.lbl_title.setText("✅ <b>Warp Complete</b>")
+        self.lbl_title.setStyleSheet("font-size: 16px; color: #58cc71;")
+        
+        unique_dests = list(set(dest_list))
+        if not unique_dests:
+            dest_str = ""
+        elif len(unique_dests) == 1:
+            dest_str = f"To: {unique_dests[0]}"
+        else:
+            dest_str = f"Across {len(unique_dests)} distinct destinations"
+        
+        # Now it tells you exactly what you selected vs what it actually moved
+        summary = (f"Processed <b>{selected_item_count}</b> selected items<br>"
+                   f"(<i>{total_files} individual files on disk</i>)<br><br>"
+                   f"<span style='color: #888;'>{dest_str}</span>")
+        
+        self.lbl_file.setText(summary)
+        self.btn_done.show()
+
+    def update_batch_status(self, current, total):
+        """Updates the batch counter label."""
+        self.lbl_batch.setText(f"Batch {current} of {total}")
+        # Force a repaint to ensure the UI doesn't lag behind the logic
+        self.lbl_batch.repaint()
+
+    def update_data(self, pct, speed, current_file):
+        self.bar.setValue(int(pct))
+        self.lbl_speed.setText(f"⚡ {speed}")
+        self.lbl_file.setText(f"Active: {current_file}")
+        
 class AssetManager(QMainWindow):
     def __init__(self, shot_path="", engine=None, project_label="Generic Project"):
         super().__init__()
@@ -6593,9 +6861,9 @@ class AssetManager(QMainWindow):
         actions_layout.addWidget(self.btn_rv)
         actions_layout.addWidget(self.btn_rv_add_scans)
         actions_layout.addWidget(self.btn_nuke)
+        actions_layout.addWidget(self.btn_os_open)
         actions_layout.addWidget(self.btn_send)
         actions_layout.addWidget(self.btn_sessions)
-        actions_layout.addWidget(self.btn_os_open)
         actions_layout.addStretch()
         self.layout.addLayout(actions_layout)
 
@@ -6681,6 +6949,108 @@ class AssetManager(QMainWindow):
         # Initialize the numbers
         self.update_status_stats()
 
+    def check_rclone_presence(self):
+        """Returns True if rclone is found in the system PATH."""
+        import shutil
+        return shutil.which("rclone") is not None
+
+    def show_rclone_install_help(self):
+        """Presents a friendly installation guide based on the OS."""
+        import sys
+        from PySide6.QtWidgets import QMessageBox
+
+        msg = QMessageBox(self)
+        msg.setWindowTitle("Rclone Not Found")
+        msg.setIcon(QMessageBox.Information)
+        
+        # Determine OS-specific instructions
+        if sys.platform == "win32":
+            install_cmd = "winget install Rclone.Rclone"
+            guide = "<b>Windows 11:</b> Open PowerShell and run:<br><code>" + install_cmd + "</code>"
+        elif sys.platform == "darwin":
+            install_cmd = "brew install rclone"
+            guide = "<b>macOS:</b> Open Terminal and run:<br><code>" + install_cmd + "</code>"
+        else:
+            install_cmd = "sudo dnf install rclone  # or apt"
+            guide = "<b>Linux:</b> Use your package manager:<br><code>" + install_cmd + "</code>"
+
+        msg.setText("🚀 <b>GDrive Warp Copy requires 'rclone' to be installed.</b>")
+        msg.setInformativeText(
+            f"This utility enables high-speed, multi-threaded transfers.<br><br>{guide}"
+            "<br><br>Once installed, please restart the application."
+        )
+        msg.setStandardButtons(QMessageBox.Ok)
+        msg.exec()
+
+    def start_warp_copy(self):
+        if not self.check_rclone_presence():
+            self.show_rclone_install_help(); return
+            
+        selection = self.get_selected_paths()
+        hub = WarpHubDialog(selection, self)
+        if hub.exec() != QDialog.Accepted: return
+        
+        mappings = hub.get_mappings()
+        
+        # --- 1. TOTAL FILE PRE-CALCULATION (The "Honesty" Phase) ---
+        grouped_tasks = {} # (anchor, dest, force) -> [LIST OF ACTUAL FILES]
+        total_files_in_job = 0
+        
+        import glob, re
+        for m in mappings:
+            key = (m['anchor'], m['dest'], m['force'])
+            if key not in grouped_tasks: grouped_tasks[key] = []
+            
+            # Expand sequences immediately to get the real count
+            expanded = glob.glob(re.sub(r'%0?\d*d', '*', m['path'])) if '%' in m['path'] else [m['path']]
+            grouped_tasks[key].extend(expanded)
+            total_files_in_job += len(expanded)
+            QApplication.processEvents()
+
+        if total_files_in_job == 0: return
+
+        # 2. HUD Setup
+        self.hud = WarpProgressHUD(self)
+        self.hud.move(self.rect().center() - self.hud.rect().center())
+        self.hud.show()
+
+        # 3. EXECUTION WITH GLOBAL FILE MATH
+        files_completed_before_current_batch = 0
+        total_batches_run = len(grouped_tasks)
+
+        for (anchor, dest, force), all_files in grouped_tasks.items():
+            if not anchor or not dest: continue
+
+            self.warp_proc = RcloneCopyTask(self)
+            
+            def handle_hud_update(batch_finished_count, speed, filename):
+                # THE REAL MATH:
+                # (Files from previous batches + files done in this batch) / Total Files
+                current_total_done = files_completed_before_current_batch + batch_finished_count
+                global_pct = (current_total_done / total_files_in_job) * 100
+                self.hud.update_data(global_pct, speed, filename)
+
+            self.warp_proc.progress_update.connect(handle_hud_update)
+            self.warp_proc.run_copy(all_files, dest, anchor, force_overwrite=force)
+            
+            while self.warp_proc.state() != QProcess.NotRunning:
+                QApplication.processEvents()
+                if not self.hud.isVisible():
+                    self.warp_proc.kill(); return 
+
+            # Batch finished! Add this batch's count to the "Completed" tally
+            files_completed_before_current_batch += len(all_files)
+
+        # 4. FINAL SUMMARY (Now entirely based on user selection)
+        # We pass len(mappings) which represents exactly how many rows were in the Warp Hub
+        self.hud.show_summary(total_files_in_job, len(mappings), [m['dest'] for m in mappings])
+
+    def _handle_rclone_output(self):
+        """Parses rclone --progress to update the UI."""
+        out = self.warp_proc.readAllStandardOutput().data().decode()
+        # You can regex parse the 'Transferred: 50%' here if you want a real bar!
+        print(out)
+    
     def setup_data_dock(self):
         self.data_dock = DataSourcesDock(self, self.engine)
         self.addDockWidget(Qt.RightDockWidgetArea, self.data_dock)
@@ -7447,7 +7817,9 @@ class AssetManager(QMainWindow):
         
         # --- SURGICAL INJECTION: THE OS OPENER ---
         main_menu.addAction("Open File (OS Default)").triggered.connect(self.open_file_os_default)
-        # -----------------------------------------
+        # --- NEW: THE WARP SPEED COPY ---
+        main_menu.addSeparator()
+        main_menu.addAction("🚀 Native Smart Copy to...").triggered.connect(self.start_warp_copy)
 
         main_menu.addSeparator()
         copy_action = QAction("Copy Selection", self)
