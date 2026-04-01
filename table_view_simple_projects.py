@@ -4623,33 +4623,35 @@ class ConfigEngine:
         self.settings = {k: PathSwapper.translate(str(v)) if ("/" in str(v) or "\\" in str(v)) else v 
                          for k, v in raw.items()}
 
-        # --- THE MULTI-ROOT INTERCEPTOR (Restored & Fixed) ---
+        # --- THE MULTI-ROOT INTERCEPTOR ---
         self.data_roots = []
-        # Look for data_root_raw first, fall back to data_root
         raw_dr = str(self.settings.get('data_root_raw', self.settings.get('data_root', ''))).strip()
 
         if raw_dr and raw_dr != "nan":
-            # SURGICAL CHECK: If it contains brackets, try to parse JSON
             if "[" in raw_dr:
                 try:
                     import json
-                    # Pre-clean for JSON parser safety
-                    json_ready = raw_dr.replace('(', '[').replace(')', ']').replace('\\', '/')
+                    # 1. Clean brackets 
+                    # 2. ESCAPE BACKSLASHES for JSON safety: \ becomes \\
+                    json_ready = raw_dr.replace('(', '[').replace(')', ']').replace('\\', '\\\\')
+                    
                     dr_list = json.loads(json_ready)
                     
                     if isinstance(dr_list, list):
+                        new_roots = []
                         for item in dr_list:
                             if isinstance(item, list) and len(item) >= 2:
-                                # TRANSLATE: Swapper turns "F:/jobs" into "F:\jobs"
-                                self.data_roots.append((str(item[0]), PathSwapper.translate(str(item[1]))))
-                except:
-                    # If JSON fails, it might be a weirdly formatted single path
+                                # 3. TRANSLATE: Swapper turns the path into the local OS version
+                                # Note: We use normpath here to fix the double-slashes we just made
+                                clean_p = os.path.normpath(PathSwapper.translate(str(item[1])))
+                                new_roots.append((str(item[0]), clean_p))
+                        self.data_roots = new_roots
+                except Exception as e:
+                    print(f"ConfigEngine: JSON Fail: {e}")
                     self.data_roots = [("default", PathSwapper.translate(raw_dr))]
             else:
-                # Standard legacy flat string
                 self.data_roots = [("default", PathSwapper.translate(raw_dr))]
-        
-        # Ensure self.settings['data_root'] is a clean string for legacy tool compatibility
+
         if self.data_roots:
             self.settings['data_root'] = self.data_roots[0][1]
                 
@@ -5870,24 +5872,25 @@ class UpdateScrapeDialog(QDialog):
         catalog_dir = os.path.join(self.engine.project_root, "catalogs")
         os.makedirs(catalog_dir, exist_ok=True)
 
-        self.thread = QThread()
+        self.worker_thread = QThread()
         self.worker = Scraper(self.roots_list, catalog_dir, blacklist_str=blacklist_val)
         
-        self.worker.moveToThread(self.thread)
-        self.thread.started.connect(self.worker.run)
+        self.worker.moveToThread(self.worker_thread)
+        self.worker_thread.started.connect(self.worker.run)
         self.worker.progress.connect(self.pbar.setValue)
         self.worker.finished.connect(self.on_finished)
-        self.thread.start()
+        self.worker_thread.start()
 
     def on_finished(self):
-        self.thread.quit()
-        self.thread.wait()
+        self.worker_thread.quit()
+        self.worker_thread.wait()
         self.accept()
 
     def closeEvent(self, event):
-        if hasattr(self, 'thread') and self.thread.isRunning():
+        # Fix the crash here by using the renamed variable
+        if hasattr(self, 'worker_thread') and self.worker_thread.isRunning():
             from PySide6.QtWidgets import QMessageBox
-            QMessageBox.warning(self, "Scrape in Progress", "Please wait for the scrape to finish before closing.")
+            QMessageBox.warning(self, "Scrape in Progress", "Please wait for the scrape to finish.")
             event.ignore() 
         else:
             event.accept()
