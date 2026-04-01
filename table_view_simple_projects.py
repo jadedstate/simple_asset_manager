@@ -2024,6 +2024,11 @@ class SubmissionReviewDialog(QDialog):
                 self.table.setColumnHidden(idx, True)
 
         btn_layout = QHBoxLayout()
+        # --- SURGICAL INJECTION: STATS LABEL ---
+        self.lbl_stats = QLabel("SELECTED: 0 | TOTAL: 0")
+        self.lbl_stats.setStyleSheet("color: #888; font-family: 'Courier New'; font-weight: bold; margin-right: 15px;")
+        btn_layout.addWidget(self.lbl_stats)
+        # ---------------------------------------
         self.btn_just_save = QPushButton("Save")
         self.btn_just_save.clicked.connect(self.quick_save)
         self.btn_save_exit = QPushButton("Save and Exit")
@@ -2033,8 +2038,27 @@ class SubmissionReviewDialog(QDialog):
         self.buttons.button(QDialogButtonBox.Cancel).setText("Exit")
         btn_layout.addWidget(self.btn_just_save); btn_layout.addWidget(self.btn_save_exit); btn_layout.addStretch(); btn_layout.addWidget(self.buttons)
         layout.addLayout(btn_layout)
+
+        # --- CONNECT SIGNALS ---
+        self.table.selectionModel().selectionChanged.connect(self.update_stats)
+        # Initial call to set "TOTAL"
+        self.update_stats()
+
         self.buttons.accepted.connect(self.accept); self.buttons.rejected.connect(self.reject)
         self.setup_ui_polish()
+
+    def update_stats(self):
+        """Updates the row and selection counts at the bottom of the dialog."""
+        total = self.proxy.rowCount()
+        selection = self.table.selectionModel().selectedIndexes()
+        selected_count = len({idx.row() for idx in selection})
+        
+        stats_text = f"SELECTED: {selected_count} | TOTAL: {total}"
+        self.lbl_stats.setText(stats_text)
+        
+        # Subtle polish: highlight the text if items are selected
+        color = "#58cc71" if selected_count > 0 else "#888"
+        self.lbl_stats.setStyleSheet(f"color: {color}; font-family: 'Courier New'; font-weight: bold; margin-right: 15px;")
 
     def toggle_validation(self, enabled):
         """Surgically toggles the red highlights in the table."""
@@ -2517,7 +2541,14 @@ class PlaylistReviewEditor(QDialog):
                 self.table.setColumnHidden(self.review_df.columns.get_loc(col), True)
 
         btn_layout = QHBoxLayout()
-        self.btn_save = QPushButton("Save Playlist"); self.btn_save.clicked.connect(self.quick_save)
+
+        # --- SURGICAL INJECTION: STATS LABEL ---
+        self.lbl_stats = QLabel("SELECTED: 0 | TOTAL: 0")
+        self.lbl_stats.setStyleSheet("color: #888; font-family: 'Courier New'; font-weight: bold; margin-right: 15px;")
+        btn_layout.addWidget(self.lbl_stats)
+        # ---------------------------------------
+
+        self.btn_save = QPushButton("Save Playlist")
         self.btn_create_sub = QPushButton("Create Submission from Playlist")
         self.btn_create_sub.setStyleSheet("background-color: #2e885a; color: white; font-weight: bold;")
         self.btn_create_sub.clicked.connect(self.create_submission_from_playlist)
@@ -2525,8 +2556,24 @@ class PlaylistReviewEditor(QDialog):
         self.btn_close = QPushButton("Close"); self.btn_close.clicked.connect(self.accept)
         btn_layout.addWidget(self.btn_save); btn_layout.addWidget(self.btn_create_sub); btn_layout.addWidget(self.btn_play_all); btn_layout.addStretch(); btn_layout.addWidget(self.btn_close)
         layout.addLayout(btn_layout)
+        
+        # --- CONNECT SIGNALS ---
+        self.table.selectionModel().selectionChanged.connect(self.update_stats)
+        self.update_stats()
         self.setup_ui_polish()
 
+    def update_stats(self):
+        """Updates the row and selection counts at the bottom of the dialog."""
+        total = self.proxy.rowCount()
+        selection = self.table.selectionModel().selectedIndexes()
+        selected_count = len({idx.row() for idx in selection})
+        
+        stats_text = f"SELECTED: {selected_count} | TOTAL: {total}"
+        self.lbl_stats.setText(stats_text)
+        
+        color = "#58cc71" if selected_count > 0 else "#888"
+        self.lbl_stats.setStyleSheet(f"color: {color}; font-family: 'Courier New'; font-weight: bold; margin-right: 15px;")
+        
     def toggle_validation(self, enabled):
         if hasattr(self, 'model'):
             self.model.validation_enabled = enabled
@@ -6555,9 +6602,6 @@ class AssetManager(QMainWindow):
         # Inside AssetManager.init_ui
         self.table = QTableView()
         self.main_model = PandasModel(self.df_master, self, read_only=True)
-        
-        # Ensure 'self' is passed as the second argument!
-        self.main_model = PandasModel(self.df_master, self, read_only=True)
 
         self.proxy_model.setSourceModel(self.main_model)
         self.table.setModel(self.proxy_model)
@@ -6570,6 +6614,7 @@ class AssetManager(QMainWindow):
         self.table.setSelectionBehavior(QTableView.SelectItems)
         self.table.setSelectionMode(QTableView.ExtendedSelection)
         self.table.setSortingEnabled(True)
+        self.table.selectionModel().selectionChanged.connect(self.update_status_stats)
         self.layout.addWidget(self.table)
         
         # --- SLEEK BOTTOM CONTROL SECTION ---
@@ -6697,18 +6742,30 @@ class AssetManager(QMainWindow):
             self.live_refresh_config()
 
     def update_status_stats(self):
-        """Updates the permanent status bar label with row counts."""
+        """Updates the permanent status bar label with row and selection counts."""
         if not hasattr(self, 'proxy_model') or not hasattr(self, 'main_model'):
             return
             
         visible = self.proxy_model.rowCount()
         total = self.main_model.rowCount()
         
-        # Color code it: if we are filtering, make it slightly more prominent
+        # --- NEW: CALCULATE SELECTED ROWS ---
+        selection = self.table.selectionModel().selectedIndexes()
+        # We use a set to ensure we only count each row once
+        selected_count = len({idx.row() for idx in selection})
+        
+        # Color code: green if filtering, otherwise standard grey
         color = "#58cc71" if visible < total else "#888"
         self.lbl_stats.setStyleSheet(f"color: {color}; padding-right: 10px; font-family: 'Courier New', 'Menlo', monospace;")
         
-        self.lbl_stats.setText(f"DISPLAYED: {visible} | TOTAL: {total}  ")
+        # Build the string: SELECTED | DISPLAYED | TOTAL
+        stats_text = ""
+        if selected_count > 0:
+            stats_text += f"SELECTED: {selected_count} | "
+            
+        stats_text += f"DISPLAYED: {visible} | TOTAL: {total}  "
+        
+        self.lbl_stats.setText(stats_text)
 
     def update_latest_filter(self, state):
         # Qt.Checked is an int (2), we need a True/False
