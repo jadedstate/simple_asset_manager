@@ -2650,25 +2650,132 @@ class PlaylistReviewEditor(QDialog):
         elif paths:
             self.parent().trigger_app(paths, "RV")
 
+    def launch_rv_with_scans_from_dialog(self):
+        """Surgically gathers paths using the same robust logic as the simple Play action."""
+        selection = self.table.selectionModel().selectedIndexes()
+        if not selection: return
+
+        rows = sorted({self.proxy.mapToSource(idx).row() for idx in selection})
+        parent = self.parent()
+        
+        final_paths = []
+        target_shots = set()
+        target_ext = "exr" # Default fallback
+
+        for r in rows:
+            path_found = False
+            
+            # --- 1. ROBUST ORIGINALS COLLECTION (Same as simple Play) ---
+            # A. Try ABSPATH first
+            if 'ABSPATH' in self.review_df.columns:
+                folder = str(self.review_df.iat[r, self.review_df.columns.get_loc("ABSPATH")])
+                filename = str(self.review_df.iat[r, self.review_df.columns.get_loc("FILENAME")])
+                if folder and folder != "nan":
+                    final_paths.append(os.path.normpath(os.path.join(folder, filename)))
+                    path_found = True
+            
+            # B. Reconstruct Fallback
+            if not path_found:
+                lp = str(self.review_df.iat[r, self.review_df.columns.get_loc("LOCALPATH")])
+                fn = str(self.review_df.iat[r, self.review_df.columns.get_loc("FILENAME")])
+                final_paths.append(os.path.normpath(os.path.join(self.engine.project_root, lp, fn)))
+
+            # --- 2. GATHER SHOT NAMES FOR SCANS ---
+            shot = str(self.review_df.iat[r, self.review_df.columns.get_loc("SHOTNAME")])
+            if shot and shot != "nan" and shot != "":
+                target_shots.add(shot)
+            
+            # Grab extension for the scan resolver
+            if r == rows[0] and 'FILETYPE' in self.review_df.columns:
+                target_ext = str(self.review_df.iat[r, self.review_df.columns.get_loc("FILETYPE")])
+
+        # --- 3. GATHER HERO SCANS (Using Parent Logic) ---
+        if hasattr(parent, 'resolve_scan_path'):
+            for shot in target_shots:
+                scan_path = parent.resolve_scan_path(shot, target_ext=target_ext)
+                if scan_path:
+                    final_paths.append(os.path.normpath(scan_path))
+
+        # --- 4. TRIGGER VIA PARENT GUARD ---
+        if final_paths:
+            if parent.confirm_missing_files(final_paths, "RV"):
+                parent.trigger_app(final_paths, "RV")
+
+    def reveal_selected_in_os(self):
+        selection = self.table.selectionModel().selectedIndexes()
+        if not selection: return
+        
+        # 1. Get the source row from the dialog's proxy
+        row = self.proxy.mapToSource(selection[0]).row()
+        parent = self.parent()
+        
+        folder = ""
+        filename = str(self.review_df.iat[row, self.review_df.columns.get_loc("FILENAME")])
+        
+        # 2. PATH RECOVERY STRATEGY
+        # A. Try local ABSPATH first
+        if 'ABSPATH' in self.review_df.columns:
+            folder = str(self.review_df.iat[row, self.review_df.columns.get_loc("ABSPATH")])
+            
+        # B. Fallback: Ask the Main App's master table via UUID
+        if (not folder or folder == "nan") and 'UUID' in self.review_df.columns:
+            uuid = self.review_df.iat[row, self.review_df.columns.get_loc("UUID")]
+            master_match = parent.df_master[parent.df_master['UUID'] == uuid]
+            if not master_match.empty:
+                folder = str(master_match.iloc[0]['ABSPATH'])
+
+        # C. Last Resort: Reconstruct from LOCALPATH + Main App's Catalog Root
+        if not folder or folder == "nan":
+            lp = str(self.review_df.iat[row, self.review_df.columns.get_loc("LOCALPATH")])
+            root_dir = self.engine.project_root
+            folder = os.path.join(root_dir, lp)
+
+        # 3. Final Verification before triggering
+        if folder and folder != "nan":
+            # Pass to the parent's unified OS trigger
+            parent.trigger_os_reveal(folder, filename)
+        else:
+            parent.statusBar().showMessage("Reveal Failed: Could not reconstruct absolute path.", 5000)
+
     def show_row_menu(self, pos):
         idx = self.table.indexAt(pos)
         if not idx.isValid(): return
+
         menu = QMenu(self)
         
-        play_sel_act = menu.addAction("Play selection in RV")
+        # --- NEW: RV ACTION ---
+        rv_act = menu.addAction("Play selection in RV")
         menu.addSeparator()
+
+        rv_scans_act = menu.addAction("Play selection + Hero Scans in RV")
+        
+        menu.addSeparator()
+
         remove_act = menu.addAction("Remove from Playlist")
+
+        menu.addSeparator()
+
+        reveal_act = menu.addAction("Reveal in Finder/Explorer")
         
         action = menu.exec(self.table.viewport().mapToGlobal(pos))
         
         if action == remove_act:
             source_idx = self.proxy.mapToSource(idx)
+            row_to_drop = source_idx.row()
             self.model.beginResetModel()
-            self.review_df.drop(self.review_df.index[source_idx.row()], inplace=True)
+            self.review_df.drop(self.review_df.index[row_to_drop], inplace=True)
             self.review_df.reset_index(drop=True, inplace=True)
             self.model.endResetModel()
-        elif action == play_sel_act:
+        
+        if action == reveal_act:
+            # The logic in AssetManager already handles the selection
+            # but we can call it directly since it looks at the table selection
+            self.reveal_selected_in_os()
+
+        elif action == rv_act:
             self.launch_rv_from_dialog()
+        elif action == rv_scans_act:
+            self.launch_rv_with_scans_from_dialog()
 
     def launch_rv_from_dialog(self):
         selection = self.table.selectionModel().selectedIndexes()
