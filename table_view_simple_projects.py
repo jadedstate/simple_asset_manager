@@ -1683,56 +1683,6 @@ def generate_uuid(local_path, filename):
     path_str = f"{clean_local}/{fn}".replace("//", "/")
     return hashlib.md5(path_str.encode()).hexdigest()
 
-class PathSwapper:
-    PATHSUBS = [] 
-    HEADERS = [] # We store the CSV headers here now
-    TARGET_COLUMN = None # The user can set this to "aws", "gdrive", etc.
-
-    @classmethod
-    def translate(cls, path):
-        if not path or pd.isna(path): return ""
-        
-        # 1. Determine our "Local" Column Index
-        local_idx = -1
-        
-        # Priority A: User-specified arbitrary column
-        if cls.TARGET_COLUMN and cls.TARGET_COLUMN in cls.HEADERS:
-            local_idx = cls.HEADERS.index(cls.TARGET_COLUMN)
-        
-        # Priority B: Standard OS Fallback
-        if local_idx == -1:
-            if sys.platform == "darwin" and "Mac_Root" in cls.HEADERS:
-                local_idx = cls.HEADERS.index("Mac_Root")
-            elif sys.platform == "win32" and "Win_Root" in cls.HEADERS:
-                local_idx = cls.HEADERS.index("Win_Root")
-            elif "Linux_Root" in cls.HEADERS:
-                local_idx = cls.HEADERS.index("Linux_Root")
-
-        if local_idx == -1: return os.path.normpath(path) # No valid roots found
-
-        normalized_path = str(path).replace("\\", "/")
-        
-        # 2. Iterate through all rows in the CSV
-        for row in cls.PATHSUBS:
-            local_root = str(row[local_idx]) if pd.notna(row[local_idx]) else ""
-            if not local_root: continue
-            
-            # 3. Check against EVERY OTHER column in this row
-            # This is the "Agnostic" part: we don't care if the path 
-            # started as an 'aws' path or a 'mac' path.
-            for i, cell_val in enumerate(row):
-                if i == local_idx: continue # Don't swap a path with itself
-                
-                remote_root = str(cell_val).replace("\\", "/") if pd.notna(cell_val) else ""
-                if not remote_root: continue
-
-                if normalized_path.lower().startswith(remote_root.lower()):
-                    # Swap the alien root for our defined local_root
-                    new_path = local_root + normalized_path[len(remote_root):]
-                    return os.path.normpath(new_path)
-        
-        return os.path.normpath(path)
-    
 class MultilineDelegate(QStyledItemDelegate):
     def createEditor(self, parent, option, index):
         editor = QTextEdit(parent)
@@ -2121,33 +2071,36 @@ class SubmissionReviewDialog(QDialog):
         return self.review_df
 
     def quick_save(self):
-        """Saves current state to the designated target_path."""
-        # --- NEW: Ensure DataFrame is synced with the Model's current state ---
+        """Saves current state and pings the Session Manager to update its preview."""
         if hasattr(self.model, '_data'):
             self.review_df = self.model._data 
 
-        # Ensure directory exists
         session_dir = os.path.dirname(self.target_path)
-        if not os.path.exists(session_dir): 
-            os.makedirs(session_dir, exist_ok=True)
+        os.makedirs(session_dir, exist_ok=True)
             
-        # 1. Save the local session CSV
         try:
             self.review_df.to_csv(self.target_path, index=False, encoding='cp1252')
             
-            # 2. Sync 'Pending' status back to main window
             parent = self.parent()
-            if parent and hasattr(parent, 'df_master'):
-                sent_uuids = self.review_df['UUID'].tolist()
-                mask = parent.df_master['UUID'].isin(sent_uuids)
-                parent.df_master.loc[mask, 'SUBSTATUS'] = "Pending"
-                
-                # 3. Force the main window to update its session JSON
-                if hasattr(parent, 'run_autosave'):
+            if parent:
+                # Sync 'Pending' status in main window
+                if hasattr(parent, 'df_master'):
+                    sent_uuids = self.review_df['UUID'].tolist()
+                    mask = parent.df_master['UUID'].isin(sent_uuids)
+                    parent.df_master.loc[mask, 'SUBSTATUS'] = "Pending"
                     parent.run_autosave()
                 
-                if hasattr(parent, 'statusBar') and parent.statusBar():
-                    parent.statusBar().showMessage(f"Progress saved to {os.path.basename(self.target_path)}", 3000)
+                # --- NEW: SYNC SESSION MANAGER PREVIEW ---
+                if hasattr(parent, 'active_dialogs'):
+                    manager = parent.active_dialogs.get("session_manager")
+                    if manager:
+                        # Only refresh if the manager is actually looking at THIS file
+                        current_item = manager.list_widget.currentItem()
+                        if current_item and current_item.text() == os.path.basename(self.target_path).replace(".csv", ""):
+                            manager.refresh_preview()
+
+                if parent.statusBar():
+                    parent.statusBar().showMessage(f"Progress saved: {os.path.basename(self.target_path)}", 3000)
         except Exception as e:
             from PySide6.QtWidgets import QMessageBox
             QMessageBox.critical(self, "Save Error", f"Failed to save session:\n{e}")
@@ -2156,42 +2109,65 @@ class SubmissionReviewDialog(QDialog):
         return self.target_path
 
     def show_row_menu(self, pos):
+        # 1. Get the item under the mouse
         idx = self.table.indexAt(pos)
         if not idx.isValid(): return
 
+        # 2. Get ALL selected indexes (this is more robust than selectedRows)
+        selection = self.table.selectionModel().selectedIndexes()
+        
+        # 3. Unique set of source rows (mapped through the proxy)
+        # We use a set first to collapse multiple cell selections in one row,
+        # then sort it in REVERSE so we don't shift indices during deletion.
+        rows_to_drop = sorted(
+            {self.proxy.mapToSource(i).row() for i in selection}, 
+            reverse=True
+        )
+
         menu = QMenu(self)
         
-        # --- NEW: RV ACTION ---
+        # --- RV ACTIONS ---
         rv_act = menu.addAction("Play selection in RV")
-        menu.addSeparator()
-
         rv_scans_act = menu.addAction("Play selection + Hero Scans in RV")
-        
         menu.addSeparator()
 
-        remove_act = menu.addAction("Remove from Submission")
+        # --- REMOVE ACTION ---
+        label = f"Remove {len(rows_to_drop)} items" if len(rows_to_drop) > 1 else "Remove from List"
+        remove_act = menu.addAction(label)
 
         menu.addSeparator()
-
         reveal_act = menu.addAction("Reveal in Finder/Explorer")
         
         action = menu.exec(self.table.viewport().mapToGlobal(pos))
         
         if action == remove_act:
-            source_idx = self.proxy.mapToSource(idx)
-            row_to_drop = source_idx.row()
+            if not rows_to_drop: return
+
+            # 4. PERFORM THE DROP
             self.model.beginResetModel()
-            self.review_df.drop(self.review_df.index[row_to_drop], inplace=True)
-            self.review_df.reset_index(drop=True, inplace=True)
+            try:
+                # Drop from the underlying DataFrame
+                self.review_df.drop(self.review_df.index[rows_to_drop], inplace=True)
+                
+                # Reset the index so the DataFrame remains a clean 0-N sequence
+                self.review_df.reset_index(drop=True, inplace=True)
+                
+                # 5. COMMIT TO DISK
+                # This ensures the floating Manager sees the change immediately
+                self.quick_save() 
+            except Exception as e:
+                print(f"Remove Error: {e}")
             self.model.endResetModel()
+            
+            # Optional: Refresh the UI polish (column widths, etc.)
+            self.setup_ui_polish()
         
-        if action == reveal_act:
-            # The logic in AssetManager already handles the selection
-            # but we can call it directly since it looks at the table selection
+        elif action == reveal_act:
             self.reveal_selected_in_os()
 
         elif action == rv_act:
             self.launch_rv_from_dialog()
+            
         elif action == rv_scans_act:
             self.launch_rv_with_scans_from_dialog()
 
@@ -2369,6 +2345,36 @@ class SubmissionReviewDialog(QDialog):
     def get_data(self):
         return self.review_df
     
+    def refresh_from_disk(self):
+        """Surgically reloads the CSV data into the floating view."""
+        if not self.target_path or not os.path.exists(self.target_path):
+            return
+
+        # 1. Force-close any active editor to prevent data corruption
+        if self.table.currentIndex().isValid():
+            self.table.commitData(self.table.viewport())
+
+        # 2. Reload the data from the CSV we just appended to
+        try:
+            # We use the same loading logic as __init__
+            new_df = pd.read_csv(self.target_path, encoding='cp1252', dtype=str).fillna("")
+            
+            # 3. Update the Model
+            self.model.beginResetModel()
+            self.review_df = new_df
+            self.model._data = self.review_df
+            self.model.endResetModel()
+            
+            # 4. Maintain UI Polish (column widths/hiding)
+            self.setup_ui_polish()
+            
+            # 5. Visual feedback (Optional)
+            self.setWindowTitle(self.windowTitle().replace(" *Updated*", "") + " *Updated*")
+            QTimer.singleShot(2000, lambda: self.setWindowTitle(self.windowTitle().replace(" *Updated*", "")))
+            
+        except Exception as e:
+            print(f"Sync Error: Could not reload {self.target_path}. {e}")
+
     def accept(self):
         """Custom confirmation before finalizing the submission."""
         # 1. Force commit any active cell edit
@@ -2404,9 +2410,10 @@ class SubmissionReviewDialog(QDialog):
         super().accept()
         
     def reject(self):
-        """Intercept Cancel to drop the model before hiding the UI."""
+        """Surgical cleanup for floating windows."""
         if hasattr(self, 'table') and self.table:
             self.table.setModel(None)
+        # Calling super().reject() triggers the 'finished' signal with code 0
         super().reject()
 
     def closeEvent(self, event):
@@ -2619,16 +2626,32 @@ class PlaylistReviewEditor(QDialog):
         headless_sub.deleteLater()
 
     def quick_save(self):
-        """Saves current state without touching SUBSTATUS."""
+        """Saves current state and pings the Session Manager."""
         if not self.target_path: return
-        session_dir = os.path.dirname(self.target_path)
-        os.makedirs(session_dir, exist_ok=True)
+        
+        # Ensure model data is synced (safety first)
+        if hasattr(self.model, '_data'):
+            self.review_df = self.model._data
+
+        os.makedirs(os.path.dirname(self.target_path), exist_ok=True)
             
         try:
             self.review_df.to_csv(self.target_path, index=False, encoding='cp1252')
-            if self.parent():
-                self.parent().statusBar().showMessage(f"Playlist saved to {os.path.basename(self.target_path)}", 3000)
+            
+            parent = self.parent()
+            if parent:
+                # --- NEW: SYNC SESSION MANAGER PREVIEW ---
+                if hasattr(parent, 'active_dialogs'):
+                    manager = parent.active_dialogs.get("session_manager")
+                    if manager and manager.current_mode == "PLAYLIST":
+                        current_item = manager.list_widget.currentItem()
+                        if current_item and current_item.text() == os.path.basename(self.target_path).replace(".csv", ""):
+                            manager.refresh_preview()
+
+                if parent.statusBar():
+                    parent.statusBar().showMessage(f"Playlist saved: {os.path.basename(self.target_path)}", 3000)
         except Exception as e:
+            from PySide6.QtWidgets import QMessageBox
             QMessageBox.critical(self, "Save Error", f"Failed to save playlist:\n{e}")
 
     def play_all_rv(self):
@@ -2738,42 +2761,65 @@ class PlaylistReviewEditor(QDialog):
             parent.statusBar().showMessage("Reveal Failed: Could not reconstruct absolute path.", 5000)
 
     def show_row_menu(self, pos):
+        # 1. Get the item under the mouse
         idx = self.table.indexAt(pos)
         if not idx.isValid(): return
 
+        # 2. Get ALL selected indexes (this is more robust than selectedRows)
+        selection = self.table.selectionModel().selectedIndexes()
+        
+        # 3. Unique set of source rows (mapped through the proxy)
+        # We use a set first to collapse multiple cell selections in one row,
+        # then sort it in REVERSE so we don't shift indices during deletion.
+        rows_to_drop = sorted(
+            {self.proxy.mapToSource(i).row() for i in selection}, 
+            reverse=True
+        )
+
         menu = QMenu(self)
         
-        # --- NEW: RV ACTION ---
+        # --- RV ACTIONS ---
         rv_act = menu.addAction("Play selection in RV")
-        menu.addSeparator()
-
         rv_scans_act = menu.addAction("Play selection + Hero Scans in RV")
-        
         menu.addSeparator()
 
-        remove_act = menu.addAction("Remove from Playlist")
+        # --- REMOVE ACTION ---
+        label = f"Remove {len(rows_to_drop)} items" if len(rows_to_drop) > 1 else "Remove from List"
+        remove_act = menu.addAction(label)
 
         menu.addSeparator()
-
         reveal_act = menu.addAction("Reveal in Finder/Explorer")
         
         action = menu.exec(self.table.viewport().mapToGlobal(pos))
         
         if action == remove_act:
-            source_idx = self.proxy.mapToSource(idx)
-            row_to_drop = source_idx.row()
+            if not rows_to_drop: return
+
+            # 4. PERFORM THE DROP
             self.model.beginResetModel()
-            self.review_df.drop(self.review_df.index[row_to_drop], inplace=True)
-            self.review_df.reset_index(drop=True, inplace=True)
+            try:
+                # Drop from the underlying DataFrame
+                self.review_df.drop(self.review_df.index[rows_to_drop], inplace=True)
+                
+                # Reset the index so the DataFrame remains a clean 0-N sequence
+                self.review_df.reset_index(drop=True, inplace=True)
+                
+                # 5. COMMIT TO DISK
+                # This ensures the floating Manager sees the change immediately
+                self.quick_save() 
+            except Exception as e:
+                print(f"Remove Error: {e}")
             self.model.endResetModel()
+            
+            # Optional: Refresh the UI polish (column widths, etc.)
+            self.setup_ui_polish()
         
-        if action == reveal_act:
-            # The logic in AssetManager already handles the selection
-            # but we can call it directly since it looks at the table selection
+        elif action == reveal_act:
             self.reveal_selected_in_os()
 
         elif action == rv_act:
             self.launch_rv_from_dialog()
+            
         elif action == rv_scans_act:
             self.launch_rv_with_scans_from_dialog()
 
@@ -2811,7 +2857,43 @@ class PlaylistReviewEditor(QDialog):
         self.table.resizeColumnsToContents()
         if "SUBNOTES" in self.review_df.columns:
             self.table.setColumnWidth(self.review_df.columns.get_loc("SUBNOTES"), 700)
+    
+    def refresh_from_disk(self):
+        """Surgically reloads the CSV data into the floating view."""
+        if not self.target_path or not os.path.exists(self.target_path):
+            return
+
+        # 1. Force-close any active editor to prevent data corruption
+        if self.table.currentIndex().isValid():
+            self.table.commitData(self.table.viewport())
+
+        # 2. Reload the data from the CSV we just appended to
+        try:
+            # We use the same loading logic as __init__
+            new_df = pd.read_csv(self.target_path, encoding='cp1252', dtype=str).fillna("")
             
+            # 3. Update the Model
+            self.model.beginResetModel()
+            self.review_df = new_df
+            self.model._data = self.review_df
+            self.model.endResetModel()
+            
+            # 4. Maintain UI Polish (column widths/hiding)
+            self.setup_ui_polish()
+            
+            # 5. Visual feedback (Optional)
+            self.setWindowTitle(self.windowTitle().replace(" *Updated*", "") + " *Updated*")
+            QTimer.singleShot(2000, lambda: self.setWindowTitle(self.windowTitle().replace(" *Updated*", "")))
+            
+        except Exception as e:
+            print(f"Sync Error: Could not reload {self.target_path}. {e}")
+
+    def reject(self):
+        """Surgical cleanup to drop the model before the window is destroyed."""
+        if hasattr(self, 'table') and self.table:
+            self.table.setModel(None)
+        super().reject()
+
     def closeEvent(self, event):
         if hasattr(self, 'table') and self.table: self.table.setModel(None)
         super().closeEvent(event)
@@ -2947,6 +3029,13 @@ class SessionManagerDialog(QDialog):
         if hasattr(self, 'preview_label') and self.preview_label:
             self.preview_label.setText("Preview Contents: (None selected)")
 
+    def refresh_preview(self):
+        """Surgically re-triggers the preview load for the currently selected item."""
+        current_row = self.list_widget.currentRow()
+        if current_row >= 0:
+            # We call the existing logic, passing the current row index
+            self.load_preview(current_row)
+            
     def switch_mode(self, mode):
         self.current_mode = mode
 
@@ -4276,6 +4365,56 @@ class ConfigHub(QDialog):
     def exec_(self):
         return super().exec_()
 
+class PathSwapper:
+    PATHSUBS = [] 
+    HEADERS = [] # We store the CSV headers here now
+    TARGET_COLUMN = None # The user can set this to "aws", "gdrive", etc.
+
+    @classmethod
+    def translate(cls, path):
+        if not path or pd.isna(path): return ""
+        
+        # 1. Determine our "Local" Column Index
+        local_idx = -1
+        
+        # Priority A: User-specified arbitrary column
+        if cls.TARGET_COLUMN and cls.TARGET_COLUMN in cls.HEADERS:
+            local_idx = cls.HEADERS.index(cls.TARGET_COLUMN)
+        
+        # Priority B: Standard OS Fallback
+        if local_idx == -1:
+            if sys.platform == "darwin" and "Mac_Root" in cls.HEADERS:
+                local_idx = cls.HEADERS.index("Mac_Root")
+            elif sys.platform == "win32" and "Win_Root" in cls.HEADERS:
+                local_idx = cls.HEADERS.index("Win_Root")
+            elif "Linux_Root" in cls.HEADERS:
+                local_idx = cls.HEADERS.index("Linux_Root")
+
+        if local_idx == -1: return os.path.normpath(path) # No valid roots found
+
+        normalized_path = str(path).replace("\\", "/")
+        
+        # 2. Iterate through all rows in the CSV
+        for row in cls.PATHSUBS:
+            local_root = str(row[local_idx]) if pd.notna(row[local_idx]) else ""
+            if not local_root: continue
+            
+            # 3. Check against EVERY OTHER column in this row
+            # This is the "Agnostic" part: we don't care if the path 
+            # started as an 'aws' path or a 'mac' path.
+            for i, cell_val in enumerate(row):
+                if i == local_idx: continue # Don't swap a path with itself
+                
+                remote_root = str(cell_val).replace("\\", "/") if pd.notna(cell_val) else ""
+                if not remote_root: continue
+
+                if normalized_path.lower().startswith(remote_root.lower()):
+                    # Swap the alien root for our defined local_root
+                    new_path = local_root + normalized_path[len(remote_root):]
+                    return os.path.normpath(new_path)
+        
+        return os.path.normpath(path)
+    
 class ConfigEngine:
     def __init__(self, root_path, bootstrap=False, use_pointers=False, template_name="_pipe_config_default"):
         self.root = os.path.abspath(os.path.normpath(root_path))
@@ -5564,6 +5703,8 @@ class AssetManager(QMainWindow):
         self.autosave_timer = QTimer()
         self.autosave_timer.setSingleShot(True)
         self.autosave_timer.timeout.connect(self.run_autosave)
+
+        self.active_dialogs = {}
         
         self.init_ui()
         
@@ -5920,51 +6061,6 @@ class AssetManager(QMainWindow):
         self._exec_simple_search() # Update the proxy with the now-empty search string
         self.statusBar().showMessage("All filters reset to default.", 3000)
 
-    def add_to_playlist(self, row_indices, playlist_name):
-        if playlist_name == "NEW":
-            from PySide6.QtWidgets import QInputDialog
-            from datetime import datetime
-            
-            # Generate default timestamped name
-            default_name = f"playlist_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-            name, ok = QInputDialog.getText(self, "New Playlist", "Enter Playlist Name:", text=default_name)
-            
-            if not ok or not name: return
-            playlist_name = name
-
-        # 1. THE DATA GRAB
-        cols = ['UUID', 'ABSPATH', 'LOCALPATH', 'FILENAME', 'FIRST', 'LAST', 'SHOTNAME', 'ALTSHOTNAME']
-        valid_cols = [c for c in cols if c in self.df_master.columns]
-        
-        try:
-            new_data = self.df_master.iloc[list(row_indices)][valid_cols].copy()
-            new_data['SUBNOTES'] = ""
-        except Exception as e:
-            self.statusBar().showMessage(f"Extraction Error: {e}", 5000)
-            return
-
-        # 2. FILE HANDLING (Bypasses SUBSTATUS entirely)
-        base_dir = self.engine.project_root
-        playlist_dir = os.path.join(base_dir, ".autosaves/playlists")
-        if not os.path.exists(playlist_dir): os.makedirs(playlist_dir)
-        
-        playlist_path = os.path.join(playlist_dir, f"{playlist_name}.csv")
-        
-        # Write to disk
-        if os.path.exists(playlist_path):
-            existing_df = pd.read_csv(playlist_path, encoding='cp1252')
-            combined = pd.concat([existing_df, new_data]).drop_duplicates(subset=['UUID'], keep='last')
-            combined.to_csv(playlist_path, index=False)
-        else:
-            new_data.to_csv(playlist_path, index=False)
-
-        # 3. UPDATE CACHE & UI
-        if playlist_name not in self.playlist_cache:
-            self.playlist_cache.append(playlist_name)
-            self.playlist_cache.sort()
-            
-        self.statusBar().showMessage(f"Added {len(row_indices)} items to playlist: {playlist_name}", 3000)
-
     def action_add_note(self, checked=False, reply_to_file=""):
         selection = self.table.selectionModel().selectedIndexes()
         if not selection: return
@@ -6299,109 +6395,93 @@ class AssetManager(QMainWindow):
         df.to_csv(csv_path, index=False)
 
     def open_session_manager(self):
+        """Surgical Update: Just handle the window visibility."""
+        manager_key = "session_manager"
+        if manager_key in self.active_dialogs:
+            self.active_dialogs[manager_key].raise_()
+            self.active_dialogs[manager_key].activateWindow()
+            return
+
         base_dir = self.engine.project_root
         dlg_manager = SessionManagerDialog(base_dir, self)
+        self.active_dialogs[manager_key] = dlg_manager
+        dlg_manager.finished.connect(lambda: self.active_dialogs.pop(manager_key, None))
         
-        result = dlg_manager.exec()
-        if not result:
-            if hasattr(dlg_manager, 'preview_table') and dlg_manager.preview_table:
-                dlg_manager.preview_table.setModel(None)
-            return
-
-        item = dlg_manager.list_widget.currentItem()
-        if not item: return
-        
-        session_name = item.text()
-        mode = dlg_manager.current_mode
-        
-        # --- PLAYLIST ROUTE ---
-        if mode == "PLAYLIST":
-            path = os.path.join(base_dir, ".autosaves", "playlists", f"{session_name}.csv")
-            df_play = pd.read_csv(path, encoding='cp1252')
-            if 'ABSPATH' in df_play.columns:
-                df_play['ABSPATH'] = df_play['ABSPATH'].apply(PathSwapper.translate)
-                
-            dlg_play = PlaylistReviewEditor(df_play, self, engine=self.engine, target_path=path)
-            dlg_play.exec()
-            return
-            
-        # --- SUBMISSION ROUTE (Original) ---
-        session_path = os.path.join(base_dir, ".autosaves", "sessions", f"{session_name}.csv")
-        df_wip = pd.read_csv(session_path, encoding='cp1252')
-        if 'ABSPATH' in df_wip.columns:
-            df_wip['ABSPATH'] = df_wip['ABSPATH'].apply(PathSwapper.translate)
-        
-        dlg_review = SubmissionReviewDialog(df_wip, self, engine=self.engine, target_path=session_path)
-        review_result = dlg_review.exec()
-        
-        if review_result == 1: 
-            self.process_final_submission(dlg_review.get_data(), session_path=session_path)
-        elif review_result == 2:
-            dlg_review.get_data().to_csv(session_path, index=False)
-            self.run_autosave()
+        # We REMOVED all the 'if result == 1' logic from here because 
+        # SessionManagerDialog now calls launch_session_from_manager directly!
+        dlg_manager.show()
 
     def launch_session_from_manager(self, session_name, mode):
+        """Now launches Review/Playlist editors as free-floating windows."""
         base_dir = self.engine.project_root
 
+        # 1. PATH RESOLUTION (Same as before)
         if mode == "PLAYLIST":
-            path = os.path.join(base_dir, ".autosaves", "playlists", f"{session_name}.csv")
-            df_play = pd.read_csv(path, encoding='cp1252')
-            if 'ABSPATH' in df_play.columns:
-                df_play['ABSPATH'] = df_play['ABSPATH'].apply(PathSwapper.translate)
-            
-            # Launch Playlist Editor
-            dlg_play = PlaylistReviewEditor(df_play, self, engine=self.engine, target_path=path)
-            dlg_play.exec()
-        
-        # --- NEW: SENT SUBMISSIONS ROUTE ---
+            session_path = os.path.normpath(os.path.join(base_dir, ".autosaves", "playlists", f"{session_name}.csv"))
         elif mode == "SENT":
-            session_path = os.path.join(base_dir, "submission_data", f"{session_name}.csv")
-            df_sent = pd.read_csv(session_path, encoding='cp1252')
+            session_path = os.path.normpath(os.path.join(base_dir, "submission_data", f"{session_name}.csv"))
+        else: # WIP
+            session_path = os.path.normpath(os.path.join(base_dir, ".autosaves", "sessions", f"{session_name}.csv"))
+
+        # 2. THE MULTI-WINDOW GUARD
+        # If this exact file is already open, just bring it to the front
+        if session_path in self.active_dialogs:
+            self.active_dialogs[session_path].raise_()
+            self.active_dialogs[session_path].activateWindow()
+            return
+
+        # 3. DATA LOADING
+        df = pd.read_csv(session_path, encoding='cp1252')
+        if 'ABSPATH' in df.columns:
+            df['ABSPATH'] = df['ABSPATH'].apply(PathSwapper.translate)
+
+        # 4. INSTANTIATE (No .exec()!)
+        if mode == "PLAYLIST":
+            dlg = PlaylistReviewEditor(df, self, engine=self.engine, target_path=session_path)
+        else:
+            is_read_only = (mode == "SENT")
+            dlg = SubmissionReviewDialog(df, self, engine=self.engine, target_path=session_path, read_only=is_read_only)
             
-            if 'ABSPATH' in df_sent.columns:
-                df_sent['ABSPATH'] = df_sent['ABSPATH'].apply(PathSwapper.translate)
+            if is_read_only:
+                dlg.btn_just_save.setVisible(False)
+                dlg.btn_save_exit.setVisible(False)
+                dlg.buttons.button(QDialogButtonBox.Ok).setVisible(False)
+                dlg.buttons.button(QDialogButtonBox.Cancel).setText("Close")
+                dlg.setWindowTitle(f"[{self.project_label}] - History: {session_name}")
+
+        # 5. REGISTER & SHOW
+        self.active_dialogs[session_path] = dlg
+        
+        # When the window closes, remove it from the registry
+        dlg.finished.connect(lambda: self.active_dialogs.pop(session_path, None))
+        
+        # --- NEW: Connect the "Submit" and "Save" signals ---
+        # Since .exec() is gone, the dialogs need to call these methods directly
+        if mode == "WIP":
+            dlg.accepted.connect(lambda: self.handle_floating_submit(session_path))
+            # result code 2 was our "Save for Later"
+            dlg.finished.connect(lambda code: self.handle_floating_save_later(session_path) if code == 2 else None)
+
+        dlg.show()
+
+    def handle_floating_submit(self, path):
+        """Triggered when a floating Submission dialog hits 'Submit'."""
+        if path in self.active_dialogs:
+            dlg = self.active_dialogs[path]
+            request_reveal = getattr(dlg, 'open_folder_requested', False)
+            self.process_final_submission(dlg.get_data(), session_path=path, open_folder=request_reveal)
             
-            # SURGICAL FIX: Pass read_only=True
-            dlg_review = SubmissionReviewDialog(df_sent, self, engine=self.engine, target_path=session_path, read_only=True)
-            
-            # Keep your UI polish for the buttons
-            dlg_review.btn_just_save.setVisible(False)
-            dlg_review.btn_save_exit.setVisible(False)
-            dlg_review.buttons.button(QDialogButtonBox.Ok).setVisible(False)
-            dlg_review.buttons.button(QDialogButtonBox.Cancel).setText("Close") # Better context
-            dlg_review.setWindowTitle(f"[{self.project_label}] - History: {session_name}")
-            
-            dlg_review.exec()
-            
-        elif mode == "WIP":
-            session_path = os.path.join(base_dir, ".autosaves", "sessions", f"{session_name}.csv")
-            df_wip = pd.read_csv(session_path, encoding='cp1252')
-            
-            dlg_review = SubmissionReviewDialog(df_wip, self, engine=self.engine, target_path=session_path)
-            result = dlg_review.exec()
-            
-            if result == 1: # Submit
-                # --- SURGICAL FIX: Match the process_final_submission signature ---
-                request_reveal = getattr(dlg_review, 'open_folder_requested', False)
-                self.process_final_submission(
-                    dlg_review.get_data(), 
-                    session_path=session_path, 
-                    open_folder=request_reveal # Passing the flag here!
-                )
-                
-                # Refresh Manager
-                for widget in self.children():
-                    if isinstance(widget, SessionManagerDialog):
-                        widget.switch_mode("WIP")
-                        break
-                        
-            elif result == 2: # Save for Later
-                dlg_review.get_data().to_csv(session_path, index=False)
-                self.run_autosave()
-                for widget in self.children():
-                    if isinstance(widget, SessionManagerDialog):
-                        widget.refresh_list()
-                        break
+            # Refresh Manager if open
+            if "session_manager" in self.active_dialogs:
+                self.active_dialogs["session_manager"].switch_mode("WIP")
+
+    def handle_floating_save_later(self, path):
+        """Triggered when a floating dialog hits 'Save and Exit'."""
+        # The dialog already saved the CSV in its internal logic, 
+        # so we just need to sync the main app state.
+        self.run_autosave()
+        if "session_manager" in self.active_dialogs:
+            self.active_dialogs["session_manager"].refresh_list()
 
     def process_final_submission(self, final_df, session_path=None, open_folder=False):
         now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -6479,9 +6559,7 @@ class AssetManager(QMainWindow):
         cols = ['UUID', 'ABSPATH', 'LOCALPATH', 'FILENAME', 'FIRST', 'LAST', 'SHOTNAME', 'ALTSHOTNAME']
         valid_cols = [c for c in cols if c in self.df_master.columns]
         
-        # Convert set to list and grab the data
         try:
-            # We use .iloc because row_indices refers to the integer position in df_master
             new_data = self.df_master.iloc[list(row_indices)][valid_cols].copy()
             new_data['SUBNOTES'] = ""
         except Exception as e:
@@ -6493,14 +6571,14 @@ class AssetManager(QMainWindow):
         for r in row_indices:
             self.df_master.iat[r, sub_idx] = "Pending"
 
-        # 3. FILE HANDLING (Translated for local OS)
+        # 3. FILE HANDLING
         base_dir = self.engine.project_root
-        session_dir = os.path.join(base_dir, ".autosaves/sessions")
+        session_dir = os.path.join(base_dir, ".autosaves", "sessions")
         if not os.path.exists(session_dir): os.makedirs(session_dir)
         
-        session_path = os.path.join(session_dir, f"{session_name}.csv")
+        # We normpath here ONLY to ensure the dictionary key matches what the launcher used
+        session_path = os.path.normpath(os.path.join(session_dir, f"{session_name}.csv"))
         
-        # Write to disk
         if os.path.exists(session_path):
             existing_df = pd.read_csv(session_path, encoding='cp1252')
             combined = pd.concat([existing_df, new_data]).drop_duplicates(subset=['UUID'], keep='last')
@@ -6510,15 +6588,74 @@ class AssetManager(QMainWindow):
 
         if session_name not in self.session_cache:
             self.session_cache.append(session_name)
-            self.session_cache.sort() # Keep it alphabetical
+            self.session_cache.sort()
             
-        # 4. REFRESH UI
+        # 4. REFRESH UI & PING FLOATING WINDOWS
         self.main_model.dataChanged.emit(
             self.main_model.index(0, sub_idx), 
             self.main_model.index(self.main_model.rowCount()-1, sub_idx)
         )
         self.start_autosave_fuse()
         self.statusBar().showMessage(f"Added {len(row_indices)} items to session: {session_name}", 3000)
+
+        # Sync the specific floating review dialog if it's open
+        if session_path in self.active_dialogs:
+            self.active_dialogs[session_path].refresh_from_disk()
+
+        # Sync the session manager list
+        manager = self.active_dialogs.get("session_manager")
+        if manager and manager.current_mode == "WIP":
+            manager.refresh_list()
+
+    def add_to_playlist(self, row_indices, playlist_name):
+        if playlist_name == "NEW":
+            from PySide6.QtWidgets import QInputDialog
+            from datetime import datetime
+            default_name = f"playlist_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+            name, ok = QInputDialog.getText(self, "New Playlist", "Enter Playlist Name:", text=default_name)
+            if not ok or not name: return
+            playlist_name = name
+
+        # 1. THE DATA GRAB
+        cols = ['UUID', 'ABSPATH', 'LOCALPATH', 'FILENAME', 'FIRST', 'LAST', 'SHOTNAME', 'ALTSHOTNAME']
+        valid_cols = [c for c in cols if c in self.df_master.columns]
+        
+        try:
+            new_data = self.df_master.iloc[list(row_indices)][valid_cols].copy()
+            new_data['SUBNOTES'] = ""
+        except Exception as e:
+            self.statusBar().showMessage(f"Extraction Error: {e}", 5000)
+            return
+
+        # 2. FILE HANDLING
+        base_dir = self.engine.project_root
+        playlist_dir = os.path.join(base_dir, ".autosaves", "playlists")
+        if not os.path.exists(playlist_dir): os.makedirs(playlist_dir)
+        
+        playlist_path = os.path.normpath(os.path.join(playlist_dir, f"{playlist_name}.csv"))
+        
+        if os.path.exists(playlist_path):
+            existing_df = pd.read_csv(playlist_path, encoding='cp1252')
+            combined = pd.concat([existing_df, new_data]).drop_duplicates(subset=['UUID'], keep='last')
+            combined.to_csv(playlist_path, index=False)
+        else:
+            new_data.to_csv(playlist_path, index=False)
+
+        # 3. UPDATE CACHE & UI & PING FLOATING WINDOWS
+        if playlist_name not in self.playlist_cache:
+            self.playlist_cache.append(playlist_name)
+            self.playlist_cache.sort()
+            
+        self.statusBar().showMessage(f"Added {len(row_indices)} items to playlist: {playlist_name}", 3000)
+
+        # Sync the specific floating playlist editor if it's open
+        if playlist_path in self.active_dialogs:
+            self.active_dialogs[playlist_path].refresh_from_disk()
+
+        # Sync the session manager list
+        manager = self.active_dialogs.get("session_manager")
+        if manager and manager.current_mode == "PLAYLIST":
+            manager.refresh_list()
 
     def keyPressEvent(self, event):
         """Surgically intercepts Copy before the Editor can steal the focus."""
