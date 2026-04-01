@@ -4621,11 +4621,10 @@ class ConfigEngine:
         # Load and SWAP settings immediately
         raw = self._load_kv_csv("Project_Settings.csv")
         self.settings = {}
-        
         for k, v in raw.items():
             if k == 'data_root':
-                # CRITICAL: Preserve the exact JSON string before any swapping
-                self.settings['data_root_raw'] = str(v) 
+                # CRITICAL: Bypass PathSwapper here so Windows normpath doesn't
+                # flip forward slashes to backslashes and break the JSON parser.
                 self.settings[k] = str(v)
             elif "/" in str(v) or "\\" in str(v):
                 self.settings[k] = PathSwapper.translate(str(v))
@@ -4633,35 +4632,30 @@ class ConfigEngine:
                 self.settings[k] = v
 
         # --- THE MULTI-ROOT INTERCEPTOR ---
-        self.data_roots = []
-        # Always read from our protected raw string
-        raw_dr = str(self.settings.get('data_root_raw', '')).strip()
+        if 'data_root' in self.settings:
+            raw_dr = str(self.settings['data_root']).strip()
+            
+            # 1. Store the untouched payload for future multi-root scrapers
+            self.settings['data_root_raw'] = raw_dr 
 
-        if raw_dr and raw_dr != "nan":
-            if "[" in raw_dr:
-                try:
-                    import json
-                    json_ready = raw_dr.replace('\\', '/')
-                    dr_list = json.loads(json_ready)
-                    
-                    if isinstance(dr_list, list):
-                        for item in dr_list:
-                            if isinstance(item, list) and len(item) >= 2:
-                                r_name = str(item[0]) # Extract the name (e.g., "root_1")
-                                r_path_local = PathSwapper.translate(str(item[1]))
-                                self.data_roots.append((r_name, r_path_local))
-                except Exception as e:
-                    print(f"ConfigEngine: JSON Parse failed: {e}")
-                    self.data_roots = [("default", PathSwapper.translate(raw_dr))]
-            else:
-                self.data_roots = [("default", PathSwapper.translate(raw_dr))]
-
-        # Update the convenience setting for legacy tool compatibility
-        if self.data_roots:
-            self.settings['data_root'] = self.data_roots[0][1]
+            # 2. Try to extract the first tuple's path for primary pipeline write actions
+            try:
+                import json
+                dr_list = json.loads(raw_dr)
                 
-        # --- CRITICAL: THESE MUST RUN TO FINISH INIT ---
+                if isinstance(dr_list, list) and len(dr_list) > 0:
+                    first_item = dr_list[0]
+                    # We expect format: [["name", "/path"], ["name2", "/path2"]]
+                    if isinstance(first_item, (list, tuple)) and len(first_item) >= 2:
+                        # NOW we translate the cleanly extracted path!
+                        self.settings['data_root'] = PathSwapper.translate(str(first_item[1]))
+            except Exception:
+                # It's a legacy flat string (e.g. "/Volumes/jobs"). 
+                # Translate it now since we skipped it in the initial loop.
+                self.settings['data_root'] = PathSwapper.translate(raw_dr)
+                
         self.apps = self._discover_apps()
+        # Load Naming Templates
         self.naming_templates = self._load_kv_csv("Naming_Templates.csv")
 
     def _resolve_pointer(self, key, value, filename):
@@ -5640,31 +5634,36 @@ class CatalogProvider:
         self.engine = engine
 
     def get_raw_csv_df(self):
-        """The Authority: Decides which catalogs to load based on engine settings."""
-        # 1. Ask the Engine for the clean, already-parsed list!
-        if not hasattr(self.engine, 'data_roots') or not self.engine.data_roots:
+        """Pulls the name from data_root_raw and loads the CSV."""
+        raw_dr = str(self.engine.settings.get('data_root_raw', ''))
+        if not raw_dr: 
             return pd.DataFrame()
 
-        # 2. Get the name from the FIRST tuple (e.g., "root_1")
-        catalog_key = self.engine.data_roots[0][0]
+        # 1. Get the name of the first tuple (e.g., "root_1")
+        try:
+            import json
+            dr_list = json.loads(raw_dr)
+            catalog_key = dr_list[0][0] 
+        except:
+            catalog_key = "default"
 
-        # 3. Resolve the path (beside _pipe_config)
+        # 2. Ask for the path
         target_path = self.get_catalog_path(catalog_key)
 
-        # 4. Load and return
+        # 3. Load it
         if os.path.exists(target_path):
             try:
                 return pd.read_csv(target_path, encoding='cp1252', dtype=str).fillna("")
             except Exception as e:
-                print(f"CatalogProvider: Error reading {target_path}: {e}")
-        
+                print(f"CatalogProvider Error: {e}")
+                
         return pd.DataFrame()
     
     def get_catalog_path(self, catalog_name):
-        """Resolves a catalog key to a physical CSV path beside the _pipe_config folder."""
-        # Project_root ensures we look at ProjectName/catalogs/root_1.csv
+        """Matches UpdateScrapeDialog: looks beside _pipe_config."""
+        # This points to .../ProjectName/catalogs/root_1.csv
         full_path = os.path.join(self.engine.project_root, "catalogs", f"{catalog_name}.csv")
-        return os.path.normpath(full_path)
+        return full_path # No normpath needed if the engine is clean!
 
 class Scraper(QObject):
     progress = Signal(int)
