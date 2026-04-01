@@ -8,7 +8,7 @@ import glob
 from PySide6.QtWidgets import (QApplication, QMainWindow, QTableView, QStyledItemDelegate, QComboBox, QButtonGroup, QStackedWidget,
                                QVBoxLayout, QHBoxLayout, QPushButton, QFrame, QHeaderView, QTextEdit, QListWidgetItem, QTableWidget, QTableWidgetItem,
                                QWidget, QLabel, QLineEdit, QFileDialog, QCheckBox, QDateEdit, QMessageBox, QStyleOptionViewItem, QStyle, QSpacerItem,
-                               QMenu, QDialog, QProgressBar, QDialogButtonBox, QSplitter, QListWidget, QFormLayout, QScrollArea, QGridLayout,
+                               QMenu, QDialog, QProgressBar, QDialogButtonBox, QSplitter, QListWidget, QFormLayout, QScrollArea, QDockWidget,
                                QSizePolicy)
 from PySide6.QtCore import QAbstractTableModel, Qt, QSortFilterProxyModel, QDate, QEvent, QTimer, QObject, Signal, QThread, QModelIndex
 from PySide6.QtGui import QKeySequence, QAction, QColor, QPalette
@@ -198,6 +198,72 @@ class AdvancedImportMapperDialog(QDialog):
                 final_map[target] = self.incoming_df.columns[i]
         return final_map, self.index_combo.currentText()
 
+class AddTempRootDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Add Temporary Data Root")
+        self.setMinimumWidth(400)
+        
+        layout = QVBoxLayout(self)
+        
+        # Name Input
+        layout.addWidget(QLabel("Root Name (e.g., usb_drive, client_drop):"))
+        self.edit_name = QLineEdit()
+        layout.addWidget(self.edit_name)
+        
+        # Path Input
+        layout.addWidget(QLabel("Directory Path:"))
+        path_layout = QHBoxLayout()
+        self.edit_path = QLineEdit()
+        self.btn_browse = QPushButton("Browse...")
+        self.btn_browse.clicked.connect(self.browse_path)
+        
+        path_layout.addWidget(self.edit_path)
+        path_layout.addWidget(self.btn_browse)
+        layout.addLayout(path_layout)
+        
+        # Buttons
+        btn_layout = QHBoxLayout()
+        self.btn_ok = QPushButton("Add Temp Root")
+        self.btn_ok.setStyleSheet("background-color: #2563eb; color: white; font-weight: bold;")
+        self.btn_ok.clicked.connect(self.validate_and_accept)
+        
+        self.btn_cancel = QPushButton("Cancel")
+        self.btn_cancel.clicked.connect(self.reject)
+        
+        btn_layout.addStretch()
+        btn_layout.addWidget(self.btn_cancel)
+        btn_layout.addWidget(self.btn_ok)
+        layout.addLayout(btn_layout)
+
+    def browse_path(self):
+        directory = QFileDialog.getExistingDirectory(self, "Select Directory")
+        if directory:
+            self.edit_path.setText(directory)
+
+    def validate_and_accept(self):
+        name = self.edit_name.text().strip()
+        path = self.edit_path.text().strip()
+        
+        if not name or not path:
+            QMessageBox.warning(self, "Missing Info", "Both Name and Path are required.")
+            return
+            
+        import re
+        if not re.match(r"^[a-zA-Z0-9_]+$", name):
+            QMessageBox.warning(self, "Invalid Name", "Name can only contain letters, numbers, and underscores (no spaces).")
+            return
+            
+        import os
+        if not os.path.exists(path):
+            QMessageBox.warning(self, "Invalid Path", "The specified directory does not exist.")
+            return
+            
+        self.accept()
+
+    def get_data(self):
+        return self.edit_name.text().strip(), self.edit_path.text().strip()
+    
 class GlobalPointerDelegate(QStyledItemDelegate):
     def __init__(self, engine, csv_path, parent=None):
         super().__init__(parent)
@@ -5636,38 +5702,34 @@ class CatalogProvider:
     def __init__(self, engine):
         self.engine = engine
 
-    def get_raw_csv_df(self):
-        """Pulls the name from data_root_raw and loads the CSV."""
-        raw_dr = str(self.engine.settings.get('data_root_raw', ''))
-        if not raw_dr: 
+    def get_raw_csv_df(self, active_roots=None):
+        """Loads and appends catalogs based ONLY on the requested root IDs."""
+        # 1. If the UI doesn't explicitly ask for anything, return empty!
+        if not active_roots:
             return pd.DataFrame()
 
-        # 1. Get the name of the first tuple (e.g., "root_1")
-        try:
-            import json
-            dr_list = json.loads(raw_dr)
-            catalog_key = dr_list[0][0] 
-        except:
-            catalog_key = "default"
+        combined_frames = []
 
-        # 2. Ask for the path
-        target_path = self.get_catalog_path(catalog_key)
+        for catalog_key in active_roots:
+            target_path = self.get_catalog_path(catalog_key)
+            if os.path.exists(target_path):
+                try:
+                    df = pd.read_csv(target_path, encoding='cp1252', dtype=str).fillna("")
+                    # 🌟 THE MAGIC TAG: We record where this data came from!
+                    df['ROOT_ID'] = catalog_key 
+                    combined_frames.append(df)
+                except Exception as e:
+                    print(f"CatalogProvider Error reading {catalog_key}: {e}")
 
-        # 3. Load it
-        if os.path.exists(target_path):
-            try:
-                return pd.read_csv(target_path, encoding='cp1252', dtype=str).fillna("")
-            except Exception as e:
-                print(f"CatalogProvider Error: {e}")
-                
+        if combined_frames:
+            # Append them all together into one giant DataFrame
+            return pd.concat(combined_frames, ignore_index=True)
+        
         return pd.DataFrame()
     
     def get_catalog_path(self, catalog_name):
-        """Matches UpdateScrapeDialog: looks beside _pipe_config."""
-        # This points to .../ProjectName/catalogs/root_1.csv
-        full_path = os.path.join(self.engine.project_root, "catalogs", f"{catalog_name}.csv")
-        return full_path # No normpath needed if the engine is clean!
-
+        return os.path.normpath(os.path.join(self.engine.project_root, "catalogs", f"{catalog_name}.csv"))
+    
 class Scraper(QObject):
     progress = Signal(int)
     finished = Signal()
@@ -5784,28 +5846,34 @@ class Scraper(QObject):
         }
 
 class UpdateScrapeDialog(QDialog):
-    def __init__(self, parent=None, engine=None):
+    def __init__(self, parent=None, engine=None, target_roots=None): 
         super().__init__(parent)
         self.engine = engine
         self.setWindowTitle("Update Data")
         self.setMinimumWidth(450)
         layout = QVBoxLayout(self)
 
-        # 1. PARSE THE DATA ROOTS
-        raw_dr = str(self.engine.settings.get('data_root_raw', ''))
+        # 1. PARSE THE DATA ROOTS (OR USE TARGETS)
         self.roots_list = []
-        try:
-            import json
-            parsed_dr = json.loads(raw_dr)
-            if isinstance(parsed_dr, list):
-                for item in parsed_dr:
-                    if isinstance(item, list) and len(item) >= 2:
-                        self.roots_list.append((str(item[0]), str(item[1])))
-        except:
-            # Legacy flat string fallback
-            flat_root = str(self.engine.settings.get('data_root', ''))
-            if flat_root:
-                self.roots_list.append(("default", flat_root))
+        
+        if target_roots is not None:
+            # If the Dock passed us specific roots, use them directly
+            self.roots_list = target_roots
+        else:
+            # Otherwise, fall back to parsing the engine's raw string
+            raw_dr = str(self.engine.settings.get('data_root_raw', ''))
+            try:
+                import json
+                parsed_dr = json.loads(raw_dr)
+                if isinstance(parsed_dr, list):
+                    for item in parsed_dr:
+                        if isinstance(item, list) and len(item) >= 2:
+                            self.roots_list.append((str(item[0]), str(item[1])))
+            except:
+                # Legacy flat string fallback
+                flat_root = str(self.engine.settings.get('data_root', ''))
+                if flat_root:
+                    self.roots_list.append(("default", flat_root))
 
         # 2. RESOLVE THE CATALOG DIRECTORY
         base_output_dir = self.engine.project_root
@@ -5892,10 +5960,318 @@ class UpdateScrapeDialog(QDialog):
         else:
             event.accept()
 
+class DataSourcesDock(QDockWidget):
+    request_reload = Signal(list) 
+
+    def __init__(self, main_window, engine):
+        super().__init__("Data Management", main_window)
+        self.main_window = main_window
+        self.engine = engine
+        self.setAllowedAreas(Qt.LeftDockWidgetArea | Qt.RightDockWidgetArea)
+
+        self.session_roots = [] 
+        self.root_checkboxes = {} 
+
+        self.setup_ui()
+        
+        # 1. Clean up any ghosts from previous crashes FIRST
+        self.cleanup_orphaned_catalogs()
+        
+        # 2. Then build the UI from the permanent roots
+        self.sync_from_engine()
+
+    def setup_ui(self):
+        self.container = QWidget()
+        self.layout = QVBoxLayout(self.container)
+
+        # 1. HEADER
+        lbl_head = QLabel("<b>ACTIVE DATA SOURCES</b>")
+        lbl_head.setAlignment(Qt.AlignCenter)
+        self.layout.addWidget(lbl_head)
+
+        # --- SURGICAL INJECTION: BATCH SCRAPE BUTTON ---
+        self.btn_scrape_selected = QPushButton("⚡ Scrape Selected")
+        self.btn_scrape_selected.setStyleSheet("background-color: #b07030; color: white; font-weight: bold; padding: 5px;")
+        self.btn_scrape_selected.setToolTip("Scrape all checked Data Roots above")
+        self.btn_scrape_selected.clicked.connect(self.on_scrape_selected)
+        self.layout.addWidget(self.btn_scrape_selected)
+        # -----------------------------------------------
+
+        # 2. SCROLLABLE LIST
+        self.scroll = QScrollArea()
+        self.scroll.setWidgetResizable(True)
+        self.scroll_widget = QWidget()
+        self.scroll_layout = QVBoxLayout(self.scroll_widget)
+        self.scroll_layout.setAlignment(Qt.AlignTop)
+        self.scroll.setWidget(self.scroll_widget)
+        self.layout.addWidget(self.scroll)
+
+        # 3. TEMP ACTIONS
+        self.btn_add_temp = QPushButton("+ Add Temporary Root")
+        self.btn_add_temp.clicked.connect(self.on_add_temp)
+        self.layout.addWidget(self.btn_add_temp)
+
+        # 4. DIVIDER
+        line = QFrame()
+        line.setFrameShape(QFrame.HLine)
+        line.setFrameShadow(QFrame.Sunken)
+        self.layout.addWidget(line)
+
+        # 5. MAIN COMMANDS
+        self.btn_reload = QPushButton("🔄 UPDATE VIEW")
+        self.btn_reload.setStyleSheet("background-color: #2563eb; color: white; font-weight: bold; padding: 8px;")
+        self.btn_reload.clicked.connect(self.on_reload_clicked)
+        self.layout.addWidget(self.btn_reload)
+
+        self.btn_manage = QPushButton("⚙️ Manage Saved Roots...")
+        self.btn_manage.clicked.connect(self.on_manage_roots)
+        self.layout.addWidget(self.btn_manage)
+
+        self.setWidget(self.container)
+
+    def cleanup_orphaned_catalogs(self):
+        """Sweeps the catalogs directory on startup to kill ghosts from crashed sessions."""
+        catalog_dir = os.path.join(self.engine.project_root, "catalogs")
+        if not os.path.exists(catalog_dir):
+            return
+
+        # 1. Parse the permanent names directly from the raw string
+        raw_dr = str(self.engine.settings.get('data_root_raw', ''))
+        permanent_names = []
+        try:
+            import json
+            parsed = json.loads(raw_dr)
+            if isinstance(parsed, list):
+                # Grab just the names (item[0]) from the valid tuples
+                permanent_names = [str(item[0]) for item in parsed if isinstance(item, list) and len(item) > 0]
+        except:
+            # Legacy fallback
+            if str(self.engine.settings.get('data_root', '')):
+                permanent_names = ["default"]
+
+        # 2. Sweep the folder
+        for filename in os.listdir(catalog_dir):
+            if filename.endswith(".csv"):
+                catalog_name = filename[:-4] # Strip .csv
+                
+                if catalog_name not in permanent_names:
+                    target_file = os.path.join(catalog_dir, filename)
+                    try:
+                        os.remove(target_file)
+                        print(f"Startup Cleanup: Vaporized orphaned catalog '{filename}'")
+                    except Exception as e:
+                        print(f"Startup Cleanup Failed on '{filename}': {e}")
+                        
+    def get_temp_root_names(self):
+        """Returns a list of root IDs that were flagged as temporary this session."""
+        return [name for name, path, is_temp in self.session_roots if is_temp]
+    
+    def on_scrape_selected(self):
+        """Gathers all checked roots and sends them to the Scraper in one batch."""
+        active_ids = self.get_active_root_ids()
+        
+        if not active_ids:
+            self.main_window.statusBar().showMessage("No Data Roots checked to scrape.", 3000)
+            return
+
+        # Build the exact [(name, path)] structure the dialog expects
+        target_batch = []
+        for name, path, is_temp in self.session_roots:
+            if name in active_ids:
+                target_batch.append((name, path))
+
+        # Launch the dialog with the batch!
+        # Adjust import if needed based on your file structure:
+        # from table_view_simple_projects import UpdateScrapeDialog
+        
+        dlg = UpdateScrapeDialog(parent=self.main_window, engine=self.engine, target_roots=target_batch)
+        if dlg.exec():
+            self.main_window.statusBar().showMessage(f"Successfully scraped {len(target_batch)} Data Roots.", 4000)
+            
+            # Optional: You can auto-trigger a view update here if you want the UI to instantly 
+            # show the newly scraped files, or just let the user click "UPDATE VIEW" manually.
+            # self.on_reload_clicked()
+
+    def sync_from_engine(self):
+        """Initial parse: Turns engine's raw string into our session list."""
+        self.session_roots = []
+        raw_dr = str(self.engine.settings.get('data_root_raw', ''))
+        
+        try:
+            import json
+            parsed = json.loads(raw_dr)
+            if isinstance(parsed, list):
+                for item in parsed:
+                    if isinstance(item, list) and len(item) >= 2:
+                        # (ID, Path, Is_Temp)
+                        self.session_roots.append([str(item[0]), str(item[1]), False])
+        except:
+            # Fallback for legacy
+            flat = str(self.engine.settings.get('data_root', ''))
+            if flat: self.session_roots.append(["default", flat, False])
+
+        self.refresh_ui_list()
+
+    def refresh_ui_list(self):
+        """Clears and rebuilds the checkbox rows based on session_roots."""
+        
+        # 1. REMEMBER WHAT WAS CHECKED BEFORE DESTROYING
+        if not self.root_checkboxes:
+            # First launch: default to just the first root
+            active_ids = [self.session_roots[0][0]] if self.session_roots else []
+        else:
+            # Subsequent refreshes: remember user's choices
+            active_ids = self.get_active_root_ids()
+
+        # 2. SAFELY AND INSTANTLY CLEAR THE UI
+        for i in reversed(range(self.scroll_layout.count())):
+            item = self.scroll_layout.takeAt(i)
+            widget = item.widget()
+            if widget:
+                widget.hide()         # INSTANTLY removes it from the screen!
+                widget.deleteLater()  # Safely queues memory cleanup
+                
+        self.root_checkboxes.clear()
+
+        # 3. REBUILD THE ROWS
+        for i, (name, path, is_temp) in enumerate(self.session_roots):
+            row = QWidget()
+            row_lay = QHBoxLayout(row)
+            row_lay.setContentsMargins(2, 2, 2, 2)
+
+            chk = QCheckBox(name)
+            
+            # Restore previous state!
+            chk.setChecked(name in active_ids) 
+            chk.setToolTip(f"Path: {path}")
+            
+            if is_temp:
+                chk.setStyleSheet("color: #fbbf24; font-style: italic;") 
+
+            self.root_checkboxes[name] = chk
+
+            btn_scrape = QPushButton("Scrape")
+            btn_scrape.setFixedWidth(50)
+            btn_scrape.clicked.connect(lambda checked=False, n=name, p=path: self.on_scrape_request(n, p))
+
+            row_lay.addWidget(chk)
+            row_lay.addStretch()
+            row_lay.addWidget(btn_scrape)
+            self.scroll_layout.addWidget(row)
+
+    def get_active_root_ids(self):
+        """Returns list of names currently checked."""
+        return [name for name, chk in self.root_checkboxes.items() if chk.isChecked()]
+
+    def on_reload_clicked(self):
+        """Emits the list of IDs the Main Window should pass to the Provider."""
+        active_ids = self.get_active_root_ids()
+        self.request_reload.emit(active_ids)
+
+    def on_scrape_request(self, name, path):
+        # Package for your existing UpdateScrapeDialog
+        target = [(name, path)]
+        from table_view_simple_projects import UpdateScrapeDialog # Adjust import as needed
+        dlg = UpdateScrapeDialog(parent=self.main_window, engine=self.engine, target_roots=target)
+        dlg.exec()
+
+    def on_add_temp(self):
+        """Adds a temporary, session-only root and prompts for an initial scrape."""
+        dlg = AddTempRootDialog(self)
+        if dlg.exec():
+            new_name, new_path = dlg.get_data()
+            
+            # Prevent duplicate names in the current session
+            existing_names = [r[0] for r in self.session_roots]
+            if new_name in existing_names:
+                from PySide6.QtWidgets import QMessageBox
+                QMessageBox.warning(self, "Duplicate Name", f"A root named '{new_name}' already exists in this session.")
+                return
+
+            # Add to our session list with the is_temp flag set to True
+            self.session_roots.append([new_name, new_path, True])
+            
+            # Rebuild the Dock UI to show the new orange row
+            self.refresh_ui_list()
+            
+            # Automatically check the new box
+            if new_name in self.root_checkboxes:
+                self.root_checkboxes[new_name].setChecked(True)
+            
+            # Offer to scrape it immediately (since a new root has no catalog yet)
+            from PySide6.QtWidgets import QMessageBox
+            res = QMessageBox.question(self, "Scrape Required", 
+                                       f"Temporary root '{new_name}' added!\n\nWould you like to scrape this directory now to build its catalog?",
+                                       QMessageBox.Yes | QMessageBox.No)
+            
+            if res == QMessageBox.Yes:
+                self.on_scrape_request(new_name, new_path)
+
+    def on_manage_roots(self):
+        """Opens the editor, detects renames, syncs physical catalogs, and saves."""
+        raw_dr = self.engine.settings.get('data_root_raw', '')
+        
+        # Capture the "Before" state (Ignore temp roots since they aren't in the JSON)
+        old_roots = [(name, path) for name, path, is_temp in self.session_roots if not is_temp]
+        
+        # Adjust import based on your setup
+        # from table_view_simple_projects import DataRootsEditorDialog
+        dlg = DataRootsEditorDialog(current_data_string=raw_dr, parent=self)
+        
+        if dlg.exec():
+            # --- START THE "SAVING" UI SPINNER ---
+            from PySide6.QtWidgets import QApplication
+            from PySide6.QtCore import Qt
+            QApplication.setOverrideCursor(Qt.WaitCursor)
+            
+            try:
+                new_json_string = dlg.get_serialized_data()
+                
+                # 1. Parse the "After" state
+                import json, os
+                new_roots = []
+                try:
+                    parsed = json.loads(new_json_string)
+                    if isinstance(parsed, list):
+                        new_roots = [(str(item[0]), str(item[1])) for item in parsed if len(item) >= 2]
+                except Exception as e:
+                    print(f"Parse error during rename check: {e}")
+
+                # 2. THE RENAME DETECTIVE
+                # If the path is identical but the name changed, rename the physical CSV
+                catalog_dir = os.path.join(self.engine.project_root, "catalogs")
+                for old_name, old_path in old_roots:
+                    for new_name, new_path in new_roots:
+                        if old_path == new_path and old_name != new_name:
+                            old_csv = os.path.join(catalog_dir, f"{old_name}.csv")
+                            new_csv = os.path.join(catalog_dir, f"{new_name}.csv")
+                            
+                            if os.path.exists(old_csv):
+                                try:
+                                    os.rename(old_csv, new_csv)
+                                    print(f"Auto-renamed catalog: {old_name}.csv -> {new_name}.csv")
+                                except Exception as e:
+                                    print(f"Failed to rename catalog {old_name}: {e}")
+
+                # 3. Standard Save & Refresh Logic
+                self.engine.settings['data_root'] = new_json_string
+                self.engine.settings['data_root_raw'] = new_json_string
+                
+                self.main_window.save_engine_settings()
+                self.main_window.live_refresh_config()
+                self.sync_from_engine()
+                
+                self.main_window.statusBar().showMessage("Data Roots updated and catalogs synced.", 4000)
+                
+            finally:
+                # --- ALWAYS RESTORE THE CURSOR, even if it crashes ---
+                QApplication.restoreOverrideCursor()
+
 class AssetManager(QMainWindow):
     def __init__(self, shot_path="", engine=None, project_label="Generic Project"):
         super().__init__()
         self.engine = engine
+        
         self.project_label = project_label
 
         self.catalog_provider = CatalogProvider(self.engine)
@@ -5925,6 +6301,9 @@ class AssetManager(QMainWindow):
         
         self.init_ui()
         
+        # --- SURGICAL INJECTION: Setup the dock ---
+        self.setup_data_dock()
+        
         # SURGICAL FIX: We no longer try to setText on self.path_master here.
         # reload_all handles everything now.
         self.reload_all()
@@ -5952,20 +6331,33 @@ class AssetManager(QMainWindow):
             QPushButton:hover { background-color: #4d4d4d; }
         """)
         self.btn_project_manager.clicked.connect(self.open_project_manager)
+        
         self.btn_notes_manager = QPushButton("Notes Manager")
         self.btn_notes_manager.setStyleSheet("""
             QPushButton { 
-                background-color: #5a2e88; 
-                color: white; 
-                font-weight: bold; 
-                height: 35px;
+                background-color: #5a2e88; color: white; 
+                font-weight: bold; height: 35px;
             }
             QPushButton:hover { background-color: #6a3e98; }
         """)
         self.btn_notes_manager.clicked.connect(self.open_global_notes_manager)
+
+        # --- SURGICAL INJECTION: DATA SOURCES TOGGLE ---
+        self.btn_data_dock = QPushButton("🗄️ Data Sources")
+        self.btn_data_dock.setCheckable(True) # Makes it act like a toggle switch
+        self.btn_data_dock.setStyleSheet("""
+            QPushButton { 
+                background-color: #2e5a88; color: white; 
+                font-weight: bold; padding: 6px 15px; border: 1px solid #555;
+            }
+            QPushButton:hover { background-color: #3b76b3; }
+            QPushButton:checked { background-color: #3b82f6; border: 1px solid #fff; }
+        """)
+        self.btn_data_dock.toggled.connect(self.toggle_data_dock)
         
         self.top_toolbar.addWidget(self.btn_project_manager)
         self.top_toolbar.addWidget(self.btn_notes_manager)
+        self.top_toolbar.addWidget(self.btn_data_dock) # Add it to the layout
 
         self.top_toolbar.addStretch()
         self.layout.addLayout(self.top_toolbar)
@@ -6231,6 +6623,24 @@ class AssetManager(QMainWindow):
 
         # Initialize the numbers
         self.update_status_stats()
+
+    def setup_data_dock(self):
+        self.data_dock = DataSourcesDock(self, self.engine)
+        self.addDockWidget(Qt.LeftDockWidgetArea, self.data_dock)
+        self.data_dock.hide()
+        self.data_dock.visibilityChanged.connect(self.btn_data_dock.setChecked)
+        
+        # --- SURGICAL INJECTION: Wire the dock directly to your reload method! ---
+        # When "UPDATE VIEW" is clicked, it sends the active_ids list, but reload_all 
+        # just pulls them directly, so we just call self.reload_all()
+        self.data_dock.request_reload.connect(lambda active_ids: self.reload_all())
+
+    def toggle_data_dock(self, checked):
+        """Shows or hides the dock based on the toolbar button state."""
+        if checked:
+            self.data_dock.show()
+        else:
+            self.data_dock.hide()
 
     def action_import_shots(self):
         file_path, _ = QFileDialog.getOpenFileName(self, "Select CSV to Import", "", "CSV Files (*.csv)")
@@ -7137,15 +7547,18 @@ class AssetManager(QMainWindow):
     def reload_all(self):
         """Audited: Uses CatalogProvider for data, but preserves all original processing logic."""
         raw_s = str(self.engine.settings.get('shots_csv', '')).strip()
-        
         s_path = PathSwapper.translate(raw_s)
 
         # 1. Catalog Intake: Ask the Authority for the Data
         self.main_model.beginResetModel()
-        df_provided = self.catalog_provider.get_raw_csv_df()
         
+        # --- SURGICAL INJECTION: Ask the Dock what's active! ---
+        active_ids = self.data_dock.get_active_root_ids() if hasattr(self, 'data_dock') else None
+        df_provided = self.catalog_provider.get_raw_csv_df(active_roots=active_ids)
+        
+        # ADD 'ROOT_ID' TO THE END OF THIS LIST so it survives the cull!
         ui_order = ["LOCALPATH", "FILENAME", "FILETYPE", "FIRST", "LAST", "SUBSTATUS", "SUBSENT", 
-                    "SEQUENCE", "SHOTNAME", "ALTSHOTNAME", "CREATION", "MODDATE", "ABSPATH", "HAS_SHOT", "FILE_ID", "UUID"]
+                    "SEQUENCE", "SHOTNAME", "ALTSHOTNAME", "CREATION", "MODDATE", "ABSPATH", "HAS_SHOT", "FILE_ID", "UUID", "ROOT_ID"]
 
         if not df_provided.empty:
             try:
@@ -7834,7 +8247,7 @@ class AssetManager(QMainWindow):
                 self.statusBar().showMessage(f"Sent {len(final_paths)} items to RV.")
 
     def closeEvent(self, event):
-        """Disarm ghost timers and kill persistent child windows."""
+        """Disarm ghost timers, kill persistent child windows, and scavenge temp data."""
         if self.autosave_timer.isActive():
             self.autosave_timer.stop()
             self.run_autosave()
@@ -7842,6 +8255,29 @@ class AssetManager(QMainWindow):
         # Kill the Session Manager if it's still floating
         if hasattr(self, 'session_manager_win') and self.session_manager_win:
             self.session_manager_win.close()
+
+        # --- SURGICAL INJECTION: THE TEMP ROOT SCAVENGER ---
+        # --- THE NEW ORPHAN SCAVENGER ---
+        catalog_dir = os.path.join(self.engine.project_root, "catalogs")
+        if os.path.exists(catalog_dir):
+            # Parse the permanent names directly
+            raw_dr = str(self.engine.settings.get('data_root_raw', ''))
+            permanent_names = []
+            try:
+                import json
+                parsed = json.loads(raw_dr)
+                if isinstance(parsed, list):
+                    permanent_names = [str(item[0]) for item in parsed if isinstance(item, list) and len(item) > 0]
+            except:
+                if str(self.engine.settings.get('data_root', '')):
+                    permanent_names = ["default"]
+
+            for filename in os.listdir(catalog_dir):
+                if filename.endswith(".csv"):
+                    if filename[:-4] not in permanent_names:
+                        try:
+                            os.remove(os.path.join(catalog_dir, filename))
+                        except: pass
 
         event.accept()
 
