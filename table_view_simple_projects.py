@@ -5,6 +5,7 @@ import pandas as pd
 import json
 import hashlib
 import glob
+from pathlib import Path
 from PySide6.QtWidgets import (QApplication, QMainWindow, QTableView, QStyledItemDelegate, QComboBox, QButtonGroup, QStackedWidget,
                                QVBoxLayout, QHBoxLayout, QPushButton, QFrame, QHeaderView, QTextEdit, QListWidgetItem, QTableWidget, QTableWidgetItem,
                                QWidget, QLabel, QLineEdit, QFileDialog, QCheckBox, QDateEdit, QMessageBox, QStyleOptionViewItem, QStyle, QSpacerItem,
@@ -25,6 +26,9 @@ from collections import defaultdict
 # Rclone:
 # - can't get Code shell to see rclone. works fine from regular powershell and compiled app
 # - not doing copy on windows
+# Playlists:
+# - doesn't create timestamped submission
+# - doesn't give user dialog for Custom
 # end to do
 
 class ClipboardHelper:
@@ -6392,16 +6396,48 @@ class WarpHubDialog(QDialog):
         
         layout = QVBoxLayout(self)
         
-        # --- GLOBAL ACTIONS ---
+        # --- GLOBAL ACTIONS (Top Bar) ---
         global_lay = QHBoxLayout()
-        btn_sync_anchor = QPushButton("🔗 Match All Anchors to Top")
-        btn_sync_dest = QPushButton("🎯 Match All Destinations to Top")
-        btn_sync_anchor.clicked.connect(self.sync_anchors)
-        btn_sync_dest.clicked.connect(self.sync_dests)
         
-        global_lay.addWidget(btn_sync_anchor)
-        global_lay.addWidget(btn_sync_dest)
+        # 1. The Solo View Toggles
+        global_lay.addWidget(QLabel("👁 <b>Solo View:</b>"))
+        
+        self.view_grp = QButtonGroup(self)
+        self.view_grp.setExclusive(True) # Ensures only one can be clicked at a time
+        
+        btn_all = QPushButton("Show All"); btn_all.setCheckable(True); btn_all.setChecked(True)
+        btn_anchors = QPushButton("Anchors"); btn_anchors.setCheckable(True)
+        btn_dest = QPushButton("Destinations"); btn_dest.setCheckable(True)
+        btn_opts = QPushButton("Options"); btn_opts.setCheckable(True)
+
+        # Add them to the logic group
+        self.view_grp.addButton(btn_all); self.view_grp.addButton(btn_anchors)
+        self.view_grp.addButton(btn_dest); self.view_grp.addButton(btn_opts)
+
+        # Style them like a sleek segmented control
+        toggle_style = """
+            QPushButton { background-color: #222; color: #888; border: 1px solid #444; padding: 5px 15px; border-radius: 4px; }
+            QPushButton:checked { background-color: #58cc71; color: black; font-weight: bold; border: 1px solid #58cc71; }
+            QPushButton:hover:!checked { background-color: #333; color: white; }
+        """
+        for btn in self.view_grp.buttons():
+            btn.setStyleSheet(toggle_style)
+            global_lay.addWidget(btn)
+
+        # Wire up the logic
+        btn_all.clicked.connect(lambda: self.apply_view_mode("all"))
+        btn_anchors.clicked.connect(lambda: self.apply_view_mode("anchor"))
+        btn_dest.clicked.connect(lambda: self.apply_view_mode("dest"))
+        btn_opts.clicked.connect(lambda: self.apply_view_mode("opts"))
+
         global_lay.addStretch()
+
+        # 2. Match Destinations Button (Pushed to the far right)
+        btn_sync_dest = QPushButton("🎯 Match All Destinations to Top")
+        btn_sync_dest.setStyleSheet("background-color: #444; color: white; font-weight: bold; padding: 5px 15px; border-radius: 4px;")
+        btn_sync_dest.clicked.connect(self.sync_dests)
+        global_lay.addWidget(btn_sync_dest)
+        
         layout.addLayout(global_lay)
 
         # --- SCROLLABLE LIST ---
@@ -6412,10 +6448,18 @@ class WarpHubDialog(QDialog):
         self.cards_layout.setAlignment(Qt.AlignTop)
         
         self.cards = []
-        for path in selected_items:
+        for i, path in enumerate(selected_items):
             card = WarpCard(path)
             self.cards.append(card)
             self.cards_layout.addWidget(card)
+            
+            # --- THE HUB MAGIC: Link only the first card ---
+            if i == 0:
+                card.enable_master_mode()
+                card.shift_requested.connect(self.sync_master_shift)
+                card.sync_force_requested.connect(self.sync_force_all)
+                # --- NEW: Wire up the toggle ---
+                card.sync_dir_toggled.connect(self.sync_master_realign)
             
         self.scroll.setWidget(self.container)
         layout.addWidget(self.scroll)
@@ -6434,11 +6478,45 @@ class WarpHubDialog(QDialog):
         btns.addWidget(self.btn_run)
         layout.addLayout(btns)
 
-    def sync_anchors(self):
-        if not self.cards: return
-        master_val = self.cards[0].edit_anchor.text()
+    def apply_view_mode(self, mode):
+        """Broadcasts the solo mode down to every card."""
         for card in self.cards:
-            card.edit_anchor.setText(master_val)
+            card.set_view_mode(mode)
+
+    def sync_force_all(self, state):
+        """Forces all below cards to match the master card's Force setting."""
+        for card in self.cards[1:]:
+            card.chk_force.setChecked(state)
+
+    def sync_master_realign(self):
+        """Fired when the user clicks the 'Align' toggle. Forces all cards to snap to the new logic."""
+        master = self.cards[0]
+        if master.is_decoupled(): return
+        
+        if getattr(master, 'sync_direction', 'right') == 'left':
+            # Snap everyone to the exact same directory depth from the root
+            for c in self.cards[1:]:
+                c.apply_absolute_split(master.split_idx)
+        else:
+            # Snapping back to Right. Calculate how many steps from the end the master is, 
+            # and apply that same right-offset to all the below cards.
+            master_right_steps = len(master.path_parts) - master.split_idx
+            for c in self.cards[1:]:
+                c.apply_absolute_split(len(c.path_parts) - master_right_steps)
+
+    def sync_master_shift(self, delta):
+        """Receives a slider click from the Master card."""
+        master = self.cards[0]
+        if master.is_decoupled(): return
+        
+        if getattr(master, 'sync_direction', 'right') == 'left':
+            # LEFT MODE: All cards perfectly mirror the master's exact root depth
+            for card in self.cards[1:]:
+                card.apply_absolute_split(master.split_idx)
+        else:
+            # RIGHT MODE (Default): Standard relative shifting
+            for card in self.cards[1:]:
+                card.apply_relative_shift(delta)
 
     def sync_dests(self):
         if not self.cards: return
@@ -6457,55 +6535,190 @@ class WarpHubDialog(QDialog):
         ]
     
 class WarpCard(QFrame):
+    shift_requested = Signal(int)
+    sync_force_requested = Signal(bool)
+    sync_dir_toggled = Signal()
+
     def __init__(self, full_path, parent=None):
         super().__init__(parent)
-        self.full_path = full_path
+        self.full_path = os.path.normpath(full_path)
         self.setFrameShape(QFrame.StyledPanel)
         self.setStyleSheet("WarpCard { background-color: #333; border-radius: 5px; margin: 2px; }")
 
-        layout = QVBoxLayout(self)
+        self.path_parts = list(Path(self.full_path).parts)
+        self.split_idx = len(self.path_parts) - 1 
+
+        main_layout = QVBoxLayout(self)
+        main_layout.setSpacing(0) # Tighten up for collapsing
         
-        # 1. FILE NAME HEADER
+        # 0. TITLE ROW (Always visible so they know what file it is)
+        self.header_lay = QHBoxLayout()
+        self.header_lay.setContentsMargins(0, 0, 0, 5)
         self.lbl_name = QLabel(f"📦 <b>{os.path.basename(full_path)}</b>")
-        self.lbl_name.setStyleSheet("color: #58cc71; font-size: 13px;")
-        layout.addWidget(self.lbl_name)
+        self.lbl_name.setStyleSheet("color: #61afef; font-size: 13px;") 
+        self.header_lay.addWidget(self.lbl_name)
+        self.header_lay.addStretch()
+        main_layout.addLayout(self.header_lay)
 
-        # 2. ANCHOR ROW
-        anchor_lay = QHBoxLayout()
-        anchor_lay.addWidget(QLabel("Source Anchor:"))
-        self.edit_anchor = QLineEdit(os.path.dirname(full_path))
-        btn_browse_anchor = QPushButton("Browse...")
-        btn_browse_anchor.clicked.connect(self.browse_anchor)
-        anchor_lay.addWidget(self.edit_anchor)
-        anchor_lay.addWidget(btn_browse_anchor)
-        layout.addLayout(anchor_lay)
+        # --- 1. ANCHOR WRAPPER ---
+        self.w_anchor = QWidget()
+        anchor_v_lay = QVBoxLayout(self.w_anchor)
+        anchor_v_lay.setContentsMargins(0, 0, 0, 5)
+        
+        self.anchor_ctrl_lay = QHBoxLayout()
+        self.anchor_ctrl_lay.addStretch()
+        self.anchor_ctrl_lay.addWidget(QLabel("Move Split:"))
+        
+        self.btn_left = QPushButton("◀")
+        self.btn_left.setFixedWidth(28)
+        self.btn_left.setStyleSheet("background-color: #444; color: white; border-radius: 3px;")
+        self.btn_left.clicked.connect(self.shift_left)
+        
+        self.btn_right = QPushButton("▶")
+        self.btn_right.setFixedWidth(28)
+        self.btn_right.setStyleSheet("background-color: #444; color: white; border-radius: 3px;")
+        self.btn_right.clicked.connect(self.shift_right)
+        
+        self.anchor_ctrl_lay.addWidget(self.btn_left)
+        self.anchor_ctrl_lay.addWidget(self.btn_right)
+        anchor_v_lay.addLayout(self.anchor_ctrl_lay)
 
-        # 3. DESTINATION ROW
-        dest_lay = QHBoxLayout()
-        dest_lay.addWidget(QLabel("Destination:  ")) # Aligned spacing
+        self.split_lay = QHBoxLayout()
+        self.split_lay.setSpacing(2)
+        
+        self.edit_anchor = QLineEdit()
+        self.edit_anchor.setReadOnly(True)
+        self.edit_anchor.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self.edit_anchor.setStyleSheet("QLineEdit { color: #61afef; background-color: #1e2a35; border: 1px dashed #3b749e; border-radius: 3px; padding: 2px; }")
+        
+        self.edit_relative = QLineEdit()
+        self.edit_relative.setReadOnly(True)
+        self.edit_relative.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        self.edit_relative.setStyleSheet("QLineEdit { color: #61afef; background-color: #1e2a35; border: 2px solid #3b949e; border-radius: 3px; padding: 2px; }")
+
+        self.split_lay.addWidget(self.edit_anchor)
+        self.split_lay.addWidget(self.edit_relative)
+        anchor_v_lay.addLayout(self.split_lay)
+        main_layout.addWidget(self.w_anchor)
+
+        # --- 2. DESTINATION WRAPPER ---
+        self.w_dest = QWidget()
+        dest_lay = QHBoxLayout(self.w_dest)
+        dest_lay.setContentsMargins(0, 0, 0, 5)
+        dest_lay.addWidget(QLabel("Destination: "))
         self.edit_dest = QLineEdit()
         btn_browse_dest = QPushButton("Browse...")
         btn_browse_dest.clicked.connect(self.browse_dest)
         dest_lay.addWidget(self.edit_dest)
         dest_lay.addWidget(btn_browse_dest)
-        layout.addLayout(dest_lay)
+        main_layout.addWidget(self.w_dest)
 
-        # 4. OPTIONS ROW
-        opts_lay = QHBoxLayout()
+        # --- 3. OPTIONS WRAPPER ---
+        self.w_opts = QWidget()
+        self.opts_lay = QHBoxLayout(self.w_opts)
+        self.opts_lay.setContentsMargins(0, 0, 0, 0)
         self.chk_force = QCheckBox("Force Overwrite (Ignore Size-Match)")
-        self.chk_force.setToolTip("Enable this if you've re-rendered files and need to overwrite the destination.")
         self.chk_force.setStyleSheet("color: #aaa; font-size: 11px;")
+        self.opts_lay.addWidget(self.chk_force)
+        self.opts_lay.addStretch()
+        main_layout.addWidget(self.w_opts)
+
+        self.update_split_display()
+
+    def set_view_mode(self, mode):
+        """Hides/Shows sections of the card based on the active Solo filter."""
+        self.w_anchor.setVisible(mode in ("all", "anchor"))
+        self.w_dest.setVisible(mode in ("all", "dest"))
+        self.w_opts.setVisible(mode in ("all", "opts"))
+
+    def enable_master_mode(self):
+        """Called by the Hub only on the very first card."""
+        self.chk_decouple = QCheckBox("Decouple Anchors")
+        self.chk_decouple.setToolTip("Don't sync slider movements to below cards")
+        self.chk_decouple.setStyleSheet("color: #e5c07b; font-weight: bold;")
+        self.anchor_ctrl_lay.insertWidget(0, self.chk_decouple)
         
-        opts_lay.addWidget(self.chk_force)
-        opts_lay.addStretch()
-        layout.addLayout(opts_lay)
+        # --- NEW: The Alignment Toggle ---
+        self.sync_direction = "right"
+        self.btn_sync_dir = QPushButton("⮂ Align: Right")
+        self.btn_sync_dir.setToolTip("Toggle how below cards match (Relative from file vs Absolute from root)")
+        self.btn_sync_dir.setStyleSheet("QPushButton { background-color: #444; color: #aaa; border-radius: 3px; padding: 2px 10px; }")
+        self.btn_sync_dir.clicked.connect(self.toggle_sync_dir)
+        self.anchor_ctrl_lay.insertWidget(1, self.btn_sync_dir)
+        
+        self.anchor_ctrl_lay.insertStretch(2) # Keeps buttons formatted nicely
+
+        self.btn_apply_force = QPushButton("⮟ Apply to All")
+        self.btn_apply_force.setStyleSheet("QPushButton { background-color: #2e5a88; color: white; border-radius: 3px; padding: 2px 10px; font-weight: bold; } QPushButton:hover { background-color: #3b76b3; }")
+        self.btn_apply_force.clicked.connect(lambda: self.sync_force_requested.emit(self.chk_force.isChecked()))
+        self.opts_lay.insertWidget(1, self.btn_apply_force)
+
+    def toggle_sync_dir(self):
+        """Swaps the index from end-based to root-based and updates the UI."""
+        if self.sync_direction == "right":
+            self.sync_direction = "left"
+            self.btn_sync_dir.setText("⮂ Align: Left")
+            self.btn_sync_dir.setStyleSheet("QPushButton { background-color: #2e885a; color: white; border-radius: 3px; padding: 2px 10px; font-weight: bold; }")
+        else:
+            self.sync_direction = "right"
+            self.btn_sync_dir.setText("⮂ Align: Right")
+            self.btn_sync_dir.setStyleSheet("QPushButton { background-color: #444; color: #aaa; border-radius: 3px; padding: 2px 10px; }")
+        
+        # Mathematically swap the position (e.g., 1 step from right becomes 1 step from left)
+        self.split_idx = len(self.path_parts) - self.split_idx
+        self.update_split_display()
+        
+        # Tell the Hub to realign everyone below us!
+        self.sync_dir_toggled.emit()
+
+    def apply_absolute_split(self, target_idx):
+        """Forces the slider to an exact directory depth from the root."""
+        self.split_idx = target_idx
+        self.update_split_display()
+
+    def is_decoupled(self):
+        return hasattr(self, 'chk_decouple') and self.chk_decouple.isChecked()
+
+    def apply_relative_shift(self, delta):
+        """Called externally by the Hub to force a relative step."""
+        self.split_idx += delta
+        self.update_split_display()
+
+    # --- SLIDER LOGIC ---
+    def update_split_display(self):
+        # Clamping logic
+        if self.split_idx < 1: self.split_idx = 1
+        if self.split_idx > len(self.path_parts) - 1: self.split_idx = len(self.path_parts) - 1
+        
+        left_path = str(Path(*self.path_parts[:self.split_idx]))
+        right_path = os.path.join(*self.path_parts[self.split_idx:])
+        
+        self.edit_anchor.setText(left_path)
+        self.edit_relative.setText(right_path)
+        
+        len_left = max(len(left_path), 1)
+        len_right = max(len(right_path), 1)
+        self.split_lay.setStretch(0, len_left)
+        self.split_lay.setStretch(1, len_right)
+        
+        self.edit_anchor.setCursorPosition(len(left_path))
+        self.edit_relative.setCursorPosition(0)
+        
+        self.btn_left.setEnabled(self.split_idx > 1)
+        self.btn_right.setEnabled(self.split_idx < len(self.path_parts) - 1)
+
+    def shift_left(self):
+        self.split_idx -= 1
+        self.update_split_display()
+        self.shift_requested.emit(-1) # Broadcast the step!
+
+    def shift_right(self):
+        self.split_idx += 1
+        self.update_split_display()
+        self.shift_requested.emit(1)  # Broadcast the step!
 
     def is_force_enabled(self):
         return self.chk_force.isChecked()
-    
-    def browse_anchor(self):
-        path = QFileDialog.getExistingDirectory(self, "Select Source Anchor", self.edit_anchor.text())
-        if path: self.edit_anchor.setText(os.path.normpath(path))
 
     def browse_dest(self):
         path = QFileDialog.getExistingDirectory(self, "Select Destination", self.edit_dest.text())
