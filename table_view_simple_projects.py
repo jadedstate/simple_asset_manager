@@ -22,10 +22,9 @@ from collections import defaultdict
 # - implement reply-to stuff
 # - get status filter checkboxes in place and have default to showing Active
 # - get simple and advanced text filtering from main window into this one
-# New Project:
-# - copy config from existing
-# SUBSTATUS autosaves, session WIP, Submission & Playlist stuff\
-# - change directory where this stuff is saved so it's not related to catalog_csv
+# Rclone:
+# - can't get Code shell to see rclone. works fine from regular powershell and compiled app
+# - not doing copy on windows
 # end to do
 
 class ClipboardHelper:
@@ -3920,7 +3919,7 @@ class SearchRuleWidget(QFrame):
             'text': self.text_input.text().strip()
         }
 
-class AdvancedSearchBuilder(QWidget): # <-- Changed back to QWidget!
+class AdvancedSearchBuilder(QWidget):
     def __init__(self, proxy_model, parent=None):
         super().__init__(parent)
         self.proxy = proxy_model
@@ -6345,26 +6344,41 @@ class RcloneCopyTask(QProcess):
         self.progress_update.emit(self.files_finished_in_this_run, speed, filename)
 
     def run_copy(self, source_list, destination, source_base_root, force_overwrite=False):
-        """
-        source_base_root: The 'anchor' point (e.g., 'G:/My Drive/Project')
-        Files will be recreated at destination relative to this anchor.
-        """
-        # We use rclone's 'files-from' feature to handle thousands of files safely
-        import tempfile
-        self.list_file = tempfile.NamedTemporaryFile(delete=False, mode='w', suffix='.txt')
+        import tempfile, os
+
+        # 1. THE CRLF FIX: newline='\n' stops Windows from corrupting the rclone path list
+        self.list_file = tempfile.NamedTemporaryFile(
+            delete=False, mode='w', suffix='.txt', encoding='utf-8', newline='\n'
+        )
         
         for p in source_list:
-            # Rclone needs paths relative to the source root
             relative_p = os.path.relpath(p, source_base_root)
+            # Force forward slashes for the internal paths
+            relative_p = relative_p.replace('\\', '/') 
             self.list_file.write(relative_p + "\n")
         self.list_file.close()
 
-        # START WITH THE BASE ARGS
-        args = ["copy", source_base_root, destination, "--files-from", self.list_file.name,
-                "--transfers", "16", "--checkers", "16", "--progress", "--stats", "1s"] # Force 1s updates
+        # 2. PATH SANITIZATION
+        # Ensure rclone's command line parser doesn't choke on Windows backslashes
+        safe_list = self.list_file.name.replace('\\', '/')
+        safe_source = source_base_root.replace('\\', '/')
+        safe_dest = destination.replace('\\', '/')
 
+        # 3. CORE ARGUMENTS
+        args = [
+            "copy", safe_source, safe_dest, 
+            "--files-from", safe_list,
+            "--transfers", "16", 
+            "--checkers", "16", 
+            "--progress", 
+            "--stats", "1s"
+        ]
+
+        # 4. SMART LOGIC
         if not force_overwrite:
-            args.extend(["--size-only", "--ignore-existing", "--exclude=._*", "--exclude=.DS_Store"])
+            # We rely purely on size-only to beat the SMB timestamp drift. 
+            # We removed --ignore-existing and --exclude to prevent rclone filter clashes.
+            args.append("--size-only")
         else:
             args.append("--ignore-times")
 
