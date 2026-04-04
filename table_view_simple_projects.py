@@ -17,6 +17,7 @@ from datetime import datetime
 import subprocess
 import csv
 from collections import defaultdict
+import concurrent.futures
 
 # to do
 # Notes manager:
@@ -950,6 +951,53 @@ class ImportWorker(QThread):
         
         self.found.emit(results)
         self.finished.emit()
+
+class ThumbImportThread(QThread):
+    progress = Signal(int, str)
+    finished = Signal(int, int)
+
+    def __init__(self, source_dir, dest_dir):
+        super().__init__()
+        self.source_dir = source_dir
+        self.dest_dir = dest_dir
+
+    def run(self):
+        import os
+        import shutil
+        
+        files_to_copy = [f for f in os.listdir(self.source_dir) if f.lower().endswith(('.jpg', '.jpeg', '.png'))]
+        total_count = len(files_to_copy)
+        success_count = 0
+
+        if total_count == 0:
+            self.finished.emit(0, 0)
+            return
+
+        def copy_task(filename):
+            src = os.path.join(self.source_dir, filename)
+            dst = os.path.join(self.dest_dir, filename)
+            # Use 'copy' instead of 'copy2' to drop metadata and drastically speed up network/ExFAT transfers
+            shutil.copy(src, dst) 
+            return filename
+
+        # Use ThreadPoolExecutor to copy up to 8 files at the exact same time
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+            # Submit all tasks
+            future_to_file = {executor.submit(copy_task, f): f for f in files_to_copy}
+            
+            # Process as they finish
+            for i, future in enumerate(concurrent.futures.as_completed(future_to_file)):
+                f = future_to_file[future]
+                try:
+                    future.result()
+                    success_count += 1
+                except Exception as e:
+                    print(f"Failed to copy {f}: {e}")
+                
+                # Emit progress to UI
+                self.progress.emit(i + 1, f)
+
+        self.finished.emit(success_count, total_count)
 
 def generate_uuid(local_path, filename):
     lp = str(local_path) if pd.notna(local_path) else ""
@@ -7696,8 +7744,9 @@ class AssetManager(QMainWindow):
         self.update_status_stats()
 
     def action_import_thumbs(self):
-        """Copies all .jpg and .png files from a selected directory into the project's thumbs_dir."""
-        import shutil
+        """Concurrently copies all .jpg and .png files from a selected directory into the project."""
+        from PySide6.QtWidgets import QProgressDialog
+        import os
         
         # 1. Ask for source directory
         source_dir = QFileDialog.getExistingDirectory(self, "Select Directory containing Thumbnails")
@@ -7708,19 +7757,31 @@ class AssetManager(QMainWindow):
         thumbs_dir = os.path.join(self.engine.project_root, self.engine.settings.get('thumbs_dir', 'thumbs'))
         os.makedirs(thumbs_dir, exist_ok=True)
         
-        # 3. Copy files
-        copied_count = 0
-        for file in os.listdir(source_dir):
-            if file.lower().endswith(('.jpg', '.jpeg', '.png')):
-                src_path = os.path.join(source_dir, file)
-                dst_path = os.path.join(thumbs_dir, file)
-                try:
-                    shutil.copy2(src_path, dst_path)
-                    copied_count += 1
-                except Exception as e:
-                    print(f"Failed to copy {file}: {e}")
-                    
-        QMessageBox.information(self, "Import Complete", f"Successfully copied {copied_count} thumbnails into project.")
+        # Count files for the progress bar bounds
+        files = [f for f in os.listdir(source_dir) if f.lower().endswith(('.jpg', '.jpeg', '.png'))]
+        if not files:
+            QMessageBox.information(self, "No Images", "No .jpg or .png files found in the selected directory.")
+            return
+
+        # 3. Setup the Progress Dialog & Thread
+        self.import_progress = QProgressDialog("Importing Thumbnails...", "Cancel", 0, len(files), self)
+        self.import_progress.setWindowTitle("Importing")
+        self.import_progress.setWindowModality(Qt.WindowModal)
+        self.import_progress.setMinimumDuration(0)
+        
+        self.import_thread = ThumbImportThread(source_dir, thumbs_dir)
+        
+        self.import_thread.progress.connect(
+            lambda i, name: (self.import_progress.setValue(i), self.import_progress.setLabelText(f"Copying: {name}"))
+        )
+        self.import_thread.finished.connect(self._on_import_finished)
+        self.import_progress.canceled.connect(self.import_thread.terminate)
+        
+        self.import_thread.start()
+
+    def _on_import_finished(self, success_count, total_count):
+        self.import_progress.setValue(total_count)
+        QMessageBox.information(self, "Import Complete", f"Successfully copied {success_count} of {total_count} thumbnails.")
         
         # Force a refresh of the thumbnail widget if a shot is currently selected
         current_shot = self.shot_selector.currentText()
