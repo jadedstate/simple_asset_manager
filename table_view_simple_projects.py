@@ -24,8 +24,7 @@ from collections import defaultdict
 # - get status filter checkboxes in place and have default to showing Active
 # - get simple and advanced text filtering from main window into this one
 # Rclone:
-# - can't get Code shell to see rclone. works fine from regular powershell and compiled app
-# - not doing copy on windows
+# - all fixed?
 # Playlists:
 # - doesn't create timestamped submission
 # - doesn't give user dialog for Custom
@@ -4159,21 +4158,24 @@ class PandasModel(QAbstractTableModel):
         return False
 
 class DataRootsEditorDialog(QDialog):
-    """Bespoke editor to manage the JSON list of [name, path] tuples for data_root."""
+    """Bespoke editor to manage the JSON config for data_root."""
     def __init__(self, current_data_string="", parent=None):
         super().__init__(parent)
         self.setWindowTitle("Manage Data Roots")
-        self.resize(600, 300)
+        self.resize(650, 300) # Slightly wider for the new buttons
         
         layout = QVBoxLayout(self)
         
         # 1. THE TABLE
         self.table = QTableWidget(0, 3)
-        self.table.setHorizontalHeaderLabels(["Root ID", "Path", ""])
+        self.table.setHorizontalHeaderLabels(["[Load] Root ID", "Path", "Actions"])
         self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
         self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
         self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Fixed)
-        self.table.setColumnWidth(2, 80)
+        self.table.setColumnWidth(2, 120) # Wider to fit Up/Down buttons
+        
+        # Make it row-selectable for a cleaner look when shifting rows
+        self.table.setSelectionBehavior(QTableWidget.SelectRows)
         layout.addWidget(self.table)
         
         # 2. ACTIONS
@@ -4194,7 +4196,7 @@ class DataRootsEditorDialog(QDialog):
         self.load_data(current_data_string)
 
     def load_data(self, raw_string):
-        """Expects: [["default", "/mnt/jobs"], ["usb", "/Volumes/usb"]]"""
+        """Handles legacy arrays and the new dictionary format."""
         self.table.setRowCount(0)
         if not raw_string: return
         
@@ -4203,70 +4205,110 @@ class DataRootsEditorDialog(QDialog):
             if isinstance(data, list):
                 for item in data:
                     if isinstance(item, list) and len(item) >= 2:
-                        self.add_row(str(item[0]), str(item[1]))
-                    elif isinstance(item, dict): # Fallback if we accidentally saved dicts
-                        self.add_row(str(item.get('name', '')), str(item.get('path', '')))
+                        # Legacy fallback: [name, path] -> defaults to active
+                        self.add_row(str(item[0]), str(item[1]), active=True)
+                    elif isinstance(item, dict):
+                        # NEW FORMAT
+                        self.add_row(
+                            str(item.get('name', '')), 
+                            str(item.get('path', '')), 
+                            active=item.get('active', True)
+                        )
             else:
-                # Absolute legacy fallback
-                self.add_row("default", raw_string)
+                self.add_row("default", raw_string, True)
         except:
-            # Absolute legacy fallback
-            self.add_row("default", raw_string)
+            self.add_row("default", raw_string, True)
 
     def add_empty_row(self):
-        """Finds the next available generic name and focuses the cell for the user."""
         existing_names = []
         for r in range(self.table.rowCount()):
             item = self.table.item(r, 0)
-            if item:
-                existing_names.append(item.text().strip())
+            if item: existing_names.append(item.text().strip())
 
-        # 1. Generate a unique default name: root_1, root_2, etc.
         counter = 1
         new_name = f"root_{counter}"
         while new_name in existing_names:
             counter += 1
             new_name = f"root_{counter}"
 
-        # 2. Add the row
-        self.add_row(new_name, "")
+        self.add_row(new_name, "", active=True)
 
-        # 3. IMMEDIATELY focus and select the name cell for the user to type
         last_row = self.table.rowCount() - 1
         name_item = self.table.item(last_row, 0)
         self.table.setCurrentItem(name_item)
         self.table.editItem(name_item) 
 
-    def add_row(self, name, path):
+    def add_row(self, name, path, active=True):
         row = self.table.rowCount()
         self.table.insertRow(row)
         
-        # ROOT ID Cell
+        # ROOT ID Cell (Now includes the Checkbox)
         name_item = QTableWidgetItem(name)
-        # Subtle UI hint: make IDs look like variables
-        name_item.setToolTip("This ID will be used as the variable name (e.g. {default})")
+        name_item.setFlags(name_item.flags() | Qt.ItemIsUserCheckable)
+        name_item.setCheckState(Qt.Checked if active else Qt.Unchecked)
+        name_item.setToolTip("Tick to load at launch. ID used as variable {name}")
         self.table.setItem(row, 0, name_item)
         
         # PATH Cell
         self.table.setItem(row, 1, QTableWidgetItem(path))
         
-        # ACTION Buttons
+        # ACTION Buttons Widget
         widget = QWidget()
         h_layout = QHBoxLayout(widget)
         h_layout.setContentsMargins(2, 2, 2, 2)
         h_layout.setSpacing(4)
         
+        # Reorder Buttons
+        btn_up = QPushButton("▲"); btn_up.setFixedWidth(20)
+        btn_down = QPushButton("▼"); btn_down.setFixedWidth(20)
+        btn_up.clicked.connect(lambda: self.shift_row(btn_up, -1))
+        btn_down.clicked.connect(lambda: self.shift_row(btn_down, 1))
+        
         btn_browse = QPushButton("...")
-        # BUG FIX: Use a more robust way to find the row during callback
         btn_browse.clicked.connect(lambda: self.browse_path_for_widget(btn_browse))
         
         btn_del = QPushButton("X")
         btn_del.setStyleSheet("background-color: #882e2e; color: white; font-weight: bold;")
         btn_del.clicked.connect(lambda: self.delete_row_for_widget(btn_del))
         
+        h_layout.addWidget(btn_up)
+        h_layout.addWidget(btn_down)
         h_layout.addWidget(btn_browse)
         h_layout.addWidget(btn_del)
         self.table.setCellWidget(row, 2, widget)
+
+    def shift_row(self, widget, direction):
+        """Swaps row data up or down without destroying the cell widgets."""
+        pos = widget.parent().mapTo(self.table, widget.pos())
+        row = self.table.indexAt(pos).row()
+        target_row = row + direction
+        
+        if target_row < 0 or target_row >= self.table.rowCount():
+            return # Out of bounds
+            
+        # Get items for current row and target row
+        item_a_name = self.table.item(row, 0)
+        item_a_path = self.table.item(row, 1)
+        item_b_name = self.table.item(target_row, 0)
+        item_b_path = self.table.item(target_row, 1)
+        
+        # Store current row (A) data
+        a_name = item_a_name.text()
+        a_state = item_a_name.checkState()
+        a_path = item_a_path.text()
+        
+        # Copy Target (B) data into Current (A)
+        item_a_name.setText(item_b_name.text())
+        item_a_name.setCheckState(item_b_name.checkState())
+        item_a_path.setText(item_b_path.text())
+        
+        # Paste Current (A) data into Target (B)
+        item_b_name.setText(a_name)
+        item_b_name.setCheckState(a_state)
+        item_b_path.setText(a_path)
+        
+        # Visually follow the row that just moved
+        self.table.selectRow(target_row)
 
     def browse_path_for_widget(self, widget):
         pos = widget.parent().mapTo(self.table, widget.pos())
@@ -4275,11 +4317,7 @@ class DataRootsEditorDialog(QDialog):
         
         current_path = self.table.item(row, 1).text()
         folder = QFileDialog.getExistingDirectory(self, "Select Root Directory", current_path)
-        
         if folder:
-            # --- THE MANDATORY SANITIZATION ---
-            # We force forward slashes here so the JSON string 
-            # is identical and valid on Mac, Windows, and Linux.
             clean_path = folder.replace('\\', '/')
             self.table.setItem(row, 1, QTableWidgetItem(clean_path))
 
@@ -4289,24 +4327,24 @@ class DataRootsEditorDialog(QDialog):
         if row >= 0:
             self.table.removeRow(row)
 
-    def browse_path(self, row):
-        current_path = self.table.item(row, 1).text()
-        folder = QFileDialog.getExistingDirectory(self, "Select Root Directory", current_path)
-        if folder:
-            self.table.setItem(row, 1, QTableWidgetItem(folder))
-
     def get_serialized_data(self):
-        """Returns a strict JSON-compliant list of lists."""
+        """Returns a robust list of dictionaries with order and state preserved."""
         data = []
         for r in range(self.table.rowCount()):
-            name = self.table.item(r, 0).text().strip()
-            # Final safety check: ensure no rogue backslashes enter the JSON string
+            name_item = self.table.item(r, 0)
+            
+            name = name_item.text().strip()
+            is_active = (name_item.checkState() == Qt.Checked)
             path = self.table.item(r, 1).text().strip().replace('\\', '/')
+            
             if name and path:
-                data.append([name, path])
-        
-        # This now produces [["root_1", "F:/jobs/rage"]] 
-        # instead of [["root_1", "F:\jobs\rage"]]
+                # Upgraded to Dictionary architecture
+                data.append({
+                    "name": name,
+                    "path": path,
+                    "active": is_active
+                })
+                
         return json.dumps(data)
 
 class SelectionModel(PandasModel):
@@ -4710,344 +4748,502 @@ class PathSwapper:
                     return os.path.normpath(new_path)
         
         return os.path.normpath(path)
+
+class RcloneCopyTask(QProcess):
+    # Signals: (current_file_index, speed, current_filename)
+    progress_update = Signal(int, str, str)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setProcessChannelMode(QProcess.MergedChannels)
+        self.files_finished_in_this_run = 0
+        self.readyRead.connect(self.parse_output)
+
+    def parse_output(self):
+        raw = self.readAllStandardOutput().data().decode()
+        
+        # Look for rclone's "Transferred: 12 / 100" line
+        count_match = re.search(r'Transferred:\s+(\d+)\s+/\s+(\d+)', raw)
+        speed_match = re.search(r'([\d\.]+\s[KMGT]B/s)', raw)
+        file_match = re.search(r'\*\s+(.*?):', raw)
+
+        if count_match:
+            self.files_finished_in_this_run = int(count_match.group(1))
+            
+        speed = speed_match.group(1) if speed_match else "Checking..."
+        filename = file_match.group(1) if file_match else "Syncing..."
+
+        # Emit the count so the AssetManager can add it to the Global Total
+        self.progress_update.emit(self.files_finished_in_this_run, speed, filename)
+
+    def run_copy(self, source_list, destination, source_base_root, force_overwrite=False):
+        import tempfile, os
+
+        # 1. THE CRLF FIX: newline='\n' stops Windows from corrupting the rclone path list
+        self.list_file = tempfile.NamedTemporaryFile(
+            delete=False, mode='w', suffix='.txt', encoding='utf-8', newline='\n'
+        )
+        
+        for p in source_list:
+            relative_p = os.path.relpath(p, source_base_root)
+            # Force forward slashes for the internal paths
+            relative_p = relative_p.replace('\\', '/') 
+            self.list_file.write(relative_p + "\n")
+        self.list_file.close()
+
+        # 2. PATH SANITIZATION
+        safe_list = self.list_file.name.replace('\\', '/')
+        safe_source = source_base_root.replace('\\', '/')
+        safe_dest = destination.replace('\\', '/')
+
+        # 3. CORE ARGUMENTS
+        args = [
+            "copy", safe_source, safe_dest, 
+            "--files-from", safe_list,
+            "--transfers", "16", 
+            "--checkers", "16", 
+            "--progress", 
+            "--stats", "1s",
+            
+            # --- SURGICAL INJECTION: EXFAT & TIMESTAMPS ---
+            "--metadata",           # Forces rclone to copy Creation Time (btime) and extended attributes
+            "--modify-window", "2s" # Compensates for exFAT's 2-second timestamp rounding limitation
+            # ----------------------------------------------
+        ]
+
+        # 4. SMART LOGIC
+        if not force_overwrite:
+            # We rely purely on size-only to beat the SMB timestamp drift. 
+            args.append("--size-only")
+        else:
+            args.append("--ignore-times")
+
+        self.start("rclone", args)
+
+class WarpHubDialog(QDialog):
+    def __init__(self, selected_items, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("🚀 GDrive Warp Copy Hub")
+        self.resize(900, 700)
+        
+        layout = QVBoxLayout(self)
+        
+        # --- GLOBAL ACTIONS (Top Bar) ---
+        global_lay = QHBoxLayout()
+        
+        # 1. The Solo View Toggles
+        global_lay.addWidget(QLabel("👁 <b>Solo View:</b>"))
+        
+        self.view_grp = QButtonGroup(self)
+        self.view_grp.setExclusive(True) # Ensures only one can be clicked at a time
+        
+        btn_all = QPushButton("Show All"); btn_all.setCheckable(True); btn_all.setChecked(True)
+        btn_anchors = QPushButton("Anchors"); btn_anchors.setCheckable(True)
+        btn_dest = QPushButton("Destinations"); btn_dest.setCheckable(True)
+        btn_opts = QPushButton("Options"); btn_opts.setCheckable(True)
+
+        # Add them to the logic group
+        self.view_grp.addButton(btn_all); self.view_grp.addButton(btn_anchors)
+        self.view_grp.addButton(btn_dest); self.view_grp.addButton(btn_opts)
+
+        # Style them like a sleek segmented control
+        toggle_style = """
+            QPushButton { background-color: #222; color: #888; border: 1px solid #444; padding: 5px 15px; border-radius: 4px; }
+            QPushButton:checked { background-color: #58cc71; color: black; font-weight: bold; border: 1px solid #58cc71; }
+            QPushButton:hover:!checked { background-color: #333; color: white; }
+        """
+        for btn in self.view_grp.buttons():
+            btn.setStyleSheet(toggle_style)
+            global_lay.addWidget(btn)
+
+        # Wire up the logic
+        btn_all.clicked.connect(lambda: self.apply_view_mode("all"))
+        btn_anchors.clicked.connect(lambda: self.apply_view_mode("anchor"))
+        btn_dest.clicked.connect(lambda: self.apply_view_mode("dest"))
+        btn_opts.clicked.connect(lambda: self.apply_view_mode("opts"))
+
+        global_lay.addStretch()
+
+        # 2. Match Destinations Button (Pushed to the far right)
+        btn_sync_dest = QPushButton("🎯 Match All Destinations to Top")
+        btn_sync_dest.setStyleSheet("background-color: #444; color: white; font-weight: bold; padding: 5px 15px; border-radius: 4px;")
+        btn_sync_dest.clicked.connect(self.sync_dests)
+        global_lay.addWidget(btn_sync_dest)
+        
+        layout.addLayout(global_lay)
+
+        # --- SCROLLABLE LIST ---
+        self.scroll = QScrollArea()
+        self.scroll.setWidgetResizable(True)
+        self.container = QWidget()
+        self.cards_layout = QVBoxLayout(self.container)
+        self.cards_layout.setAlignment(Qt.AlignTop)
+        
+        self.cards = []
+        for i, path in enumerate(selected_items):
+            card = WarpCard(path)
+            self.cards.append(card)
+            self.cards_layout.addWidget(card)
+            
+            # --- THE HUB MAGIC: Link only the first card ---
+            if i == 0:
+                card.enable_master_mode()
+                card.shift_requested.connect(self.sync_master_shift)
+                card.sync_force_requested.connect(self.sync_force_all)
+                # --- NEW: Wire up the toggle ---
+                card.sync_dir_toggled.connect(self.sync_master_realign)
+            
+        self.scroll.setWidget(self.container)
+        layout.addWidget(self.scroll)
+
+        # --- FOOTER ---
+        btns = QHBoxLayout()
+        self.btn_run = QPushButton("🚀 START BATCH WARP")
+        self.btn_run.setStyleSheet("background-color: #2e885a; color: white; font-weight: bold; padding: 12px;")
+        self.btn_run.clicked.connect(self.accept)
+        
+        btn_cancel = QPushButton("Cancel")
+        btn_cancel.clicked.connect(self.reject)
+        
+        btns.addStretch()
+        btns.addWidget(btn_cancel)
+        btns.addWidget(self.btn_run)
+        layout.addLayout(btns)
+
+    def apply_view_mode(self, mode):
+        """Broadcasts the solo mode down to every card."""
+        for card in self.cards:
+            card.set_view_mode(mode)
+
+    def sync_force_all(self, state):
+        """Forces all below cards to match the master card's Force setting."""
+        for card in self.cards[1:]:
+            card.chk_force.setChecked(state)
+
+    def sync_master_realign(self):
+        """Fired when the user clicks the 'Align' toggle. Forces all cards to snap to the new logic."""
+        master = self.cards[0]
+        if master.is_decoupled(): return
+        
+        if getattr(master, 'sync_direction', 'right') == 'left':
+            # Snap everyone to the exact same directory depth from the root
+            for c in self.cards[1:]:
+                c.apply_absolute_split(master.split_idx)
+        else:
+            # Snapping back to Right. Calculate how many steps from the end the master is, 
+            # and apply that same right-offset to all the below cards.
+            master_right_steps = len(master.path_parts) - master.split_idx
+            for c in self.cards[1:]:
+                c.apply_absolute_split(len(c.path_parts) - master_right_steps)
+
+    def sync_master_shift(self, delta):
+        """Receives a slider click from the Master card."""
+        master = self.cards[0]
+        if master.is_decoupled(): return
+        
+        if getattr(master, 'sync_direction', 'right') == 'left':
+            # LEFT MODE: All cards perfectly mirror the master's exact root depth
+            for card in self.cards[1:]:
+                card.apply_absolute_split(master.split_idx)
+        else:
+            # RIGHT MODE (Default): Standard relative shifting
+            for card in self.cards[1:]:
+                card.apply_relative_shift(delta)
+
+    def sync_dests(self):
+        if not self.cards: return
+        master_val = self.cards[0].edit_dest.text()
+        for card in self.cards:
+            card.edit_dest.setText(master_val)
+
+    def get_mappings(self):
+        return [
+            {
+                'path': c.full_path, 
+                'anchor': c.edit_anchor.text(), 
+                'dest': c.edit_dest.text(),
+                'force': c.is_force_enabled() # <--- NEW FLAG
+            } for c in self.cards
+        ]
     
-class ConfigEngine:
-    def __init__(self, root_path, bootstrap=False, use_pointers=False, template_name="_pipe_config_default"):
-        self.root = os.path.abspath(os.path.normpath(root_path))
-        self.project_root = os.path.dirname(os.path.normpath(self.root))
+class WarpCard(QFrame):
+    shift_requested = Signal(int)
+    sync_force_requested = Signal(bool)
+    sync_dir_toggled = Signal()
+
+    def __init__(self, full_path, parent=None):
+        super().__init__(parent)
+        self.full_path = os.path.normpath(full_path)
+        self.setFrameShape(QFrame.StyledPanel)
+        self.setStyleSheet("WarpCard { background-color: #333; border-radius: 5px; margin: 2px; }")
+
+        self.path_parts = list(Path(self.full_path).parts)
+        self.split_idx = len(self.path_parts) - 1 
+
+        main_layout = QVBoxLayout(self)
+        main_layout.setSpacing(0) # Tighten up for collapsing
         
-        # --- THE TEMPLATE ROUTER ---
-        manager_dir = os.path.normpath(os.path.join(os.path.expanduser("~"), ".simplepipemanager"))
-        target_template_dir = os.path.join(manager_dir, "_pipe_config_templates", template_name)
+        # 0. TITLE ROW (Always visible so they know what file it is)
+        self.header_lay = QHBoxLayout()
+        self.header_lay.setContentsMargins(0, 0, 0, 5)
+        self.lbl_name = QLabel(f"📦 <b>{os.path.basename(full_path)}</b>")
+        self.lbl_name.setStyleSheet("color: #61afef; font-size: 13px;") 
+        self.header_lay.addWidget(self.lbl_name)
+        self.header_lay.addStretch()
+        main_layout.addLayout(self.header_lay)
+
+        # --- 1. ANCHOR WRAPPER ---
+        self.w_anchor = QWidget()
+        anchor_v_lay = QVBoxLayout(self.w_anchor)
+        anchor_v_lay.setContentsMargins(0, 0, 0, 5)
         
-        # The Fallback Safety Net
-        if not os.path.exists(target_template_dir):
-            target_template_dir = os.path.join(manager_dir, "_pipe_config_templates", "_pipe_config_default")
-            
-        self.local_dot_dir = os.path.join(manager_dir, "_pipe_config")
-        self.apps_dir = os.path.join(self.root, "Media_Actions")
+        self.anchor_ctrl_lay = QHBoxLayout()
+        self.anchor_ctrl_lay.addStretch()
+        self.anchor_ctrl_lay.addWidget(QLabel("Move Split:"))
         
-        if bootstrap or not os.path.exists(self.apps_dir):
-            self.bootstrap_template(use_pointers=use_pointers)
-            
-        self.pathsubs = self._load_flat_csv("Path_Subs.csv")
-        # Global Injection
-        PathSwapper.PATHSUBS = self.pathsubs
-
-        # Load and SWAP settings immediately
-        raw = self._load_kv_csv("Project_Settings.csv")
-        self.settings = {}
-        for k, v in raw.items():
-            if k == 'data_root':
-                # CRITICAL: Bypass PathSwapper here so Windows normpath doesn't
-                # flip forward slashes to backslashes and break the JSON parser.
-                self.settings[k] = str(v)
-            elif "/" in str(v) or "\\" in str(v):
-                self.settings[k] = PathSwapper.translate(str(v))
-            else:
-                self.settings[k] = v
-
-        # --- THE MULTI-ROOT INTERCEPTOR ---
-        if 'data_root' in self.settings:
-            raw_dr = str(self.settings['data_root']).strip()
-            
-            # 1. Store the untouched payload for future multi-root scrapers
-            self.settings['data_root_raw'] = raw_dr 
-
-            # 2. Try to extract the first tuple's path for primary pipeline write actions
-            try:
-                import json
-                dr_list = json.loads(raw_dr)
-                
-                if isinstance(dr_list, list) and len(dr_list) > 0:
-                    first_item = dr_list[0]
-                    # We expect format: [["name", "/path"], ["name2", "/path2"]]
-                    if isinstance(first_item, (list, tuple)) and len(first_item) >= 2:
-                        # NOW we translate the cleanly extracted path!
-                        self.settings['data_root'] = PathSwapper.translate(str(first_item[1]))
-            except Exception:
-                # It's a legacy flat string (e.g. "/Volumes/jobs"). 
-                # Translate it now since we skipped it in the initial loop.
-                self.settings['data_root'] = PathSwapper.translate(raw_dr)
-                
-        self.apps = self._discover_apps()
-        # Load Naming Templates
-        self.naming_templates = self._load_kv_csv("Naming_Templates.csv")
-
-    def _resolve_pointer(self, key, value, filename):
-        """Resolves outward pointers by querying the exact same schema at the target boundary."""
-        if str(value).strip().upper() == "{LOCALDOTDIR}":
-            target_file = os.path.join(self.local_dot_dir, filename)
-            
-            if os.path.exists(target_file):
-                try:
-                    df = pd.read_csv(target_file, encoding='cp1252', dtype=str).fillna("")
-                    match = df[df['Key'] == key]
-                    if not match.empty:
-                        return str(match.iloc[0]['Value'])
-                except Exception as e:
-                    print(f"Pointer resolution error for {key} in {filename}: {e}")
-            
-            # Failure-centric: If the global file/key is missing, return empty string
-            return "" 
-            
-        # Not a pointer, return the local value untouched
-        return value
+        self.btn_left = QPushButton("◀")
+        self.btn_left.setFixedWidth(28)
+        self.btn_left.setStyleSheet("background-color: #444; color: white; border-radius: 3px;")
+        self.btn_left.clicked.connect(self.shift_left)
         
-    def _load_kv_csv(self, filename):
-        path = os.path.join(self.root, filename)
-        if not os.path.exists(path): return {}
-        try:
-            # ADDED: dtype=str to keep padding in settings
-            df = pd.read_csv(path, encoding='cp1252', dtype=str).fillna("")
-            raw_dict = dict(zip(df['Key'], df['Value']))
-            
-            # --- THE MAGIC: Resolve the pointers before returning ---
-            return {k: self._resolve_pointer(k, v, filename) for k, v in raw_dict.items()}
-            
-        except Exception as e:
-            print(f"Error loading {filename}: {e}")
-            return {}
-
-    def _load_flat_csv(self, filename):
-        path = os.path.join(self.root, filename)
-        if not os.path.exists(path): return []
-        try: 
-            df = pd.read_csv(path, encoding='cp1252', dtype=str).fillna("")
-            
-            # --- CRITICAL: Capture the headers for the PathSwapper ---
-            if filename == "Path_Subs.csv":
-                PathSwapper.HEADERS = df.columns.tolist()
-                
-            return df.values.tolist()
-        except: 
-            return []
-
-    def _discover_apps(self):
-        """Discovers apps by folder name and loads the OS-specific CSV."""
-        apps = {}
-        if not os.path.exists(self.apps_dir): return {}
+        self.btn_right = QPushButton("▶")
+        self.btn_right.setFixedWidth(28)
+        self.btn_right.setStyleSheet("background-color: #444; color: white; border-radius: 3px;")
+        self.btn_right.clicked.connect(self.shift_right)
         
-        # Determine our current OS label for the sub-folder search
-        plat_folder = "win" if sys.platform == "win32" else "mac" if sys.platform == "darwin" else "linux"
+        self.anchor_ctrl_lay.addWidget(self.btn_left)
+        self.anchor_ctrl_lay.addWidget(self.btn_right)
+        anchor_v_lay.addLayout(self.anchor_ctrl_lay)
+
+        self.split_lay = QHBoxLayout()
+        self.split_lay.setSpacing(2)
         
-        # Look at each directory in Media_Actions (e.g., /Nuke, /RV)
-        for app_name in os.listdir(self.apps_dir):
-            app_path = os.path.join(self.apps_dir, app_name)
-            if os.path.isdir(app_path):
-                # Look for the specific OS csv inside that folder
-                os_csv = os.path.join(app_path, f"{plat_folder}.csv")
-                if os.path.exists(os_csv):
-                    # Load the Key/Value pairs for this specific OS
-                    apps[app_name] = self._load_kv_csv_multi(os_csv)
-        return apps
-
-    def _load_kv_csv_multi(self, path):
-        """Modified loader to allow multiple rows with the same Key (for 'env')."""
-        data = defaultdict(list)
+        self.edit_anchor = QLineEdit()
+        self.edit_anchor.setReadOnly(True)
+        self.edit_anchor.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self.edit_anchor.setStyleSheet("QLineEdit { color: #61afef; background-color: #1e2a35; border: 1px dashed #3b749e; border-radius: 3px; padding: 2px; }")
         
-        # Determine the relative filename so the resolver knows where to look globally
-        try:
-            rel_filename = os.path.relpath(path, self.root).replace('\\', '/')
-        except ValueError:
-            rel_filename = os.path.basename(path) # Fallback if paths cross drives on Windows
+        self.edit_relative = QLineEdit()
+        self.edit_relative.setReadOnly(True)
+        self.edit_relative.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        self.edit_relative.setStyleSheet("QLineEdit { color: #61afef; background-color: #1e2a35; border: 2px solid #3b949e; border-radius: 3px; padding: 2px; }")
 
-        try:
-            df = pd.read_csv(path, encoding='cp1252', dtype=str).fillna("")
-            for _, row in df.iterrows():
-                key = str(row['Key'])
-                raw_val = str(row['Value'])
-                
-                # --- THE MAGIC: Resolve the pointer for each row ---
-                resolved_val = self._resolve_pointer(key, raw_val, rel_filename)
-                
-                data[key].append(resolved_val)
-            return dict(data)
-        except Exception as e:
-            print(f"Error loading {path}: {e}")
-            return {}
+        self.split_lay.addWidget(self.edit_anchor)
+        self.split_lay.addWidget(self.edit_relative)
+        anchor_v_lay.addLayout(self.split_lay)
+        main_layout.addWidget(self.w_anchor)
 
-    def get_catalog_path(self, catalog_name):
-        """Resolves a catalog key to a physical CSV path in the data root."""
-        # 1. Grab the catalog_dir (the parent of catalogs) from settings
-        c_dir = PathSwapper.translate(str(self.settings.get('catalog_dir', '')))
+        # --- 2. DESTINATION WRAPPER ---
+        self.w_dest = QWidget()
+        dest_lay = QHBoxLayout(self.w_dest)
+        dest_lay.setContentsMargins(0, 0, 0, 5)
+        dest_lay.addWidget(QLabel("Destination: "))
+        self.edit_dest = QLineEdit()
+        btn_browse_dest = QPushButton("Browse...")
+        btn_browse_dest.clicked.connect(self.browse_dest)
+        dest_lay.addWidget(self.edit_dest)
+        dest_lay.addWidget(btn_browse_dest)
+        main_layout.addWidget(self.w_dest)
+
+        # --- 3. OPTIONS WRAPPER ---
+        self.w_opts = QWidget()
+        self.opts_lay = QHBoxLayout(self.w_opts)
+        self.opts_lay.setContentsMargins(0, 0, 0, 0)
+        self.chk_force = QCheckBox("Force Overwrite (Ignore Size-Match)")
+        self.chk_force.setStyleSheet("color: #aaa; font-size: 11px;")
+        self.opts_lay.addWidget(self.chk_force)
+        self.opts_lay.addStretch()
+        main_layout.addWidget(self.w_opts)
+
+        self.update_split_display()
+
+    def set_view_mode(self, mode):
+        """Hides/Shows sections of the card based on the active Solo filter."""
+        self.w_anchor.setVisible(mode in ("all", "anchor"))
+        self.w_dest.setVisible(mode in ("all", "dest"))
+        self.w_opts.setVisible(mode in ("all", "opts"))
+
+    def enable_master_mode(self):
+        """Called by the Hub only on the very first card."""
+        self.chk_decouple = QCheckBox("Decouple Anchors")
+        self.chk_decouple.setToolTip("Don't sync slider movements to below cards")
+        self.chk_decouple.setStyleSheet("color: #e5c07b; font-weight: bold;")
+        self.anchor_ctrl_lay.insertWidget(0, self.chk_decouple)
         
-        # 2. Point to the 'catalogs' subfolder within that data root
-        full_path = os.path.join(c_dir, "catalogs", f"{catalog_name}.csv")
-        return os.path.normpath(full_path)
-    
-    def bootstrap_template(self, target_dir=None, mode='create', use_pointers=False):
-        if target_dir is None:
-            target_dir = self.root
-
-        # --- THE HELPER THAT DOES THE WORK ---
-        def ptr(default_val, force_local=False):
-            if use_pointers and not force_local:
-                return "{LOCALDOTDIR}" # This physically writes the string to the CSV!
-            return default_val
-
-        def write(filename, rows):
-            path = os.path.join(target_dir, filename)
-            os.makedirs(os.path.dirname(path), exist_ok=True)
-            
-            if mode == 'create' or not os.path.exists(path):
-                self.write_csv(path, rows)
-                return
-
-            # --- MODE: SYNC (The Additive Logic) ---
-            if mode == 'sync' and os.path.exists(path):
-                try:
-                    existing_df = pd.read_csv(path, dtype=str).fillna("")
-                    incoming_df = pd.DataFrame(rows[1:], columns=rows[0]).astype(str)
-                    key_col = rows[0][0]
-                    existing_keys = set(existing_df[key_col].tolist())
-                    missing_rows = incoming_df[~incoming_df[key_col].isin(existing_keys)]
-                    
-                    if not missing_rows.empty:
-                        updated_df = pd.concat([existing_df, missing_rows], ignore_index=True)
-                        updated_df.to_csv(path, index=False)
-                except Exception as e:
-                    print(f"Failed to sync {filename}: {e}")
-
-        # Project Settings
-        write("Project_Settings.csv", [
-            ["Key", "Value"],
-            # data_root is specific to every project, so we force it to remain local (empty)
-            ["data_root", ptr("", force_local=True)],
-            # catalog_dir physically lives in the local project, so force local
-            ["catalog_dir", ptr(self.project_root.replace('\\', '/'), force_local=True)], 
-            
-            # --- THE UPDATE: Absolute path to the generated Shots_Template.csv ---
-            ["shots_csv", ptr(os.path.join(target_dir, "Shots_Template.csv").replace('\\', '/'), force_local=True)],
-            
-            ["dual_name", ptr("False")],
-            ["submission_types", ptr("WIP, Final Pending QC, Final QC Approved")],
-            ["status_options", ptr("Ready for Review, Needs Update, Approved, RTS, Pending")],
-            ["submission_csv_headers", ptr("LOCALPATH,SHOTNAME,FILENAME,FIRST,LAST,SUBNOTES,SUBTYPE")],
-            ["submission_review_headers", ptr("LOCALPATH,SHOTNAME,FILENAME,FIRST,LAST,SUBTYPE,SUBNOTES")],
-            ["playlist_review_headers", ptr("LOCALPATH,SHOTNAME,FILENAME,FIRST,LAST,SUBNOTES")],
-            ["scrape_blacklist", ptr(".trash, .snapshot, _thumbs")],
-            ["padding_default", ptr("4")],
-            ["padding_scans", ptr("4")],
-            ["padding_renders", ptr("4")]
-        ])
+        # --- NEW: The Alignment Toggle ---
+        self.sync_direction = "right"
+        self.btn_sync_dir = QPushButton("⮂ Align: Right")
+        self.btn_sync_dir.setToolTip("Toggle how below cards match (Relative from file vs Absolute from root)")
+        self.btn_sync_dir.setStyleSheet("QPushButton { background-color: #444; color: #aaa; border-radius: 3px; padding: 2px 10px; }")
+        self.btn_sync_dir.clicked.connect(self.toggle_sync_dir)
+        self.anchor_ctrl_lay.insertWidget(1, self.btn_sync_dir)
         
-        # --- NEW: Project Actions (Nuke Folder-Based Structure) ---
-        nuke_root = "Project_Actions/Nuke"
+        self.anchor_ctrl_lay.insertStretch(2) # Keeps buttons formatted nicely
+
+        self.btn_apply_force = QPushButton("⮟ Apply to All")
+        self.btn_apply_force.setStyleSheet("QPushButton { background-color: #2e5a88; color: white; border-radius: 3px; padding: 2px 10px; font-weight: bold; } QPushButton:hover { background-color: #3b76b3; }")
+        self.btn_apply_force.clicked.connect(lambda: self.sync_force_requested.emit(self.chk_force.isChecked()))
+        self.opts_lay.insertWidget(1, self.btn_apply_force)
+
+    def toggle_sync_dir(self):
+        """Swaps the index from end-based to root-based and updates the UI."""
+        if self.sync_direction == "right":
+            self.sync_direction = "left"
+            self.btn_sync_dir.setText("⮂ Align: Left")
+            self.btn_sync_dir.setStyleSheet("QPushButton { background-color: #2e885a; color: white; border-radius: 3px; padding: 2px 10px; font-weight: bold; }")
+        else:
+            self.sync_direction = "right"
+            self.btn_sync_dir.setText("⮂ Align: Right")
+            self.btn_sync_dir.setStyleSheet("QPushButton { background-color: #444; color: #aaa; border-radius: 3px; padding: 2px 10px; }")
         
-        # 1. THE MASTER INDEX (Just IDs now - Flat Tabular, no ptr)
-        write(f"{nuke_root}/nuke_templates.csv", [
-            ["Template_ID"],
-            ["read_write_setup"]
-        ])
-
-        # 2. THE SPECIFIC TEMPLATE SUBDIRECTORY
-        rw_dir = f"{nuke_root}/read_write_setup"
+        # Mathematically swap the position (e.g., 1 step from right becomes 1 step from left)
+        self.split_idx = len(self.path_parts) - self.split_idx
+        self.update_split_display()
         
-        # 3. THE CONFIG CSV (Paths - Key/Value, gets ptr)
-        write(f"{rw_dir}/config.csv", [
-            ["Key", "Value"],
-            ["Source_NK", ptr("")],
-            ["Output_Template_path", ptr("{data_root}/{SEQUENCE}/{SHOTNAME}/nuke/{SHOTNAME}")],
-            ["Output_Template_file", ptr("{SHOTNAME}_comp_v001.nk")],
-            ["nuke_comp_render_path", ptr("{data_root}/comp/{ALTSHOTNAME}/{ALTSHOTNAME}_comp_v001")],
-            ["nuke_comp_render_filename", ptr("{ALTSHOTNAME}_comp_v001.{padding_default}.exr")]
-        ])
+        # Tell the Hub to realign everyone below us!
+        self.sync_dir_toggled.emit()
 
-        # 4. THE MAPPING CSV (Variables - Flat Tabular, no ptr)
-        write(f"{rw_dir}/mapping.csv", [
-            ["Variable", "Source_Type", "Lookup_Key"],
-            ["FIRSTFRAME", "HEADER", "FIRSTFRAME"],
-            ["LASTFRAME", "HEADER", "LASTFRAME"]
-        ])
+    def apply_absolute_split(self, target_idx):
+        """Forces the slider to an exact directory depth from the root."""
+        self.split_idx = target_idx
+        self.update_split_display()
 
-        # Path Subs (Flat Tabular, no ptr)
-        write("Path_Subs.csv", [
-            ["Mac_Root", "Win_Root", "Linux_Root", "cloud"],
-            ["/Volumes/jobs", "J:", "/mnt/jobs", "{aws_config}"]
-        ])
+    def is_decoupled(self):
+        return hasattr(self, 'chk_decouple') and self.chk_decouple.isChecked()
 
-        # Naming Templates (Key/Value, gets ptr)
-        write("Naming_Templates.csv", [
-            ["Key", "Value"],
-            ["scan_name_template", ptr("SHOTNAME_plate_vHEROPLATE")]
-        ])
+    def apply_relative_shift(self, delta):
+        """Called externally by the Hub to force a relative step."""
+        self.split_idx += delta
+        self.update_split_display()
 
-        # NOTES CONFIG (Scoped) --- (Key/Type/Value, Value gets ptr)
-        write("Notes_Config.csv", [
-            ["Key", "Key_Type", "Value"],
-            # Global Logic
-            ["substitute_unresolved_vars", "main", ptr("True")],
-            ["unresolved_vars_default_string", "main", ptr("default")],
-            
-            # Roots (The Starting Points)
-            ["default", "root", ptr("{data_root}")],
-            ["client", "root", ptr("{s3_PROJECT_CLIENTNAME_config}")],
-            
-            # Trees (The Directory Structures)
-            ["default", "tree", ptr("notes/{SHOTNAME}")],
-            ["sequence_shot_task_user", "tree", ptr("{SEQUENCE}/{SHOTNAME}/{TASK}/{USER}")],
-            ["client", "tree", ptr("prod/client/.notes/{SEQUENCE}/{SHOTNAME}/{TASK}/{USER}")],
-            
-            # Names (The File Conventions)
-            ["default", "name", ptr("note_{TIMESTAMP}")],
-            ["client", "name", ptr("note_CLIENTNAME_{TIMESTAMP}")]
-        ])
+    # --- SLIDER LOGIC ---
+    def update_split_display(self):
+        # Clamping logic
+        if self.split_idx < 1: self.split_idx = 1
+        if self.split_idx > len(self.path_parts) - 1: self.split_idx = len(self.path_parts) - 1
+        
+        left_path = str(Path(*self.path_parts[:self.split_idx]))
+        right_path = os.path.join(*self.path_parts[self.split_idx:])
+        
+        self.edit_anchor.setText(left_path)
+        self.edit_relative.setText(right_path)
+        
+        len_left = max(len(left_path), 1)
+        len_right = max(len(right_path), 1)
+        self.split_lay.setStretch(0, len_left)
+        self.split_lay.setStretch(1, len_right)
+        
+        self.edit_anchor.setCursorPosition(len(left_path))
+        self.edit_relative.setCursorPosition(0)
+        
+        self.btn_left.setEnabled(self.split_idx > 1)
+        self.btn_right.setEnabled(self.split_idx < len(self.path_parts) - 1)
 
-        # Shots Template (Flat Tabular, no ptr)
-        write("Shots_Template.csv", [
-            ["SEQUENCE", "PROCESS", "SHOTNAME", "ALTSHOTNAME", "FIRSTFRAME", "LASTFRAME", "HEROPLATE"],
-            ["abc_001", "0", "job_001_abc_0010", "abc_001_0010", "1001", "1100", "001"]
-        ])
+    def shift_left(self):
+        self.split_idx -= 1
+        self.update_split_display()
+        self.shift_requested.emit(-1) # Broadcast the step!
 
-        # Nuke Nested Configs (Key/Value, gets ptr)
-        nuke_base = "Media_Actions/Nuke"
-        write(f"{nuke_base}/win.csv", [
-            ["Key", "Value"],
-            ["bin", ptr("G:/Program Files/Nuke16.0v6/Nuke16.0.exe")],
-            ["flags", ptr("--nukex, -m 18")]
-            #["env", ptr("OCIO=Z:/config/aces_1.2/config.ocio")],
-            #["env", ptr("NUKE_PATH=Z:/pipeline/nuke")]
-        ])
-        write(f"{nuke_base}/mac.csv", [
-            ["Key", "Value"],
-            ["bin", ptr("/Applications/Nuke16.0v6/Nuke16.0v6.app/Contents/MacOS/Nuke16.0")],
-            ["flags", ptr("--nukex")]
-            # ["env", ptr("OCIO=/Volumes/jobs/config/aces_1.2/config.ocio")]
-        ])
-        write(f"{nuke_base}/linux.csv", [
-            ["Key", "Value"],
-            ["bin", ptr("/opt/Nuke16.0v6/Nuke16.0")],
-            ["flags", ptr("--nukex")]
-        ])
+    def shift_right(self):
+        self.split_idx += 1
+        self.update_split_display()
+        self.shift_requested.emit(1)  # Broadcast the step!
 
-        # RV Nested Configs (Key/Value, gets ptr)
-        rv_base = "Media_Actions/RV"
-        write(f"{rv_base}/win.csv", [
-            ["Key", "Value"],
-            ["bin", ptr("C:/Program Files/OpenRV-win/bin/rv.exe")],
-            ["flags", ptr("")]
-        ])
-        write(f"{rv_base}/mac.csv", [
-            ["Key", "Value"],
-            ["bin", ptr("/Applications/RV.app/Contents/MacOS/RV")],
-            ["flags", ptr("")],
-            ["env", ptr("/Users/uel/Dasein/daseinVfxPipe/aces_1.2/config.ocio")]
-        ])
-        write(f"{rv_base}/linux.csv", [
-            ["Key", "Value"],
-            ["bin", ptr("/opt/RV/bin/rv")],
-            ["flags", ptr("")],
-            ["env", ptr("/Users/uel/Dasein/daseinVfxPipe/aces_1.2/config.ocio")]
-        ])
+    def is_force_enabled(self):
+        return self.chk_force.isChecked()
 
-    def write_csv(self, path, rows):
-        """Standard helper to actually touch the disk."""
-        import csv
-        with open(path, 'w', newline='', encoding='utf-8') as f:
-            writer = csv.writer(f)
-            writer.writerows(rows)
+    def browse_dest(self):
+        path = QFileDialog.getExistingDirectory(self, "Select Destination", self.edit_dest.text())
+        if path: self.edit_dest.setText(os.path.normpath(path))
 
+class WarpProgressHUD(QFrame):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedSize(450, 150)
+        self.setWindowFlags(Qt.SubWindow) # Keeps it on top of the parent
+        
+        # Sleek dark HUD styling
+        self.setStyleSheet("""
+            WarpProgressHUD {
+                background-color: rgba(30, 30, 30, 230);
+                border: 2px solid #58cc71;
+                border-radius: 10px;
+            }
+            QLabel { color: white; font-family: 'Segoe UI', sans-serif; }
+        """)
+
+        layout = QVBoxLayout(self)
+        
+        self.lbl_title = QLabel("🚀 <b>GDrive Warp Transfer</b>")
+        self.lbl_title.setStyleSheet("font-size: 16px; color: #58cc71;")
+        self.lbl_title.setAlignment(Qt.AlignCenter)
+        
+        self.bar = QProgressBar()
+        self.bar.setStyleSheet("""
+            QProgressBar { border: 1px solid #555; border-radius: 5px; text-align: center; height: 20px; }
+            QProgressBar::chunk { background-color: #58cc71; }
+        """)
+        
+        self.lbl_speed = QLabel("Calculating speed...")
+        self.lbl_speed.setAlignment(Qt.AlignCenter)
+        
+        self.lbl_file = QLabel("Initializing...")
+        self.lbl_file.setStyleSheet("color: #aaa; font-size: 11px;")
+        self.lbl_file.setAlignment(Qt.AlignCenter)
+        self.lbl_file.setWordWrap(True)
+
+        layout.addWidget(self.lbl_title)
+        layout.addWidget(self.bar)
+        layout.addWidget(self.lbl_speed)
+        layout.addWidget(self.lbl_file)
+
+        self.lbl_batch = QLabel("Task 1 of 1")
+        self.lbl_batch.setStyleSheet("color: #888; font-size: 10px;")
+        self.lbl_batch.setAlignment(Qt.AlignRight)
+        
+        # Add it to your layout (perhaps at the very bottom or top-right)
+        self.layout().addWidget(self.lbl_batch)
+
+        self.btn_done = QPushButton("Close")
+        self.btn_done.hide()
+        self.btn_done.clicked.connect(self.hide)
+        self.btn_done.setStyleSheet("background-color: #2e885a; color: white; font-weight: bold;")
+        self.layout().addWidget(self.btn_done)
+
+    def show_summary(self, total_files, selected_item_count, dest_list):
+        """Transforms the HUD into an honest completion report."""
+        self.bar.hide()
+        self.lbl_speed.hide()
+        self.lbl_title.setText("✅ <b>Warp Complete</b>")
+        self.lbl_title.setStyleSheet("font-size: 16px; color: #58cc71;")
+        
+        unique_dests = list(set(dest_list))
+        if not unique_dests:
+            dest_str = ""
+        elif len(unique_dests) == 1:
+            dest_str = f"To: {unique_dests[0]}"
+        else:
+            dest_str = f"Across {len(unique_dests)} distinct destinations"
+        
+        # Now it tells you exactly what you selected vs what it actually moved
+        summary = (f"Processed <b>{selected_item_count}</b> selected items<br>"
+                   f"(<i>{total_files} individual files on disk</i>)<br><br>"
+                   f"<span style='color: #888;'>{dest_str}</span>")
+        
+        self.lbl_file.setText(summary)
+        self.btn_done.show()
+
+    def update_batch_status(self, current, total):
+        """Updates the batch counter label."""
+        self.lbl_batch.setText(f"Batch {current} of {total}")
+        # Force a repaint to ensure the UI doesn't lag behind the logic
+        self.lbl_batch.repaint()
+
+    def update_data(self, pct, speed, current_file):
+        self.bar.setValue(int(pct))
+        self.lbl_speed.setText(f"⚡ {speed}")
+        self.lbl_file.setText(f"Active: {current_file}")
+        
 class ProjectLauncherDialog(QDialog):
     def __init__(self):
         super().__init__()
@@ -5824,7 +6020,7 @@ class Scraper(QObject):
             final_rows = []
             
             for root, dirs, files in os.walk(current_root_dir):
-                # Blacklist pruning
+                # Blacklist pruning for DIRECTORIES (Exact match)
                 for d in list(dirs):
                     if d.lower() in clean_blacklist:
                         dirs.remove(d)
@@ -5836,6 +6032,12 @@ class Scraper(QObject):
                 local_p = self.get_local_path(root, current_root_dir)
                 
                 for f in files:
+                    # --- SURGICAL INJECTION: FILE BLACKLIST GUARD ---
+                    # Check if the filename starts with or matches any blacklist term
+                    if any(f.lower().startswith(b) for b in clean_blacklist):
+                        continue
+                    # ------------------------------------------------
+
                     ext = os.path.splitext(f)[1].lower()
                     full_path = os.path.join(root, f)
                     
@@ -5917,7 +6119,10 @@ class UpdateScrapeDialog(QDialog):
                 parsed_dr = json.loads(raw_dr)
                 if isinstance(parsed_dr, list):
                     for item in parsed_dr:
-                        if isinstance(item, list) and len(item) >= 2:
+                        # Support both new dict format and legacy list format
+                        if isinstance(item, dict) and 'name' in item and 'path' in item:
+                            self.roots_list.append((str(item['name']), str(item['path'])))
+                        elif isinstance(item, list) and len(item) >= 2:
                             self.roots_list.append((str(item[0]), str(item[1])))
             except:
                 # Legacy flat string fallback
@@ -5962,7 +6167,6 @@ class UpdateScrapeDialog(QDialog):
         # --- NEW: PRE-FLIGHT ACCESSIBILITY CHECK ---
         missing_roots = []
         for name, r_path in self.roots_list:
-            print("R_PATH: ", r_path)
             if not os.path.exists(r_path):
                 missing_roots.append(f"{name}: {r_path}")
 
@@ -6009,6 +6213,341 @@ class UpdateScrapeDialog(QDialog):
             event.ignore() 
         else:
             event.accept()
+    
+class ConfigEngine:
+    def __init__(self, root_path, bootstrap=False, use_pointers=False, template_name="_pipe_config_default"):
+        self.root = os.path.abspath(os.path.normpath(root_path))
+        self.project_root = os.path.dirname(os.path.normpath(self.root))
+        
+        # --- THE TEMPLATE ROUTER ---
+        manager_dir = os.path.normpath(os.path.join(os.path.expanduser("~"), ".simplepipemanager"))
+        target_template_dir = os.path.join(manager_dir, "_pipe_config_templates", template_name)
+        
+        # The Fallback Safety Net
+        if not os.path.exists(target_template_dir):
+            target_template_dir = os.path.join(manager_dir, "_pipe_config_templates", "_pipe_config_default")
+            
+        self.local_dot_dir = os.path.join(manager_dir, "_pipe_config")
+        self.apps_dir = os.path.join(self.root, "Media_Actions")
+        
+        if bootstrap or not os.path.exists(self.apps_dir):
+            self.bootstrap_template(use_pointers=use_pointers)
+            
+        self.pathsubs = self._load_flat_csv("Path_Subs.csv")
+        # Global Injection
+        PathSwapper.PATHSUBS = self.pathsubs
+
+        # Load and SWAP settings immediately
+        raw = self._load_kv_csv("Project_Settings.csv")
+        self.settings = {}
+        for k, v in raw.items():
+            if k == 'data_root':
+                # CRITICAL: Bypass PathSwapper here so Windows normpath doesn't
+                # flip forward slashes to backslashes and break the JSON parser.
+                self.settings[k] = str(v)
+            elif "/" in str(v) or "\\" in str(v):
+                self.settings[k] = PathSwapper.translate(str(v))
+            else:
+                self.settings[k] = v
+
+        # --- THE MULTI-ROOT INTERCEPTOR ---
+        # SURGICAL FIX: Prioritize data_root_raw to prevent the single-path string from overwriting the JSON!
+        raw_dr = str(self.settings.get('data_root_raw', self.settings.get('data_root', ''))).strip()
+        
+        if raw_dr:
+            self.settings['data_root_raw'] = raw_dr 
+
+            # Try to extract the first root's path for primary pipeline write actions
+            try:
+                import json
+                dr_list = json.loads(raw_dr)
+                if isinstance(dr_list, list) and len(dr_list) > 0:
+                    first_item = dr_list[0]
+                    if isinstance(first_item, dict):
+                        self.settings['data_root'] = PathSwapper.translate(str(first_item.get('path', '')))
+                    elif isinstance(first_item, (list, tuple)) and len(first_item) >= 2:
+                        self.settings['data_root'] = PathSwapper.translate(str(first_item[1]))
+            except Exception:
+                # It's a legacy flat string
+                self.settings['data_root'] = PathSwapper.translate(raw_dr)
+                
+        self.apps = self._discover_apps()
+        # Load Naming Templates
+        self.naming_templates = self._load_kv_csv("Naming_Templates.csv")
+
+    def _resolve_pointer(self, key, value, filename):
+        """Resolves outward pointers by querying the exact same schema at the target boundary."""
+        if str(value).strip().upper() == "{LOCALDOTDIR}":
+            target_file = os.path.join(self.local_dot_dir, filename)
+            
+            if os.path.exists(target_file):
+                try:
+                    df = pd.read_csv(target_file, encoding='cp1252', dtype=str).fillna("")
+                    match = df[df['Key'] == key]
+                    if not match.empty:
+                        return str(match.iloc[0]['Value'])
+                except Exception as e:
+                    print(f"Pointer resolution error for {key} in {filename}: {e}")
+            
+            # Failure-centric: If the global file/key is missing, return empty string
+            return "" 
+            
+        # Not a pointer, return the local value untouched
+        return value
+        
+    def _load_kv_csv(self, filename):
+        path = os.path.join(self.root, filename)
+        if not os.path.exists(path): return {}
+        try:
+            # ADDED: dtype=str to keep padding in settings
+            df = pd.read_csv(path, encoding='cp1252', dtype=str).fillna("")
+            raw_dict = dict(zip(df['Key'], df['Value']))
+            
+            # --- THE MAGIC: Resolve the pointers before returning ---
+            return {k: self._resolve_pointer(k, v, filename) for k, v in raw_dict.items()}
+            
+        except Exception as e:
+            print(f"Error loading {filename}: {e}")
+            return {}
+
+    def _load_flat_csv(self, filename):
+        path = os.path.join(self.root, filename)
+        if not os.path.exists(path): return []
+        try: 
+            df = pd.read_csv(path, encoding='cp1252', dtype=str).fillna("")
+            
+            # --- CRITICAL: Capture the headers for the PathSwapper ---
+            if filename == "Path_Subs.csv":
+                PathSwapper.HEADERS = df.columns.tolist()
+                
+            return df.values.tolist()
+        except: 
+            return []
+
+    def _discover_apps(self):
+        """Discovers apps by folder name and loads the OS-specific CSV."""
+        apps = {}
+        if not os.path.exists(self.apps_dir): return {}
+        
+        # Determine our current OS label for the sub-folder search
+        plat_folder = "win" if sys.platform == "win32" else "mac" if sys.platform == "darwin" else "linux"
+        
+        # Look at each directory in Media_Actions (e.g., /Nuke, /RV)
+        for app_name in os.listdir(self.apps_dir):
+            app_path = os.path.join(self.apps_dir, app_name)
+            if os.path.isdir(app_path):
+                # Look for the specific OS csv inside that folder
+                os_csv = os.path.join(app_path, f"{plat_folder}.csv")
+                if os.path.exists(os_csv):
+                    # Load the Key/Value pairs for this specific OS
+                    apps[app_name] = self._load_kv_csv_multi(os_csv)
+        return apps
+
+    def _load_kv_csv_multi(self, path):
+        """Modified loader to allow multiple rows with the same Key (for 'env')."""
+        data = defaultdict(list)
+        
+        # Determine the relative filename so the resolver knows where to look globally
+        try:
+            rel_filename = os.path.relpath(path, self.root).replace('\\', '/')
+        except ValueError:
+            rel_filename = os.path.basename(path) # Fallback if paths cross drives on Windows
+
+        try:
+            df = pd.read_csv(path, encoding='cp1252', dtype=str).fillna("")
+            for _, row in df.iterrows():
+                key = str(row['Key'])
+                raw_val = str(row['Value'])
+                
+                # --- THE MAGIC: Resolve the pointer for each row ---
+                resolved_val = self._resolve_pointer(key, raw_val, rel_filename)
+                
+                data[key].append(resolved_val)
+            return dict(data)
+        except Exception as e:
+            print(f"Error loading {path}: {e}")
+            return {}
+
+    def get_catalog_path(self, catalog_name):
+        """Resolves a catalog key to a physical CSV path in the data root."""
+        # 1. Grab the catalog_dir (the parent of catalogs) from settings
+        c_dir = PathSwapper.translate(str(self.settings.get('catalog_dir', '')))
+        
+        # 2. Point to the 'catalogs' subfolder within that data root
+        full_path = os.path.join(c_dir, "catalogs", f"{catalog_name}.csv")
+        return os.path.normpath(full_path)
+    
+    def bootstrap_template(self, target_dir=None, mode='create', use_pointers=False):
+        if target_dir is None:
+            target_dir = self.root
+
+        # --- THE HELPER THAT DOES THE WORK ---
+        def ptr(default_val, force_local=False):
+            if use_pointers and not force_local:
+                return "{LOCALDOTDIR}" # This physically writes the string to the CSV!
+            return default_val
+
+        def write(filename, rows):
+            path = os.path.join(target_dir, filename)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            
+            if mode == 'create' or not os.path.exists(path):
+                self.write_csv(path, rows)
+                return
+
+            # --- MODE: SYNC (The Additive Logic) ---
+            if mode == 'sync' and os.path.exists(path):
+                try:
+                    existing_df = pd.read_csv(path, dtype=str).fillna("")
+                    incoming_df = pd.DataFrame(rows[1:], columns=rows[0]).astype(str)
+                    key_col = rows[0][0]
+                    existing_keys = set(existing_df[key_col].tolist())
+                    missing_rows = incoming_df[~incoming_df[key_col].isin(existing_keys)]
+                    
+                    if not missing_rows.empty:
+                        updated_df = pd.concat([existing_df, missing_rows], ignore_index=True)
+                        updated_df.to_csv(path, index=False)
+                except Exception as e:
+                    print(f"Failed to sync {filename}: {e}")
+
+        # Project Settings
+        write("Project_Settings.csv", [
+            ["Key", "Value"],
+            # data_root is specific to every project, so we force it to remain local (empty)
+            ["data_root", ptr("", force_local=True)],
+            # catalog_dir physically lives in the local project, so force local
+            ["catalog_dir", ptr(self.project_root.replace('\\', '/'), force_local=True)], 
+            
+            # --- THE UPDATE: Absolute path to the generated Shots_Template.csv ---
+            ["shots_csv", ptr(os.path.join(target_dir, "Shots_Template.csv").replace('\\', '/'), force_local=True)],
+            
+            ["dual_name", ptr("False")],
+            ["submission_types", ptr("WIP, Final Pending QC, Final QC Approved")],
+            ["status_options", ptr("Ready for Review, Needs Update, Approved, RTS, Pending")],
+            ["submission_csv_headers", ptr("LOCALPATH,SHOTNAME,FILENAME,FIRST,LAST,SUBNOTES,SUBTYPE")],
+            ["submission_review_headers", ptr("LOCALPATH,SHOTNAME,FILENAME,FIRST,LAST,SUBTYPE,SUBNOTES")],
+            ["playlist_review_headers", ptr("LOCALPATH,SHOTNAME,FILENAME,FIRST,LAST,SUBNOTES")],
+            ["scrape_blacklist", ptr(".trash, .snapshot, _thumbs, ._")],
+            ["padding_default", ptr("4")],
+            ["padding_scans", ptr("4")],
+            ["padding_renders", ptr("4")]
+        ])
+        
+        # --- NEW: Project Actions (Nuke Folder-Based Structure) ---
+        nuke_root = "Project_Actions/Nuke"
+        
+        # 1. THE MASTER INDEX (Just IDs now - Flat Tabular, no ptr)
+        write(f"{nuke_root}/nuke_templates.csv", [
+            ["Template_ID"],
+            ["read_write_setup"]
+        ])
+
+        # 2. THE SPECIFIC TEMPLATE SUBDIRECTORY
+        rw_dir = f"{nuke_root}/read_write_setup"
+        
+        # 3. THE CONFIG CSV (Paths - Key/Value, gets ptr)
+        write(f"{rw_dir}/config.csv", [
+            ["Key", "Value"],
+            ["Source_NK", ptr("")],
+            ["Output_Template_path", ptr("{data_root}/{SEQUENCE}/{SHOTNAME}/nuke/{SHOTNAME}")],
+            ["Output_Template_file", ptr("{SHOTNAME}_comp_v001.nk")],
+            ["nuke_comp_render_path", ptr("{data_root}/comp/{ALTSHOTNAME}/{ALTSHOTNAME}_comp_v001")],
+            ["nuke_comp_render_filename", ptr("{ALTSHOTNAME}_comp_v001.{padding_default}.exr")]
+        ])
+
+        # 4. THE MAPPING CSV (Variables - Flat Tabular, no ptr)
+        write(f"{rw_dir}/mapping.csv", [
+            ["Variable", "Source_Type", "Lookup_Key"],
+            ["FIRSTFRAME", "HEADER", "FIRSTFRAME"],
+            ["LASTFRAME", "HEADER", "LASTFRAME"]
+        ])
+
+        # Path Subs (Flat Tabular, no ptr)
+        write("Path_Subs.csv", [
+            ["Mac_Root", "Win_Root", "Linux_Root", "cloud"],
+            ["/Volumes/jobs", "J:", "/mnt/jobs", "{aws_config}"]
+        ])
+
+        # Naming Templates (Key/Value, gets ptr)
+        write("Naming_Templates.csv", [
+            ["Key", "Value"],
+            ["scan_name_template", ptr("SHOTNAME_plate_vHEROPLATE")]
+        ])
+
+        # NOTES CONFIG (Scoped) --- (Key/Type/Value, Value gets ptr)
+        write("Notes_Config.csv", [
+            ["Key", "Key_Type", "Value"],
+            # Global Logic
+            ["substitute_unresolved_vars", "main", ptr("True")],
+            ["unresolved_vars_default_string", "main", ptr("default")],
+            
+            # Roots (The Starting Points)
+            ["default", "root", ptr("{data_root}")],
+            ["client", "root", ptr("{s3_PROJECT_CLIENTNAME_config}")],
+            
+            # Trees (The Directory Structures)
+            ["default", "tree", ptr("notes/{SHOTNAME}")],
+            ["sequence_shot_task_user", "tree", ptr("{SEQUENCE}/{SHOTNAME}/{TASK}/{USER}")],
+            ["client", "tree", ptr("prod/client/.notes/{SEQUENCE}/{SHOTNAME}/{TASK}/{USER}")],
+            
+            # Names (The File Conventions)
+            ["default", "name", ptr("note_{TIMESTAMP}")],
+            ["client", "name", ptr("note_CLIENTNAME_{TIMESTAMP}")]
+        ])
+
+        # Shots Template (Flat Tabular, no ptr)
+        write("Shots_Template.csv", [
+            ["SEQUENCE", "PROCESS", "SHOTNAME", "ALTSHOTNAME", "FIRSTFRAME", "LASTFRAME", "HEROPLATE"],
+            ["abc_001", "0", "job_001_abc_0010", "abc_001_0010", "1001", "1100", "001"]
+        ])
+
+        # Nuke Nested Configs (Key/Value, gets ptr)
+        nuke_base = "Media_Actions/Nuke"
+        write(f"{nuke_base}/win.csv", [
+            ["Key", "Value"],
+            ["bin", ptr("G:/Program Files/Nuke16.0v6/Nuke16.0.exe")],
+            ["flags", ptr("--nukex, -m 18")]
+            #["env", ptr("OCIO=Z:/config/aces_1.2/config.ocio")],
+            #["env", ptr("NUKE_PATH=Z:/pipeline/nuke")]
+        ])
+        write(f"{nuke_base}/mac.csv", [
+            ["Key", "Value"],
+            ["bin", ptr("/Applications/Nuke16.0v6/Nuke16.0v6.app/Contents/MacOS/Nuke16.0")],
+            ["flags", ptr("--nukex")]
+            # ["env", ptr("OCIO=/Volumes/jobs/config/aces_1.2/config.ocio")]
+        ])
+        write(f"{nuke_base}/linux.csv", [
+            ["Key", "Value"],
+            ["bin", ptr("/opt/Nuke16.0v6/Nuke16.0")],
+            ["flags", ptr("--nukex")]
+        ])
+
+        # RV Nested Configs (Key/Value, gets ptr)
+        rv_base = "Media_Actions/RV"
+        write(f"{rv_base}/win.csv", [
+            ["Key", "Value"],
+            ["bin", ptr("C:/Program Files/OpenRV-win/bin/rv.exe")],
+            ["flags", ptr("")]
+        ])
+        write(f"{rv_base}/mac.csv", [
+            ["Key", "Value"],
+            ["bin", ptr("/Applications/RV.app/Contents/MacOS/RV")],
+            ["flags", ptr("")],
+            ["env", ptr("/Users/uel/Dasein/daseinVfxPipe/aces_1.2/config.ocio")]
+        ])
+        write(f"{rv_base}/linux.csv", [
+            ["Key", "Value"],
+            ["bin", ptr("/opt/RV/bin/rv")],
+            ["flags", ptr("")],
+            ["env", ptr("/Users/uel/Dasein/daseinVfxPipe/aces_1.2/config.ocio")]
+        ])
+
+    def write_csv(self, path, rows):
+        """Standard helper to actually touch the disk."""
+        import csv
+        with open(path, 'w', newline='', encoding='utf-8') as f:
+            writer = csv.writer(f)
+            writer.writerows(rows)
 
 class DataSourcesDock(QDockWidget):
     request_reload = Signal(list) 
@@ -6090,30 +6629,26 @@ class DataSourcesDock(QDockWidget):
 
         # 1. Parse the permanent names directly from the raw string
         raw_dr = str(self.engine.settings.get('data_root_raw', ''))
-        permanent_names = []
         try:
             import json
             parsed = json.loads(raw_dr)
-            if isinstance(parsed, list):
-                # Grab just the names (item[0]) from the valid tuples
-                permanent_names = [str(item[0]) for item in parsed if isinstance(item, list) and len(item) > 0]
+            if not isinstance(parsed, list): return # FAIL-SAFE ABORT
+            
+            permanent_names = [
+                str(i.get('name')) if isinstance(i, dict) else str(i[0]) 
+                for i in parsed 
+                if (isinstance(i, dict) and 'name' in i) or (isinstance(i, list) and len(i) > 0)
+            ]
         except:
-            # Legacy fallback
-            if str(self.engine.settings.get('data_root', '')):
-                permanent_names = ["default"]
+            return # FAIL-SAFE ABORT: Don't delete things if the JSON is corrupted!
 
         # 2. Sweep the folder
         for filename in os.listdir(catalog_dir):
             if filename.endswith(".csv"):
-                catalog_name = filename[:-4] # Strip .csv
-                
-                if catalog_name not in permanent_names:
-                    target_file = os.path.join(catalog_dir, filename)
+                if filename[:-4] not in permanent_names:
                     try:
-                        os.remove(target_file)
-                        print(f"Startup Cleanup: Vaporized orphaned catalog '{filename}'")
-                    except Exception as e:
-                        print(f"Startup Cleanup Failed on '{filename}': {e}")
+                        os.remove(os.path.join(catalog_dir, filename))
+                    except: pass
                         
     def get_temp_root_names(self):
         """Returns a list of root IDs that were flagged as temporary this session."""
@@ -6148,6 +6683,7 @@ class DataSourcesDock(QDockWidget):
     def sync_from_engine(self):
         """Initial parse: Turns engine's raw string into our session list."""
         self.session_roots = []
+        self.startup_active_ids = [] # NEW: Remember what the user wants checked at launch
         raw_dr = str(self.engine.settings.get('data_root_raw', ''))
         
         try:
@@ -6155,13 +6691,22 @@ class DataSourcesDock(QDockWidget):
             parsed = json.loads(raw_dr)
             if isinstance(parsed, list):
                 for item in parsed:
-                    if isinstance(item, list) and len(item) >= 2:
-                        # (ID, Path, Is_Temp)
-                        self.session_roots.append([str(item[0]), str(item[1]), False])
+                    # NEW DICTIONARY FORMAT
+                    if isinstance(item, dict) and 'name' in item and 'path' in item:
+                        name = str(item['name'])
+                        self.session_roots.append([name, str(item['path']), False])
+                        if item.get('active', True):
+                            self.startup_active_ids.append(name)
+                    # LEGACY TUPLE FORMAT
+                    elif isinstance(item, list) and len(item) >= 2:
+                        name = str(item[0])
+                        self.session_roots.append([name, str(item[1]), False])
+                        self.startup_active_ids.append(name) # Legacy defaults to active
         except:
-            # Fallback for legacy
             flat = str(self.engine.settings.get('data_root', ''))
-            if flat: self.session_roots.append(["default", flat, False])
+            if flat: 
+                self.session_roots.append(["default", flat, False])
+                self.startup_active_ids.append("default")
 
         self.refresh_ui_list()
 
@@ -6170,8 +6715,8 @@ class DataSourcesDock(QDockWidget):
         
         # 1. REMEMBER WHAT WAS CHECKED BEFORE DESTROYING
         if not self.root_checkboxes:
-            # First launch: default to just the first root
-            active_ids = [self.session_roots[0][0]] if self.session_roots else []
+            # SURGICAL UPDATE: Use the saved active list, not just the first item!
+            active_ids = getattr(self, 'startup_active_ids', [])
         else:
             # Subsequent refreshes: remember user's choices
             active_ids = self.get_active_root_ids()
@@ -6286,7 +6831,12 @@ class DataSourcesDock(QDockWidget):
                 try:
                     parsed = json.loads(new_json_string)
                     if isinstance(parsed, list):
-                        new_roots = [(str(item[0]), str(item[1])) for item in parsed if len(item) >= 2]
+                        for item in parsed:
+                            # Safely handle both the new dictionary format AND legacy lists
+                            if isinstance(item, dict) and 'name' in item and 'path' in item:
+                                new_roots.append((str(item['name']), str(item['path'])))
+                            elif isinstance(item, list) and len(item) >= 2:
+                                new_roots.append((str(item[0]), str(item[1])))
                 except Exception as e:
                     print(f"Parse error during rename check: {e}")
 
@@ -6306,6 +6856,11 @@ class DataSourcesDock(QDockWidget):
                                 except Exception as e:
                                     print(f"Failed to rename catalog {old_name}: {e}")
 
+                            # --- SURGICAL INJECTION: TRANSFER THE CHECKBOX MEMORY ---
+                            if old_name in self.root_checkboxes:
+                                self.root_checkboxes[new_name] = self.root_checkboxes.pop(old_name)
+                            # --------------------------------------------------------
+
                 # 3. Standard Save & Refresh Logic
                 self.engine.settings['data_root'] = new_json_string
                 self.engine.settings['data_root_raw'] = new_json_string
@@ -6320,498 +6875,6 @@ class DataSourcesDock(QDockWidget):
                 # --- ALWAYS RESTORE THE CURSOR, even if it crashes ---
                 QApplication.restoreOverrideCursor()
 
-class RcloneCopyTask(QProcess):
-    # Signals: (current_file_index, speed, current_filename)
-    progress_update = Signal(int, str, str)
-
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setProcessChannelMode(QProcess.MergedChannels)
-        self.files_finished_in_this_run = 0
-        self.readyRead.connect(self.parse_output)
-
-    def parse_output(self):
-        raw = self.readAllStandardOutput().data().decode()
-        
-        # Look for rclone's "Transferred: 12 / 100" line
-        count_match = re.search(r'Transferred:\s+(\d+)\s+/\s+(\d+)', raw)
-        speed_match = re.search(r'([\d\.]+\s[KMGT]B/s)', raw)
-        file_match = re.search(r'\*\s+(.*?):', raw)
-
-        if count_match:
-            self.files_finished_in_this_run = int(count_match.group(1))
-            
-        speed = speed_match.group(1) if speed_match else "Checking..."
-        filename = file_match.group(1) if file_match else "Syncing..."
-
-        # Emit the count so the AssetManager can add it to the Global Total
-        self.progress_update.emit(self.files_finished_in_this_run, speed, filename)
-
-    def run_copy(self, source_list, destination, source_base_root, force_overwrite=False):
-        import tempfile, os
-
-        # 1. THE CRLF FIX: newline='\n' stops Windows from corrupting the rclone path list
-        self.list_file = tempfile.NamedTemporaryFile(
-            delete=False, mode='w', suffix='.txt', encoding='utf-8', newline='\n'
-        )
-        
-        for p in source_list:
-            relative_p = os.path.relpath(p, source_base_root)
-            # Force forward slashes for the internal paths
-            relative_p = relative_p.replace('\\', '/') 
-            self.list_file.write(relative_p + "\n")
-        self.list_file.close()
-
-        # 2. PATH SANITIZATION
-        # Ensure rclone's command line parser doesn't choke on Windows backslashes
-        safe_list = self.list_file.name.replace('\\', '/')
-        safe_source = source_base_root.replace('\\', '/')
-        safe_dest = destination.replace('\\', '/')
-
-        # 3. CORE ARGUMENTS
-        args = [
-            "copy", safe_source, safe_dest, 
-            "--files-from", safe_list,
-            "--transfers", "16", 
-            "--checkers", "16", 
-            "--progress", 
-            "--stats", "1s"
-        ]
-
-        # 4. SMART LOGIC
-        if not force_overwrite:
-            # We rely purely on size-only to beat the SMB timestamp drift. 
-            # We removed --ignore-existing and --exclude to prevent rclone filter clashes.
-            args.append("--size-only")
-        else:
-            args.append("--ignore-times")
-
-        self.start("rclone", args)
-
-class WarpHubDialog(QDialog):
-    def __init__(self, selected_items, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("🚀 GDrive Warp Copy Hub")
-        self.resize(900, 700)
-        
-        layout = QVBoxLayout(self)
-        
-        # --- GLOBAL ACTIONS (Top Bar) ---
-        global_lay = QHBoxLayout()
-        
-        # 1. The Solo View Toggles
-        global_lay.addWidget(QLabel("👁 <b>Solo View:</b>"))
-        
-        self.view_grp = QButtonGroup(self)
-        self.view_grp.setExclusive(True) # Ensures only one can be clicked at a time
-        
-        btn_all = QPushButton("Show All"); btn_all.setCheckable(True); btn_all.setChecked(True)
-        btn_anchors = QPushButton("Anchors"); btn_anchors.setCheckable(True)
-        btn_dest = QPushButton("Destinations"); btn_dest.setCheckable(True)
-        btn_opts = QPushButton("Options"); btn_opts.setCheckable(True)
-
-        # Add them to the logic group
-        self.view_grp.addButton(btn_all); self.view_grp.addButton(btn_anchors)
-        self.view_grp.addButton(btn_dest); self.view_grp.addButton(btn_opts)
-
-        # Style them like a sleek segmented control
-        toggle_style = """
-            QPushButton { background-color: #222; color: #888; border: 1px solid #444; padding: 5px 15px; border-radius: 4px; }
-            QPushButton:checked { background-color: #58cc71; color: black; font-weight: bold; border: 1px solid #58cc71; }
-            QPushButton:hover:!checked { background-color: #333; color: white; }
-        """
-        for btn in self.view_grp.buttons():
-            btn.setStyleSheet(toggle_style)
-            global_lay.addWidget(btn)
-
-        # Wire up the logic
-        btn_all.clicked.connect(lambda: self.apply_view_mode("all"))
-        btn_anchors.clicked.connect(lambda: self.apply_view_mode("anchor"))
-        btn_dest.clicked.connect(lambda: self.apply_view_mode("dest"))
-        btn_opts.clicked.connect(lambda: self.apply_view_mode("opts"))
-
-        global_lay.addStretch()
-
-        # 2. Match Destinations Button (Pushed to the far right)
-        btn_sync_dest = QPushButton("🎯 Match All Destinations to Top")
-        btn_sync_dest.setStyleSheet("background-color: #444; color: white; font-weight: bold; padding: 5px 15px; border-radius: 4px;")
-        btn_sync_dest.clicked.connect(self.sync_dests)
-        global_lay.addWidget(btn_sync_dest)
-        
-        layout.addLayout(global_lay)
-
-        # --- SCROLLABLE LIST ---
-        self.scroll = QScrollArea()
-        self.scroll.setWidgetResizable(True)
-        self.container = QWidget()
-        self.cards_layout = QVBoxLayout(self.container)
-        self.cards_layout.setAlignment(Qt.AlignTop)
-        
-        self.cards = []
-        for i, path in enumerate(selected_items):
-            card = WarpCard(path)
-            self.cards.append(card)
-            self.cards_layout.addWidget(card)
-            
-            # --- THE HUB MAGIC: Link only the first card ---
-            if i == 0:
-                card.enable_master_mode()
-                card.shift_requested.connect(self.sync_master_shift)
-                card.sync_force_requested.connect(self.sync_force_all)
-                # --- NEW: Wire up the toggle ---
-                card.sync_dir_toggled.connect(self.sync_master_realign)
-            
-        self.scroll.setWidget(self.container)
-        layout.addWidget(self.scroll)
-
-        # --- FOOTER ---
-        btns = QHBoxLayout()
-        self.btn_run = QPushButton("🚀 START BATCH WARP")
-        self.btn_run.setStyleSheet("background-color: #2e885a; color: white; font-weight: bold; padding: 12px;")
-        self.btn_run.clicked.connect(self.accept)
-        
-        btn_cancel = QPushButton("Cancel")
-        btn_cancel.clicked.connect(self.reject)
-        
-        btns.addStretch()
-        btns.addWidget(btn_cancel)
-        btns.addWidget(self.btn_run)
-        layout.addLayout(btns)
-
-    def apply_view_mode(self, mode):
-        """Broadcasts the solo mode down to every card."""
-        for card in self.cards:
-            card.set_view_mode(mode)
-
-    def sync_force_all(self, state):
-        """Forces all below cards to match the master card's Force setting."""
-        for card in self.cards[1:]:
-            card.chk_force.setChecked(state)
-
-    def sync_master_realign(self):
-        """Fired when the user clicks the 'Align' toggle. Forces all cards to snap to the new logic."""
-        master = self.cards[0]
-        if master.is_decoupled(): return
-        
-        if getattr(master, 'sync_direction', 'right') == 'left':
-            # Snap everyone to the exact same directory depth from the root
-            for c in self.cards[1:]:
-                c.apply_absolute_split(master.split_idx)
-        else:
-            # Snapping back to Right. Calculate how many steps from the end the master is, 
-            # and apply that same right-offset to all the below cards.
-            master_right_steps = len(master.path_parts) - master.split_idx
-            for c in self.cards[1:]:
-                c.apply_absolute_split(len(c.path_parts) - master_right_steps)
-
-    def sync_master_shift(self, delta):
-        """Receives a slider click from the Master card."""
-        master = self.cards[0]
-        if master.is_decoupled(): return
-        
-        if getattr(master, 'sync_direction', 'right') == 'left':
-            # LEFT MODE: All cards perfectly mirror the master's exact root depth
-            for card in self.cards[1:]:
-                card.apply_absolute_split(master.split_idx)
-        else:
-            # RIGHT MODE (Default): Standard relative shifting
-            for card in self.cards[1:]:
-                card.apply_relative_shift(delta)
-
-    def sync_dests(self):
-        if not self.cards: return
-        master_val = self.cards[0].edit_dest.text()
-        for card in self.cards:
-            card.edit_dest.setText(master_val)
-
-    def get_mappings(self):
-        return [
-            {
-                'path': c.full_path, 
-                'anchor': c.edit_anchor.text(), 
-                'dest': c.edit_dest.text(),
-                'force': c.is_force_enabled() # <--- NEW FLAG
-            } for c in self.cards
-        ]
-    
-class WarpCard(QFrame):
-    shift_requested = Signal(int)
-    sync_force_requested = Signal(bool)
-    sync_dir_toggled = Signal()
-
-    def __init__(self, full_path, parent=None):
-        super().__init__(parent)
-        self.full_path = os.path.normpath(full_path)
-        self.setFrameShape(QFrame.StyledPanel)
-        self.setStyleSheet("WarpCard { background-color: #333; border-radius: 5px; margin: 2px; }")
-
-        self.path_parts = list(Path(self.full_path).parts)
-        self.split_idx = len(self.path_parts) - 1 
-
-        main_layout = QVBoxLayout(self)
-        main_layout.setSpacing(0) # Tighten up for collapsing
-        
-        # 0. TITLE ROW (Always visible so they know what file it is)
-        self.header_lay = QHBoxLayout()
-        self.header_lay.setContentsMargins(0, 0, 0, 5)
-        self.lbl_name = QLabel(f"📦 <b>{os.path.basename(full_path)}</b>")
-        self.lbl_name.setStyleSheet("color: #61afef; font-size: 13px;") 
-        self.header_lay.addWidget(self.lbl_name)
-        self.header_lay.addStretch()
-        main_layout.addLayout(self.header_lay)
-
-        # --- 1. ANCHOR WRAPPER ---
-        self.w_anchor = QWidget()
-        anchor_v_lay = QVBoxLayout(self.w_anchor)
-        anchor_v_lay.setContentsMargins(0, 0, 0, 5)
-        
-        self.anchor_ctrl_lay = QHBoxLayout()
-        self.anchor_ctrl_lay.addStretch()
-        self.anchor_ctrl_lay.addWidget(QLabel("Move Split:"))
-        
-        self.btn_left = QPushButton("◀")
-        self.btn_left.setFixedWidth(28)
-        self.btn_left.setStyleSheet("background-color: #444; color: white; border-radius: 3px;")
-        self.btn_left.clicked.connect(self.shift_left)
-        
-        self.btn_right = QPushButton("▶")
-        self.btn_right.setFixedWidth(28)
-        self.btn_right.setStyleSheet("background-color: #444; color: white; border-radius: 3px;")
-        self.btn_right.clicked.connect(self.shift_right)
-        
-        self.anchor_ctrl_lay.addWidget(self.btn_left)
-        self.anchor_ctrl_lay.addWidget(self.btn_right)
-        anchor_v_lay.addLayout(self.anchor_ctrl_lay)
-
-        self.split_lay = QHBoxLayout()
-        self.split_lay.setSpacing(2)
-        
-        self.edit_anchor = QLineEdit()
-        self.edit_anchor.setReadOnly(True)
-        self.edit_anchor.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
-        self.edit_anchor.setStyleSheet("QLineEdit { color: #61afef; background-color: #1e2a35; border: 1px dashed #3b749e; border-radius: 3px; padding: 2px; }")
-        
-        self.edit_relative = QLineEdit()
-        self.edit_relative.setReadOnly(True)
-        self.edit_relative.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
-        self.edit_relative.setStyleSheet("QLineEdit { color: #61afef; background-color: #1e2a35; border: 2px solid #3b949e; border-radius: 3px; padding: 2px; }")
-
-        self.split_lay.addWidget(self.edit_anchor)
-        self.split_lay.addWidget(self.edit_relative)
-        anchor_v_lay.addLayout(self.split_lay)
-        main_layout.addWidget(self.w_anchor)
-
-        # --- 2. DESTINATION WRAPPER ---
-        self.w_dest = QWidget()
-        dest_lay = QHBoxLayout(self.w_dest)
-        dest_lay.setContentsMargins(0, 0, 0, 5)
-        dest_lay.addWidget(QLabel("Destination: "))
-        self.edit_dest = QLineEdit()
-        btn_browse_dest = QPushButton("Browse...")
-        btn_browse_dest.clicked.connect(self.browse_dest)
-        dest_lay.addWidget(self.edit_dest)
-        dest_lay.addWidget(btn_browse_dest)
-        main_layout.addWidget(self.w_dest)
-
-        # --- 3. OPTIONS WRAPPER ---
-        self.w_opts = QWidget()
-        self.opts_lay = QHBoxLayout(self.w_opts)
-        self.opts_lay.setContentsMargins(0, 0, 0, 0)
-        self.chk_force = QCheckBox("Force Overwrite (Ignore Size-Match)")
-        self.chk_force.setStyleSheet("color: #aaa; font-size: 11px;")
-        self.opts_lay.addWidget(self.chk_force)
-        self.opts_lay.addStretch()
-        main_layout.addWidget(self.w_opts)
-
-        self.update_split_display()
-
-    def set_view_mode(self, mode):
-        """Hides/Shows sections of the card based on the active Solo filter."""
-        self.w_anchor.setVisible(mode in ("all", "anchor"))
-        self.w_dest.setVisible(mode in ("all", "dest"))
-        self.w_opts.setVisible(mode in ("all", "opts"))
-
-    def enable_master_mode(self):
-        """Called by the Hub only on the very first card."""
-        self.chk_decouple = QCheckBox("Decouple Anchors")
-        self.chk_decouple.setToolTip("Don't sync slider movements to below cards")
-        self.chk_decouple.setStyleSheet("color: #e5c07b; font-weight: bold;")
-        self.anchor_ctrl_lay.insertWidget(0, self.chk_decouple)
-        
-        # --- NEW: The Alignment Toggle ---
-        self.sync_direction = "right"
-        self.btn_sync_dir = QPushButton("⮂ Align: Right")
-        self.btn_sync_dir.setToolTip("Toggle how below cards match (Relative from file vs Absolute from root)")
-        self.btn_sync_dir.setStyleSheet("QPushButton { background-color: #444; color: #aaa; border-radius: 3px; padding: 2px 10px; }")
-        self.btn_sync_dir.clicked.connect(self.toggle_sync_dir)
-        self.anchor_ctrl_lay.insertWidget(1, self.btn_sync_dir)
-        
-        self.anchor_ctrl_lay.insertStretch(2) # Keeps buttons formatted nicely
-
-        self.btn_apply_force = QPushButton("⮟ Apply to All")
-        self.btn_apply_force.setStyleSheet("QPushButton { background-color: #2e5a88; color: white; border-radius: 3px; padding: 2px 10px; font-weight: bold; } QPushButton:hover { background-color: #3b76b3; }")
-        self.btn_apply_force.clicked.connect(lambda: self.sync_force_requested.emit(self.chk_force.isChecked()))
-        self.opts_lay.insertWidget(1, self.btn_apply_force)
-
-    def toggle_sync_dir(self):
-        """Swaps the index from end-based to root-based and updates the UI."""
-        if self.sync_direction == "right":
-            self.sync_direction = "left"
-            self.btn_sync_dir.setText("⮂ Align: Left")
-            self.btn_sync_dir.setStyleSheet("QPushButton { background-color: #2e885a; color: white; border-radius: 3px; padding: 2px 10px; font-weight: bold; }")
-        else:
-            self.sync_direction = "right"
-            self.btn_sync_dir.setText("⮂ Align: Right")
-            self.btn_sync_dir.setStyleSheet("QPushButton { background-color: #444; color: #aaa; border-radius: 3px; padding: 2px 10px; }")
-        
-        # Mathematically swap the position (e.g., 1 step from right becomes 1 step from left)
-        self.split_idx = len(self.path_parts) - self.split_idx
-        self.update_split_display()
-        
-        # Tell the Hub to realign everyone below us!
-        self.sync_dir_toggled.emit()
-
-    def apply_absolute_split(self, target_idx):
-        """Forces the slider to an exact directory depth from the root."""
-        self.split_idx = target_idx
-        self.update_split_display()
-
-    def is_decoupled(self):
-        return hasattr(self, 'chk_decouple') and self.chk_decouple.isChecked()
-
-    def apply_relative_shift(self, delta):
-        """Called externally by the Hub to force a relative step."""
-        self.split_idx += delta
-        self.update_split_display()
-
-    # --- SLIDER LOGIC ---
-    def update_split_display(self):
-        # Clamping logic
-        if self.split_idx < 1: self.split_idx = 1
-        if self.split_idx > len(self.path_parts) - 1: self.split_idx = len(self.path_parts) - 1
-        
-        left_path = str(Path(*self.path_parts[:self.split_idx]))
-        right_path = os.path.join(*self.path_parts[self.split_idx:])
-        
-        self.edit_anchor.setText(left_path)
-        self.edit_relative.setText(right_path)
-        
-        len_left = max(len(left_path), 1)
-        len_right = max(len(right_path), 1)
-        self.split_lay.setStretch(0, len_left)
-        self.split_lay.setStretch(1, len_right)
-        
-        self.edit_anchor.setCursorPosition(len(left_path))
-        self.edit_relative.setCursorPosition(0)
-        
-        self.btn_left.setEnabled(self.split_idx > 1)
-        self.btn_right.setEnabled(self.split_idx < len(self.path_parts) - 1)
-
-    def shift_left(self):
-        self.split_idx -= 1
-        self.update_split_display()
-        self.shift_requested.emit(-1) # Broadcast the step!
-
-    def shift_right(self):
-        self.split_idx += 1
-        self.update_split_display()
-        self.shift_requested.emit(1)  # Broadcast the step!
-
-    def is_force_enabled(self):
-        return self.chk_force.isChecked()
-
-    def browse_dest(self):
-        path = QFileDialog.getExistingDirectory(self, "Select Destination", self.edit_dest.text())
-        if path: self.edit_dest.setText(os.path.normpath(path))
-
-class WarpProgressHUD(QFrame):
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setFixedSize(450, 150)
-        self.setWindowFlags(Qt.SubWindow) # Keeps it on top of the parent
-        
-        # Sleek dark HUD styling
-        self.setStyleSheet("""
-            WarpProgressHUD {
-                background-color: rgba(30, 30, 30, 230);
-                border: 2px solid #58cc71;
-                border-radius: 10px;
-            }
-            QLabel { color: white; font-family: 'Segoe UI', sans-serif; }
-        """)
-
-        layout = QVBoxLayout(self)
-        
-        self.lbl_title = QLabel("🚀 <b>GDrive Warp Transfer</b>")
-        self.lbl_title.setStyleSheet("font-size: 16px; color: #58cc71;")
-        self.lbl_title.setAlignment(Qt.AlignCenter)
-        
-        self.bar = QProgressBar()
-        self.bar.setStyleSheet("""
-            QProgressBar { border: 1px solid #555; border-radius: 5px; text-align: center; height: 20px; }
-            QProgressBar::chunk { background-color: #58cc71; }
-        """)
-        
-        self.lbl_speed = QLabel("Calculating speed...")
-        self.lbl_speed.setAlignment(Qt.AlignCenter)
-        
-        self.lbl_file = QLabel("Initializing...")
-        self.lbl_file.setStyleSheet("color: #aaa; font-size: 11px;")
-        self.lbl_file.setAlignment(Qt.AlignCenter)
-        self.lbl_file.setWordWrap(True)
-
-        layout.addWidget(self.lbl_title)
-        layout.addWidget(self.bar)
-        layout.addWidget(self.lbl_speed)
-        layout.addWidget(self.lbl_file)
-
-        self.lbl_batch = QLabel("Task 1 of 1")
-        self.lbl_batch.setStyleSheet("color: #888; font-size: 10px;")
-        self.lbl_batch.setAlignment(Qt.AlignRight)
-        
-        # Add it to your layout (perhaps at the very bottom or top-right)
-        self.layout().addWidget(self.lbl_batch)
-
-        self.btn_done = QPushButton("Close")
-        self.btn_done.hide()
-        self.btn_done.clicked.connect(self.hide)
-        self.btn_done.setStyleSheet("background-color: #2e885a; color: white; font-weight: bold;")
-        self.layout().addWidget(self.btn_done)
-
-    def show_summary(self, total_files, selected_item_count, dest_list):
-        """Transforms the HUD into an honest completion report."""
-        self.bar.hide()
-        self.lbl_speed.hide()
-        self.lbl_title.setText("✅ <b>Warp Complete</b>")
-        self.lbl_title.setStyleSheet("font-size: 16px; color: #58cc71;")
-        
-        unique_dests = list(set(dest_list))
-        if not unique_dests:
-            dest_str = ""
-        elif len(unique_dests) == 1:
-            dest_str = f"To: {unique_dests[0]}"
-        else:
-            dest_str = f"Across {len(unique_dests)} distinct destinations"
-        
-        # Now it tells you exactly what you selected vs what it actually moved
-        summary = (f"Processed <b>{selected_item_count}</b> selected items<br>"
-                   f"(<i>{total_files} individual files on disk</i>)<br><br>"
-                   f"<span style='color: #888;'>{dest_str}</span>")
-        
-        self.lbl_file.setText(summary)
-        self.btn_done.show()
-
-    def update_batch_status(self, current, total):
-        """Updates the batch counter label."""
-        self.lbl_batch.setText(f"Batch {current} of {total}")
-        # Force a repaint to ensure the UI doesn't lag behind the logic
-        self.lbl_batch.repaint()
-
-    def update_data(self, pct, speed, current_file):
-        self.bar.setValue(int(pct))
-        self.lbl_speed.setText(f"⚡ {speed}")
-        self.lbl_file.setText(f"Active: {current_file}")
-        
 class AssetManager(QMainWindow):
     def __init__(self, shot_path="", engine=None, project_label="Generic Project"):
         super().__init__()
@@ -8954,28 +9017,29 @@ class AssetManager(QMainWindow):
         if hasattr(self, 'session_manager_win') and self.session_manager_win:
             self.session_manager_win.close()
 
-        # --- SURGICAL INJECTION: THE TEMP ROOT SCAVENGER ---
         # --- THE NEW ORPHAN SCAVENGER ---
         catalog_dir = os.path.join(self.engine.project_root, "catalogs")
         if os.path.exists(catalog_dir):
-            # Parse the permanent names directly
             raw_dr = str(self.engine.settings.get('data_root_raw', ''))
-            permanent_names = []
             try:
                 import json
                 parsed = json.loads(raw_dr)
-                if isinstance(parsed, list):
-                    permanent_names = [str(item[0]) for item in parsed if isinstance(item, list) and len(item) > 0]
+                if not isinstance(parsed, list): raise ValueError()
+                
+                permanent_names = [
+                    str(i.get('name')) if isinstance(i, dict) else str(i[0]) 
+                    for i in parsed 
+                    if (isinstance(i, dict) and 'name' in i) or (isinstance(i, list) and len(i) > 0)
+                ]
+                
+                for filename in os.listdir(catalog_dir):
+                    if filename.endswith(".csv"):
+                        if filename[:-4] not in permanent_names:
+                            try:
+                                os.remove(os.path.join(catalog_dir, filename))
+                            except: pass
             except:
-                if str(self.engine.settings.get('data_root', '')):
-                    permanent_names = ["default"]
-
-            for filename in os.listdir(catalog_dir):
-                if filename.endswith(".csv"):
-                    if filename[:-4] not in permanent_names:
-                        try:
-                            os.remove(os.path.join(catalog_dir, filename))
-                        except: pass
+                pass # FAIL-SAFE ABORT
 
         event.accept()
 
