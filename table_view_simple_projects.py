@@ -6700,6 +6700,39 @@ class NukeSetupDialog(QDialog):
         
         if close: self.accept()
 
+class ThumbGenOptionsDialog(QDialog):
+    """A small popup to ask the user how to handle existing thumbnails."""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Thumbnail Options")
+        self.force_remake = False
+        
+        layout = QVBoxLayout(self)
+        lbl = QLabel("<b>How would you like to handle existing thumbnails?</b>")
+        lbl.setAlignment(Qt.AlignCenter)
+        layout.addWidget(lbl)
+        
+        layout.addSpacing(10)
+        
+        self.btn_skip = QPushButton("Skip Existing (Faster)")
+        self.btn_skip.setStyleSheet("background-color: #2e885a; color: white; height: 30px; font-weight: bold;")
+        self.btn_skip.clicked.connect(self.choose_skip)
+        
+        self.btn_force = QPushButton("Force Remake All")
+        self.btn_force.setStyleSheet("background-color: #882e2e; color: white; height: 30px; font-weight: bold;")
+        self.btn_force.clicked.connect(self.choose_force)
+        
+        layout.addWidget(self.btn_skip)
+        layout.addWidget(self.btn_force)
+        
+    def choose_skip(self):
+        self.force_remake = False
+        self.accept()
+        
+    def choose_force(self):
+        self.force_remake = True
+        self.accept()
+
 class MacThumbGeneratorThread(QThread):
     progress = Signal(int, str) # Emits (current_step, current_shot_name)
     finished = Signal(int, int) # Emits (successful_count, total_count)
@@ -6716,50 +6749,39 @@ class MacThumbGeneratorThread(QThread):
         success_count = 0
         total_count = len(self.shot_media_map)
 
-        for i, (shotname, source_path) in enumerate(self.shot_media_map.items()):
+        for i, (shotname, source_paths) in enumerate(self.shot_media_map.items()):
             self.progress.emit(i + 1, shotname)
             
-            dest_path = os.path.join(self.thumbs_dir, f"{shotname}.jpg")
-            
-            # Skip if it already exists
-            if os.path.exists(dest_path):
-                success_count += 1
-                continue
+            # Ensure it's a list even if it only found 1 file
+            if not isinstance(source_paths, list):
+                source_paths = [source_paths]
 
-            try:
-                # STEP 1: Hijack macOS QuickLook to generate the thumbnail.
-                # This guarantees it looks exactly like what you see in the Finder!
-                ql_cmd = [
-                    "qlmanage", 
-                    "-t", 
-                    "-s", "640", 
-                    "-o", self.thumbs_dir, 
-                    source_path
-                ]
-                # Run silently
-                subprocess.run(ql_cmd, capture_output=True, text=True)
+            for frame_idx, source_path in enumerate(source_paths):
+                # Save as sh010_00.jpg, sh010_01.jpg, etc.
+                dest_path = os.path.join(self.thumbs_dir, f"{shotname}_{frame_idx:02d}.jpg")
                 
-                # QuickLook always outputs the file as: OriginalName.extension.png
-                source_basename = os.path.basename(source_path)
-                ql_generated_png = os.path.join(self.thumbs_dir, f"{source_basename}.png")
-                
-                # STEP 2: Format it nicely as our {SHOTNAME}.jpg and clean up
-                if os.path.exists(ql_generated_png):
-                    sips_cmd = [
-                        "sips", 
-                        "-s", "format", "jpeg", 
-                        ql_generated_png, 
-                        "--out", dest_path
-                    ]
-                    subprocess.run(sips_cmd, capture_output=True, text=True)
+                if os.path.exists(dest_path):
+                    success_count += 1
+                    continue
+
+                try:
+                    # STEP 1: Hijack macOS QuickLook
+                    ql_cmd = ["qlmanage", "-t", "-s", "256", "-o", self.thumbs_dir, source_path]
+                    subprocess.run(ql_cmd, capture_output=True, text=True)
                     
-                    # Delete the temporary QuickLook PNG
-                    os.remove(ql_generated_png)
+                    source_basename = os.path.basename(source_path)
+                    ql_generated_png = os.path.join(self.thumbs_dir, f"{source_basename}.png")
                     
-                    if os.path.exists(dest_path):
-                        success_count += 1
-            except Exception as e:
-                print(f"Failed to generate thumb for {shotname}: {e}")
+                    # STEP 2: Sips to JPG
+                    if os.path.exists(ql_generated_png):
+                        sips_cmd = ["sips", "-s", "format", "jpeg", ql_generated_png, "--out", dest_path]
+                        subprocess.run(sips_cmd, capture_output=True, text=True)
+                        os.remove(ql_generated_png)
+                        
+                        if os.path.exists(dest_path):
+                            success_count += 1
+                except Exception as e:
+                    print(f"Failed to generate thumb for {shotname} frame {frame_idx}: {e}")
 
         self.finished.emit(success_count, total_count)
 
@@ -6886,6 +6908,7 @@ class ProjectManagerDialog(QDialog):
         from PySide6.QtWidgets import QProgressDialog, QMessageBox
         import glob
         import re
+        import os
         
         # 1. Get Selected Shots from the UI Table
         selected_rows = self.df_manager[self.df_manager['Select'] == True]
@@ -6895,6 +6918,14 @@ class ProjectManagerDialog(QDialog):
 
         selected_shots = selected_rows['SHOTNAME'].tolist()
         
+        # --- NEW: INTERMEDIATE DIALOG ---
+        opts_dlg = ThumbGenOptionsDialog(self)
+        if opts_dlg.exec() != QDialog.Accepted:
+            return # User closed the window (e.g. hit Escape), abort the whole process.
+            
+        force_remake = opts_dlg.force_remake
+        # --------------------------------
+        
         thumbs_dir = os.path.join(self.engine.project_root, self.engine.settings.get('thumbs_dir', 'thumbs'))
         shot_media_map = {}
         
@@ -6902,38 +6933,50 @@ class ProjectManagerDialog(QDialog):
         for raw_shot in selected_shots:
             clean_shotname = str(raw_shot).split("|")[0].strip()
             
-            # Skip if thumb already exists! Fail nicely and continue.
-            if os.path.exists(os.path.join(thumbs_dir, f"{clean_shotname}.jpg")):
-                continue
+            # --- NEW: HANDLE EXISTING ---
+            if force_remake:
+                # Silently delete any existing thumbnails so the background thread remakes them
+                legacy_thumb = os.path.join(thumbs_dir, f"{clean_shotname}.jpg")
+                if os.path.exists(legacy_thumb):
+                    try: os.remove(legacy_thumb)
+                    except: pass
+                    
+                for existing_frame in glob.glob(os.path.join(thumbs_dir, f"{clean_shotname}_*.jpg")):
+                    try: os.remove(existing_frame)
+                    except: pass
+            else:
+                # Skip if thumb already exists! (Check for either the new sequence style or legacy single file)
+                if os.path.exists(os.path.join(thumbs_dir, f"{clean_shotname}_00.jpg")) or \
+                   os.path.exists(os.path.join(thumbs_dir, f"{clean_shotname}.jpg")):
+                    continue
+            # --------------------------
                 
-            # THE FIX: Tell the resolver to give us a glob-searchable pattern!
             search_pattern = self.parent_app.resolve_scan_path(clean_shotname, padding_style="glob")
-            source_file = None
+            source_files = []
             
             if search_pattern:
-                matches = glob.glob(search_pattern)
+                # 1. Ask the OS for all files matching the pattern
+                matches = sorted(glob.glob(search_pattern))
+                
+                # 2. Fallback: If it's literally a directory, dig inside it
+                if not matches and os.path.isdir(search_pattern):
+                    for f in sorted(os.listdir(search_pattern)):
+                        if f.lower().endswith(('.exr', '.jpg', '.jpeg', '.png')):
+                            matches.append(os.path.join(search_pattern, f))
+                            
+                # 3. If we found files, sample up to 10 of them
                 if matches:
-                    source_file = sorted(matches)[0] # Grab the very first frame found on disk
+                    total_frames = len(matches)
+                    step = max(1, total_frames // 10)
+                    source_files = matches[::step][:10]
             
-            # Check if we ended up inside a directory instead of a file
-            if source_file and os.path.isdir(source_file):
-                found = False
-                for f in os.listdir(source_file):
-                    if f.lower().endswith(('.exr', '.jpg', '.jpeg', '.png')):
-                        source_file = os.path.join(source_file, f)
-                        found = True
-                        break
-                if not found:
-                    source_file = None
-            
-            if source_file and os.path.exists(source_file):
-                shot_media_map[clean_shotname] = source_file
+            # Add to the processing map if we successfully found frames
+            if source_files:
+                shot_media_map[clean_shotname] = source_files
 
         if not shot_media_map:
             QMessageBox.information(self, "Nothing to do", "All selected shots either have thumbnails already, or no valid scans were found.")
             return
-        
-        print("SHOT MEDIA MAP: ", shot_media_map)
             
         # 3. Setup Progress and Fire Thread
         self.thumb_progress = QProgressDialog("Generating Thumbnails...", "Cancel", 0, len(shot_media_map), self)
@@ -7092,8 +7135,7 @@ class ScalingOptionsDialog(QDialog):
             return "fit_height"
         return "distort"
 
-class ShotThumbnailWidget(QLabel):
-    # Emitted when a user successfully creates a new thumb, so the main UI knows.
+class ScrubbableThumbnailWidget(QLabel):
     thumbnail_updated = Signal(str) 
 
     def __init__(self, parent=None):
@@ -7101,63 +7143,108 @@ class ShotThumbnailWidget(QLabel):
         self.current_shot = None
         self.thumbs_dir = None
         
+        # --- SCRUBBING MEMORY ---
+        self.pixmap_cache = [] # Holds our 10 frames
+        self.current_frame_idx = 0
+        
         # UI Setup
         self.setAlignment(Qt.AlignCenter)
-        self.setMinimumSize(250, 150) # Set this to whatever fits your dead space
+        self.setMinimumSize(256, 144)
         self.setFrameStyle(QLabel.Panel | QLabel.Sunken)
-        self.set_neutral_state() # Start in a neutral state
+        self.setMouseTracking(True) # MAGIC FLAG: Listen to mouse hover!
+        
+        self.set_neutral_state()
 
-        # Context Menu for right-clicking
         self.setContextMenuPolicy(Qt.CustomContextMenu)
         self.customContextMenuRequested.connect(self.show_context_menu)
 
     def set_neutral_state(self):
-        """State when 'All' is selected. No clicking allowed."""
         self.current_shot = None
+        self.pixmap_cache = []
         self.setStyleSheet("background-color: #222; color: #555; border: 1px solid #333;")
         self.setText("Select a specific Shot\nto view/add thumbnail")
 
     def set_empty_state(self):
-        """State when a valid shot is selected, but it has no thumbnail."""
+        self.pixmap_cache = []
         self.setStyleSheet("background-color: #222; color: #888; border: 2px dashed #444;")
         self.setText("No Thumbnail Found\n\nClick to Add Media")
 
     def load_shot(self, raw_shotname, thumbs_dir):
-        """Called by the main UI when the user selects a shot from the dropdown."""
-        # 1. Handle the "All" or empty state
         if not raw_shotname or raw_shotname.strip() == "All":
             self.set_neutral_state()
             return
             
-        # 2. Extract the actual shot name from the UI display string
-        # This turns "sh010 | AltName" into just "sh010"
-        clean_shotname = raw_shotname.split("|")[0].strip()
-        
-        # 3. Strip any other accidentally illegal Windows characters just to be safe
         import re
+        clean_shotname = raw_shotname.split("|")[0].strip()
         clean_shotname = re.sub(r'[<>:"/\\|?*]', '_', clean_shotname)
 
         self.current_shot = clean_shotname
         self.thumbs_dir = thumbs_dir
+        self.pixmap_cache = [] # Clear old memory
         
-        # Construct the expected path: just {clean_shotname}.jpg
-        self.expected_thumb_path = os.path.join(self.thumbs_dir, f"{self.current_shot}.jpg")
+        # Look for scrubbing sequence (e.g., sh010_00.jpg, sh010_01.jpg...)
+        import glob
+        seq_pattern = os.path.join(self.thumbs_dir, f"{self.current_shot}_*.jpg")
+        found_frames = sorted(glob.glob(seq_pattern))
+        
+        # Fallback to single static thumb if it's an old legacy one
+        single_path = os.path.join(self.thumbs_dir, f"{self.current_shot}.jpg")
+        if not found_frames and os.path.exists(single_path):
+            found_frames = [single_path]
 
-        if os.path.exists(self.expected_thumb_path):
-            self.setStyleSheet("") # Clear the empty state styling
-            pixmap = QPixmap(self.expected_thumb_path)
-            self.setPixmap(pixmap.scaled(self.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation))
+        if found_frames:
+            self.setStyleSheet("") # Clear empty state
+            
+            # --- THE FIX: Pre-scale all frames to RAM for instant scrubbing ---
+            for f in found_frames:
+                pm = QPixmap(f)
+                if not pm.isNull():
+                    # Calculate the scale ONCE based on the fixed contents rect
+                    scaled_pm = pm.scaled(self.contentsRect().size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                    self.pixmap_cache.append(scaled_pm)
+                    
+            if self.pixmap_cache:
+                mid_idx = len(self.pixmap_cache) // 2
+                self.show_frame(mid_idx)
         else:
             self.set_empty_state()
+
+    def show_frame(self, index):
+        """Safely displays a specific pre-scaled frame from the cache."""
+        if not self.pixmap_cache: return
+        self.current_frame_idx = max(0, min(index, len(self.pixmap_cache) - 1))
+        
+        # Just grab it and show it. No math!
+        self.setPixmap(self.pixmap_cache[self.current_frame_idx])
+
+    def mouseMoveEvent(self, event):
+        """The Magic Hover Scrub! Maps X position to a frame index."""
+        if len(self.pixmap_cache) > 1: # Only scrub if we have > 1 frame
+            # Calculate where the mouse is horizontally (0.0 to 1.0)
+            norm_x = max(0.0, min(event.position().x() / self.width(), 1.0))
+            
+            # Map that percentage to an array index
+            target_idx = int(norm_x * len(self.pixmap_cache))
+            
+            # Don't redraw if we are already showing that frame (saves CPU)
+            if target_idx != self.current_frame_idx:
+                self.show_frame(target_idx)
+                
+        super().mouseMoveEvent(event)
 
     def mousePressEvent(self, event):
         """Intercept the click event to trigger the builder."""
         if event.button() == Qt.LeftButton:
             if not self.current_shot:
-                # If they click while it says "Select a specific Shot...", do nothing.
                 return
             self.trigger_build_process()
         super().mousePressEvent(event)
+
+    def leaveEvent(self, event):
+        """When the mouse leaves, snap back to the middle 'Hero' frame."""
+        if self.pixmap_cache:
+            self.show_frame(len(self.pixmap_cache) // 2)
+        super().leaveEvent(event)
 
     def show_context_menu(self, pos):
         """Right-click menu to replace existing thumbnails."""
@@ -7173,6 +7260,11 @@ class ShotThumbnailWidget(QLabel):
     def trigger_build_process(self):
         """The 'Right Now' builder: asks for an image and scales it."""
         # 1. Ask for media
+        import os
+        from PySide6.QtWidgets import QFileDialog, QMessageBox, QDialog
+        from PySide6.QtGui import QPixmap
+        from PySide6.QtCore import Qt
+        
         file_path, _ = QFileDialog.getOpenFileName(
             self, "Select Image", "", "Images (*.jpg *.jpeg *.png *.bmp)" 
         )
@@ -7193,7 +7285,7 @@ class ShotThumbnailWidget(QLabel):
             QMessageBox.critical(self, "Error", "Could not read the selected image file.")
             return
 
-        target_w, target_h = 640, 360
+        target_w, target_h = 256, 144 # Match the new smaller widget size!
         
         if mode == "fit_width":
             final_pixmap = source_pixmap.scaledToWidth(target_w, Qt.SmoothTransformation)
@@ -7206,19 +7298,27 @@ class ShotThumbnailWidget(QLabel):
         else: # distort
             final_pixmap = source_pixmap.scaled(target_w, target_h, Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
 
-        # 4. Save the result
+        # 4. Housekeeping: Delete ANY existing thumbs for this shot so they don't conflict
+        import glob
         os.makedirs(self.thumbs_dir, exist_ok=True)
         
-        # FIX 1: Qt strongly prefers forward slashes, even on Windows
-        safe_path = self.expected_thumb_path.replace("\\", "/")
-        print("SAF/VE PATH: ", self.expected_thumb_path)
+        # This will find "sh010.jpg" OR "sh010_00.jpg", "sh010_01.jpg", etc.
+        old_files = glob.glob(os.path.join(self.thumbs_dir, f"{self.current_shot}*.jpg"))
+        for old_file in old_files:
+            try:
+                os.remove(old_file)
+            except Exception as e:
+                print(f"Failed to remove old thumb {old_file}: {e}")
+
+        # 5. Save the new result as a single static thumb
+        expected_thumb_path = os.path.join(self.thumbs_dir, f"{self.current_shot}.jpg")
+        safe_path = expected_thumb_path.replace("\\", "/")
         
-        # FIX 2: Let Qt infer the format from the .jpg extension by not specifying it
         success = final_pixmap.save(safe_path, quality=85)
 
         if success:
             self.load_shot(self.current_shot, self.thumbs_dir)
-            self.thumbnail_updated.emit(self.expected_thumb_path)
+            self.thumbnail_updated.emit(expected_thumb_path)
         else:
             QMessageBox.critical(self, "Error", "Failed to save thumbnail to disk.")
 
@@ -7431,7 +7531,7 @@ class AssetManager(QMainWindow):
         shot_status_layout.addWidget(self.shot_selector)
         
         # 1. Create it in your UI setup
-        self.thumb_widget = ShotThumbnailWidget()
+        self.thumb_widget = ScrubbableThumbnailWidget()
         shot_status_layout.addWidget(self.thumb_widget)
 
         # 2. Connect your existing Shot dropdown
