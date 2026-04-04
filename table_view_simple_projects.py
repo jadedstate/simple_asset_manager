@@ -10,9 +10,9 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QTableView, QStyledIte
                                QVBoxLayout, QHBoxLayout, QPushButton, QFrame, QHeaderView, QTextEdit, QListWidgetItem, QTableWidget, QTableWidgetItem,
                                QWidget, QLabel, QLineEdit, QFileDialog, QCheckBox, QDateEdit, QMessageBox, QStyleOptionViewItem, QStyle, QSpacerItem,
                                QMenu, QDialog, QProgressBar, QDialogButtonBox, QSplitter, QListWidget, QFormLayout, QScrollArea, QDockWidget,
-                               QSizePolicy)
+                               QSizePolicy, QRadioButton)
 from PySide6.QtCore import QAbstractTableModel, Qt, QSortFilterProxyModel, QDate, QEvent, QTimer, QObject, Signal, QThread, QModelIndex, QProcess
-from PySide6.QtGui import QKeySequence, QAction, QColor, QPalette
+from PySide6.QtGui import QKeySequence, QAction, QColor, QPalette, QPixmap, QPainter
 from datetime import datetime
 import subprocess
 import csv
@@ -6875,6 +6875,152 @@ class DataSourcesDock(QDockWidget):
                 # --- ALWAYS RESTORE THE CURSOR, even if it crashes ---
                 QApplication.restoreOverrideCursor()
 
+class ScalingOptionsDialog(QDialog):
+    """A small dialog to ask the user how they want to conform their image."""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Thumbnail Scaling")
+        layout = QVBoxLayout(self)
+
+        self.fit_width = QRadioButton("Fit Width (Keep Aspect Ratio)")
+        self.fit_height = QRadioButton("Fit Height (Keep Aspect Ratio)")
+        self.distort = QRadioButton("Distort to Fill")
+        
+        self.fit_width.setChecked(True) # Default
+
+        layout.addWidget(self.fit_width)
+        layout.addWidget(self.fit_height)
+        layout.addWidget(self.distort)
+
+        self.buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        self.buttons.accepted.connect(self.accept)
+        self.buttons.rejected.connect(self.reject)
+        layout.addWidget(self.buttons)
+
+    def get_scaling_mode(self):
+        if self.fit_width.isChecked():
+            return "fit_width"
+        elif self.fit_height.isChecked():
+            return "fit_height"
+        return "distort"
+
+class ShotThumbnailWidget(QLabel):
+    # Emitted when a user successfully creates a new thumb, so the main UI knows.
+    thumbnail_updated = Signal(str) 
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.current_shot = None
+        self.thumbs_dir = None
+        
+        # UI Setup
+        self.setAlignment(Qt.AlignCenter)
+        self.setMinimumSize(250, 150) # Set this to whatever fits your dead space
+        self.setFrameStyle(QLabel.Panel | QLabel.Sunken)
+        self.set_neutral_state() # Start in a neutral state
+
+        # Context Menu for right-clicking
+        self.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.customContextMenuRequested.connect(self.show_context_menu)
+
+    def set_neutral_state(self):
+        """State when 'All' is selected. No clicking allowed."""
+        self.current_shot = None
+        self.setStyleSheet("background-color: #222; color: #555; border: 1px solid #333;")
+        self.setText("Select a specific Shot\nto view/add thumbnail")
+
+    def set_empty_state(self):
+        """State when a valid shot is selected, but it has no thumbnail."""
+        self.setStyleSheet("background-color: #222; color: #888; border: 2px dashed #444;")
+        self.setText("No Thumbnail Found\n\nClick to Add Media")
+
+    def load_shot(self, shotname, thumbs_dir):
+        """Called by the main UI when the user selects a shot from the dropdown."""
+        # 1. Handle the "All" or empty state
+        if not shotname or shotname == "All":
+            self.set_neutral_state()
+            return
+            
+        # 2. Proceed normally for valid shots
+        self.current_shot = shotname
+        self.thumbs_dir = thumbs_dir
+        
+        # Construct the expected path: just {SHOTNAME}.jpg
+        self.expected_thumb_path = os.path.join(self.thumbs_dir, f"{self.current_shot}.jpg")
+
+        if os.path.exists(self.expected_thumb_path):
+            self.setStyleSheet("") # Clear the empty state styling
+            pixmap = QPixmap(self.expected_thumb_path)
+            self.setPixmap(pixmap.scaled(self.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation))
+        else:
+            self.set_empty_state()
+
+    def mousePressEvent(self, event):
+        """Intercept the click event to trigger the builder."""
+        if event.button() == Qt.LeftButton:
+            if not self.current_shot:
+                # If they click while it says "Select a specific Shot...", do nothing.
+                return
+            self.trigger_build_process()
+        super().mousePressEvent(event)
+
+    def show_context_menu(self, pos):
+        """Right-click menu to replace existing thumbnails."""
+        if not self.current_shot:
+            return
+            
+        menu = QMenu(self)
+        replace_action = QAction("Replace Thumbnail...", self)
+        replace_action.triggered.connect(self.trigger_build_process)
+        menu.addAction(replace_action)
+        menu.exec_(self.mapToGlobal(pos))
+
+    def trigger_build_process(self):
+        """The 'Right Now' builder: asks for an image and scales it."""
+        # 1. Ask for media
+        file_path, _ = QFileDialog.getOpenFileName(
+            self, "Select Image", "", "Images (*.jpg *.jpeg *.png *.bmp)" 
+        )
+        
+        if not file_path:
+            return
+
+        # 2. Ask for scaling options
+        scale_dialog = ScalingOptionsDialog(self)
+        if scale_dialog.exec() != QDialog.Accepted:
+            return
+            
+        mode = scale_dialog.get_scaling_mode()
+
+        # 3. Process the Image using PySide6's native QPixmap
+        source_pixmap = QPixmap(file_path)
+        if source_pixmap.isNull():
+            QMessageBox.critical(self, "Error", "Could not read the selected image file.")
+            return
+
+        target_w, target_h = 640, 360
+        
+        if mode == "fit_width":
+            final_pixmap = source_pixmap.scaledToWidth(target_w, Qt.SmoothTransformation)
+            if final_pixmap.height() > target_h:
+                final_pixmap = final_pixmap.copy(0, 0, target_w, target_h)
+        elif mode == "fit_height":
+            final_pixmap = source_pixmap.scaledToHeight(target_h, Qt.SmoothTransformation)
+            if final_pixmap.width() > target_w:
+                final_pixmap = final_pixmap.copy(0, 0, target_w, target_h)
+        else: # distort
+            final_pixmap = source_pixmap.scaled(target_w, target_h, Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
+
+        # 4. Save the result
+        os.makedirs(self.thumbs_dir, exist_ok=True)
+        success = final_pixmap.save(self.expected_thumb_path, "JPG", quality=85)
+
+        if success:
+            self.load_shot(self.current_shot, self.thumbs_dir)
+            self.thumbnail_updated.emit(self.expected_thumb_path)
+        else:
+            QMessageBox.critical(self, "Error", "Failed to save thumbnail to disk.")
+
 class AssetManager(QMainWindow):
     def __init__(self, shot_path="", engine=None, project_label="Generic Project"):
         super().__init__()
@@ -7083,6 +7229,13 @@ class AssetManager(QMainWindow):
         shot_status_layout.addWidget(QLabel("Shot:"))
         shot_status_layout.addWidget(self.shot_selector)
         
+        # 1. Create it in your UI setup
+        self.thumb_widget = ShotThumbnailWidget()
+        shot_status_layout.addWidget(self.thumb_widget)
+
+        # 2. Connect your existing Shot dropdown
+        self.shot_selector.currentTextChanged.connect(self.update_thumbnail_view)
+
         # Pushes the dropdowns tightly to the left
         shot_status_layout.addStretch() 
         self.layout.addLayout(shot_status_layout)
@@ -7238,6 +7391,17 @@ class AssetManager(QMainWindow):
 
         # Initialize the numbers
         self.update_status_stats()
+
+    def update_thumbnail_view(self, shotname):
+        # Safety check: ensure the engine exists
+        if not self.engine:
+            return
+            
+        # Ask ConfigEngine for the thumbs directory
+        thumbs_dir = os.path.join(self.engine.project_root, self.engine.settings.get('thumbs_dir', 'thumbs'))
+        
+        # Tell the widget to load just the shotname
+        self.thumb_widget.load_shot(shotname, thumbs_dir)
 
     def check_rclone_presence(self):
         """Returns True if rclone is found in the system PATH."""
@@ -8973,32 +9137,33 @@ class AssetManager(QMainWindow):
         return PathSwapper.translate(full_path)
     
     def launch_rv_with_added_scans(self):
-        """Launches selection + the Hero Scans defined in the Project Config."""
+        """Launches selection + the Hero Scans interleaved."""
         selection = self.table.selectionModel().selectedIndexes()
         if not selection: return
 
+        # 1. SURGICAL FIX: Get UNIQUE rows to prevent spam if a full row is highlighted
+        rows = sorted({self.proxy_model.mapToSource(idx).row() for idx in selection})
+        
         # Get extension from the first item
-        first_row = self.proxy_model.mapToSource(selection[0]).row()
-        target_ext = str(self.df_master.iat[first_row, self.df_master.columns.get_loc("FILETYPE")])
+        target_ext = str(self.df_master.iat[rows[0], self.df_master.columns.get_loc("FILETYPE")])
 
         final_paths = []
-        target_shots = set()
 
-        # 1. Add explicitly selected items
-        for idx in selection:
-            src_row = self.proxy_model.mapToSource(idx).row()
-            shot = str(self.df_master.iat[src_row, self.df_master.columns.get_loc("SHOTNAME")])
-            path = os.path.join(str(self.df_master.iat[src_row, self.df_master.columns.get_loc("ABSPATH")]),
-                                str(self.df_master.iat[src_row, self.df_master.columns.get_loc("FILENAME")]))
+        # 2. Interleave explicitly selected items with their scans
+        for r in rows:
+            shot = str(self.df_master.iat[r, self.df_master.columns.get_loc("SHOTNAME")])
+            path = os.path.join(str(self.df_master.iat[r, self.df_master.columns.get_loc("ABSPATH")]),
+                                str(self.df_master.iat[r, self.df_master.columns.get_loc("FILENAME")]))
+            
+            # Add the selected item (e.g., the Comp)
             final_paths.append(path)
+            
+            # Immediately add the Hero Scan right next to it
             if shot and shot != "nan" and shot != "":
-                target_shots.add(shot)
-
-        # 2. Append the calculated Hero Scan paths
-        for shot in target_shots:
-            scan_path = self.resolve_scan_path(shot, target_ext=target_ext)
-            if scan_path:
-                final_paths.append(scan_path)
+                scan_path = self.resolve_scan_path(shot, target_ext=target_ext)
+                # Ensure we don't accidentally double-load if the user selected the scan itself
+                if scan_path and scan_path != path:
+                    final_paths.append(scan_path)
 
         # --- THE SAFETY GUARD FIX ---
         if final_paths:
