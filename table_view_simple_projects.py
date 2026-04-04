@@ -6241,10 +6241,23 @@ class ConfigEngine:
         raw = self._load_kv_csv("Project_Settings.csv")
         self.settings = {}
         for k, v in raw.items():
-            if k == 'data_root':
-                # CRITICAL: Bypass PathSwapper here so Windows normpath doesn't
-                # flip forward slashes to backslashes and break the JSON parser.
-                self.settings[k] = str(v)
+            if k in ('data_root', 'data_root_raw'):
+                # --- SURGICAL SANITIZER ---
+                val = str(v).strip()
+                
+                # 1. Strip outer quotes that CSV writers sometimes leave behind
+                if val.startswith('"') and val.endswith('"'): 
+                    val = val[1:-1]
+                if val.startswith("'") and val.endswith("'"): 
+                    val = val[1:-1]
+                    
+                # 2. Fix inner CSV quote escaping (in case Pandas doubled them up)
+                val = val.replace('""', '"')
+                
+                # 3. Kill Windows backslashes that crash the JSON parser
+                self.settings[k] = val.replace('\\', '/')
+                # --------------------------
+                
             elif "/" in str(v) or "\\" in str(v):
                 self.settings[k] = PathSwapper.translate(str(v))
             else:
