@@ -526,938 +526,6 @@ class GenericCSVEditor(QDialog):
         # No preview_table in this class, so we can remove that elif
         super().closeEvent(event)
 
-class PaddingNomBuilder:
-    @staticmethod
-    def build(raw_pad, style="printf"):
-        """
-        The Single Source of Truth for VFX sequence padding formatting.
-        Kills NaNs, fixes single digits, and translates to app-specific nomenclature.
-        """
-        # 1. The Sanity Check (Kill NaN/Ghosts)
-        padding_val = str(raw_pad).strip() if pd.notna(raw_pad) and str(raw_pad).strip() else ""
-        
-        # 2. The Strict Formatter (e.g., '4' -> '04')
-        if padding_val.isdigit() and len(padding_val) == 1:
-            padding_val = f"0{padding_val}"
-
-        # 3. The Output Switchboard
-        if style == "printf":
-            # Nuke/Maya/Standard C-style: %04d
-            return f"%{padding_val}d" if padding_val else "%d"
-            
-        elif style == "hash":
-            # Nuke alt/RV style: ####
-            if not padding_val: return "#"
-            # Strip the '0' prefix for the multiplier to avoid octal math weirdness, default to 1
-            return "#" * int(padding_val.lstrip('0') or 1)
-            
-        elif style == "houdini":
-            # Houdini style: $F4
-            if not padding_val: return "$F"
-            return f"$F{padding_val.lstrip('0')}"
-            
-        else:
-            # Failure-centric: Unrecognized style returns the raw parsed value
-            return padding_val
-       
-class TextInjectionEngine:
-    @staticmethod
-    def extract_variables(filepath):
-        """Finds any contiguous block of 4+ uppercase letters."""
-        if not os.path.exists(filepath): 
-            return set()
-            
-        with open(filepath, 'r') as f:
-            content = f.read()
-        
-        # Simple, contiguous uppercase lookup
-        matches = set(re.findall(r'[A-Z]{4,}', content))
-        return matches
-
-    @staticmethod
-    def inject(source_path, target_path, mapping_dict):
-        """Performs replacement, skipping variables set to IGNORE."""
-        with open(source_path, 'r') as f:
-            content = f.read()
-
-        # Sort by length descending to prevent partial matches (e.g., 'SHOT' in 'SHOTNAME')
-        for var in sorted(mapping_dict.keys(), key=len, reverse=True):
-            val = mapping_dict[var]
-            
-            # If the UI set this to IGNORE, we do nothing to this string
-            if val == "<<IGNORE>>":
-                continue
-                
-            content = content.replace(var, str(val))
-
-        os.makedirs(os.path.dirname(target_path), exist_ok=True)
-        with open(target_path, 'w') as f:
-            f.write(content)
-        return True
-
-class TemplateVariableResolver:
-    def __init__(self, engine, mapping_df, app_window=None):
-        self.engine = engine
-        self.mapping_df = mapping_df # Now takes a DF directly
-        self.app = app_window
-
-    def get_resolved_map(self, row_dict, action_config=None):
-        """THE ONE SOURCE OF TRUTH: Resolves a single row of data."""
-        if action_config is None: action_config = {}
-        final_map = {}
-        
-        for _, row in self.mapping_df.iterrows():
-            var = row['Variable']
-            src = row['Source_Type']
-            key = str(row['Lookup_Key']).strip()
-            val = "UNRESOLVED"
-
-            if src == "IGNORE":
-                val = "<<IGNORE>>"
-            elif src == "HEADER":
-                val = row_dict.get(key, "MISSING_COL")
-            elif src == "CONFIG":
-                val = self.engine.settings.get(key, "MISSING_SETTING")
-            elif src == "CONSTANT":
-                val = key
-            elif src == "SCAN":
-                shot = row_dict.get('SHOTNAME')
-                if self.app and hasattr(self.app, 'resolve_scan_path'):
-                    val = self.app.resolve_scan_path(shot) or "SCAN_NOT_FOUND"
-                else:
-                    val = "RESOLVER_NOT_FOUND"
-            
-            # --- THE GRAVITY INJECTION: EXPLICIT NUKE_WRITE ---
-            elif src == "NUKE_WRITE":
-                r_path = action_config.get('nuke_comp_render_path', "MISSING_COMP_PATH")
-                r_file = action_config.get('nuke_comp_render_filename', "MISSING_COMP_FILE")
-                
-                template = f"{r_path}/{r_file}".replace("//", "/")
-                
-                # --- SURGICAL PADDING: Catch ALL padding variables ---
-                for k, v in self.engine.settings.items():
-                    if k.startswith('padding_') and f"{{{k}}}" in template:
-                        padding_nomenclature = PaddingNomBuilder.build(v, style="printf")
-                        template = template.replace(f"{{{k}}}", padding_nomenclature)
-                
-                # Resolve the remaining placeholders ({SHOTNAME}, {data_root}, etc.)
-                ctx = {**self.engine.settings, **row_dict}
-                for k in sorted(ctx.keys(), key=len, reverse=True):
-                    placeholder = f"{{{k}}}"
-                    if placeholder in template:
-                        template = template.replace(placeholder, str(ctx[k]))
-                val = template
-
-            elif src == "NAMING":
-                template = self.engine.naming_templates.get(key, "")
-                ctx = {**self.engine.settings, **row_dict}
-                for k in sorted(ctx.keys(), key=len, reverse=True):
-                    placeholder = f"{{{k}}}"
-                    if placeholder in template:
-                        template = template.replace(placeholder, str(ctx[k]))
-                val = template
-
-            if isinstance(val, str) and src != "IGNORE":
-                val = val.replace("\\", "/")
-            final_map[var] = val
-            
-        return final_map
-
-class TemplateMappingWidget(QWidget):
-    # SURGICAL FIX: Change 'source_dfs' to 'manager_df' in the signature
-    def __init__(self, engine, template_id, template_path, map_csv_path, manager_df, active_shotname=None, parent=None):
-        super().__init__(parent)
-        self.engine = engine
-        self.template_path = template_path
-        self.map_csv_path = map_csv_path
-        
-        # --- SURGICAL FIX: The data is already unified. Just copy it. ---
-        self.full_context_df = manager_df.copy()
-        
-        # Find the index for our preview shot in the DF
-        self.active_row_idx = 0
-        if active_shotname:
-            matches = self.full_context_df.index[self.full_context_df['SHOTNAME'] == active_shotname].tolist()
-            if matches:
-                self.active_row_idx = matches[0]
-        
-        self.setWindowTitle(f"Template Mapping: {template_id}")
-        self.resize(1200, 600)
-        
-        layout = QVBoxLayout(self)
-
-        # 1. DATA PREP: Sync variables before loading
-        self.sync_variables_on_disk()
-        
-        # 2. LOAD DF
-        self.df_map = pd.read_csv(self.map_csv_path, dtype=str).fillna("")
-        
-        # 3. ADD LIVE PREVIEW
-        self.df_map['Live_Preview'] = self.df_map.apply(self.mock_resolve, axis=1)
-
-        # 4. TABLE SETUP
-        self.table = QTableView()
-        self.table.setAlternatingRowColors(True)
-        self.table.setEditTriggers(QTableView.AllEditTriggers)
-        
-        self.model = PandasModel(self.df_map, self, read_only=False)
-        self.model.flags = self.mapping_table_flags 
-        self.table.setModel(self.model)
-
-        self.model.dataChanged.connect(self.on_cell_edited)
-
-        # 5. APPLY DELEGATE TO ALL COLUMNS
-        # SURGICAL FIX: Removed generic options, added strict NUKE_WRITE
-        self.options = ["HEADER", "CONFIG", "SCAN", "NAMING", "CONSTANT", "IGNORE", "NUKE_WRITE"]
-        
-        self.row_delegate = CSVEditorDelegate(self.options, self.table)
-        
-        for i in range(self.model.columnCount()):
-            self.table.setItemDelegateForColumn(i, self.row_delegate)
-
-        layout.addWidget(QLabel(f"<b>Template:</b> {template_path}"))
-        layout.addWidget(self.table)
-
-        self.table.resizeColumnsToContents()
-
-    def keyPressEvent(self, event):
-        """Surgically intercepts Copy before the Editor can steal the focus."""
-        
-        # 1. Catch the Copy Command (Cmd+C / Ctrl+C)
-        if event.matches(QKeySequence.Copy):
-            # 2. FORCE-CLOSE any active editor in the table 
-            # This prevents the "last cell is currently being edited" ghosting.
-            if self.table.indexWidget(self.table.currentIndex()):
-                self.table.commitData(self.table.indexWidget(self.table.currentIndex()))
-            
-            # 3. Perform the centralized copy
-            ClipboardHelper.copy_table_selection(self.table)
-            
-            # 4. Optional: Feedback via status bar
-            curr = self
-            while curr:
-                if hasattr(curr, 'statusBar') and curr.statusBar():
-                    curr.statusBar().showMessage("Copied selection to clipboard", 2000)
-                    break
-                curr = curr.parent()
-            
-            # IMPORTANT: Accept the event so it doesn't trigger the default Qt edit behavior
-            event.accept()
-            return 
-
-        # Let all other keys (Enter, Arrows, etc.) behave normally
-        super().keyPressEvent(event)
-
-    def mapping_table_flags(self, index):
-        if not index.isValid(): return Qt.NoItemFlags
-        col_name = self.df_map.columns[index.column()]
-        
-        # 1. Hard Locks
-        if col_name in ['Variable', 'Live_Preview']:
-            return Qt.ItemIsEnabled | Qt.ItemIsSelectable
-            
-        # 2. Lookup_Key is ALWAYS editable (Failure-centric: User can type notes if they want)
-        # It will just be Greyed Out visually if Source is SCAN to show it's redundant.
-        return Qt.ItemIsEnabled | Qt.ItemIsSelectable | Qt.ItemIsEditable
-
-    def mock_resolve(self, row_map):
-        """Wrapper that uses the REAL TemplateVariableResolver with polite failure handling."""
-        
-        # 1. POLITE FAILURE: Check if we actually have any shots loaded in the Asset Manager
-        if self.full_context_df.empty:
-            return "Preview not available: No shot data loaded."
-
-        app_window = None
-        curr = self
-        while curr:
-            if hasattr(curr, 'resolve_scan_path'):
-                app_window = curr
-                break
-            curr = curr.parent()
-
-        # Try the LIVE UI first, fallback to disk
-        action_config = {}
-        if hasattr(self.parent(), 'get_live_config'):
-            action_config = self.parent().get_live_config()
-        else:
-            config_path = os.path.join(os.path.dirname(self.map_csv_path), "config.csv")
-            if os.path.exists(config_path):
-                df_cfg = pd.read_csv(config_path).fillna("")
-                action_config = dict(zip(df_cfg['Key'], df_cfg['Value']))
-
-        resolver = TemplateVariableResolver(self.engine, pd.DataFrame([row_map]), app_window=app_window)
-        
-        try:
-            # 2. POLITE FAILURE: Ensure the active row index is actually valid
-            if self.active_row_idx >= len(self.full_context_df):
-                return "Preview not available: Selected shot index out of range."
-                
-            current_data = self.full_context_df.iloc[self.active_row_idx].to_dict()
-            resolved_dict = resolver.get_resolved_map(current_data, action_config=action_config)
-            
-            val = resolved_dict.get(row_map['Variable'], "ERR")
-            
-            # 3. POLITE FAILURE: Translate the Engine's raw missing codes into human phrases
-            lookup_key = row_map.get('Lookup_Key', 'Unknown')
-            if val == "MISSING_COL":
-                return f"Preview not available: Missing column '{lookup_key}' in Shot data."
-            elif val == "MISSING_SETTING":
-                return f"Preview not available: Missing '{lookup_key}' in Project Settings."
-            elif val in ["SCAN_NOT_FOUND", "RESOLVER_NOT_FOUND"]:
-                return f"Preview not available: Could not locate scan path for this shot."
-            elif val == "MISSING_COMP_PATH":
-                return "Preview not available: 'Output_Template_path' missing in Nuke Config."
-            elif val == "MISSING_COMP_FILE":
-                return "Preview not available: 'Output_Template_file' missing in Nuke Config."
-                
-            return "[ SKIPPED ]" if val == "<<IGNORE>>" else val
-            
-        except Exception as e:
-            # Catch-all for any truly unexpected errors (like unparsed math or bad file formats)
-            return f"Preview not available: {str(e)}"
-    
-    def refresh_previews(self):
-        """Forces the Live Preview column to recalculate and repaint."""
-        # 1. Recalculate the entire Live_Preview column
-        self.df_map['Live_Preview'] = self.df_map.apply(self.mock_resolve, axis=1)
-        
-        # 2. Tell the model exactly which column changed so it redraws
-        if 'Live_Preview' in self.df_map.columns:
-            preview_col_idx = self.df_map.columns.get_loc('Live_Preview')
-            top_left = self.model.index(0, preview_col_idx)
-            bottom_right = self.model.index(self.model.rowCount() - 1, preview_col_idx)
-            self.model.dataChanged.emit(top_left, bottom_right, [Qt.DisplayRole])
-            self.table.viewport().update()
-
-    def execute_template(self, template_data, manager_df, parent_window=None):
-        """Iterates through selected shots and generates Nuke scripts."""
-        selected_rows = manager_df[manager_df['Select'] == True]
-        if selected_rows.empty:
-            return
-
-        mapping_df = pd.read_csv(template_data['Mapping_CSV'], dtype=str).fillna("")
-        resolver = TemplateVariableResolver(self.engine, mapping_df, app_window=self.app)
-        
-        source_nk = PathSwapper.translate(template_data['Source_Path'])
-        output_tpl = template_data['Output_Template']
-        
-        for _, row in selected_rows.iterrows():
-            row_dict = row.to_dict()
-            mapping_dict = resolver.get_resolved_map(row_dict)
-            
-            # Resolve Output Path
-            output_path = output_tpl
-            ctx = {**self.engine.settings, **row_dict}
-            for k in sorted(ctx.keys(), key=len, reverse=True):
-                placeholder = f"{{{k}}}"
-                if placeholder in output_path:
-                    output_path = output_path.replace(placeholder, str(ctx[k]))
-            
-            target_path = PathSwapper.translate(output_path)
-            TextInjectionEngine.inject(source_nk, target_path, mapping_dict)
-
-    def on_cell_edited(self, top_left, bottom_right):
-        """Triggered whenever a cell is finished being edited."""
-        row = top_left.row()
-        col = top_left.column()
-        
-        # We don't want an infinite loop! 
-        # Only recalculate if we edited something OTHER than the preview column itself.
-        preview_col_idx = self.df_map.columns.get_loc('Live_Preview')
-        
-        if col != preview_col_idx:
-            # 1. Grab the updated row data from the DataFrame
-            row_data = self.df_map.iloc[row]
-            
-            # 2. Run the mock_resolve again for this specific row
-            updated_preview = self.mock_resolve(row_data)
-            
-            # 3. Update the DataFrame silently (without triggering another signal yet)
-            self.df_map.iat[row, preview_col_idx] = updated_preview
-            
-            # 4. Tell the model that the PREVIEW cell has changed so it repaints
-            preview_index = self.model.index(row, preview_col_idx)
-            self.model.dataChanged.emit(preview_index, preview_index, [Qt.DisplayRole])
-            
-            # 5. Force the viewport update for the IGNORE grey-out logic
-            self.table.viewport().update()
-
-    def sync_variables_on_disk(self):
-        """Dumb extraction: 4+ uppercase letters. Now fails gracefully if file is missing."""
-        content = ""
-        found_vars = set()
-        
-        # --- SURGICAL FIX: Wrap file I/O in a check ---
-        if os.path.exists(self.template_path):
-            try:
-                with open(self.template_path, 'r') as f:
-                    content = f.read()
-                found_vars = set(re.findall(r'[A-Z]{4,}', content))
-            except Exception as e:
-                print(f"Error reading template file: {e}")
-        else:
-            # If the file doesn't exist, we just proceed with found_vars as an empty set.
-            # This allows the UI to open so the user can fix the path.
-            print(f"Template path not found: {self.template_path}")
-
-        if os.path.exists(self.map_csv_path):
-            df = pd.read_csv(self.map_csv_path, dtype=str).fillna("")
-        else:
-            # Ensure we have the correct columns even if starting fresh
-            df = pd.DataFrame(columns=['Variable', 'Source_Type', 'Lookup_Key'])
-
-        existing = df['Variable'].tolist()
-        new_entries = []
-        for v in found_vars:
-            if v not in existing:
-                # Default new variables to HEADER type
-                new_entries.append({'Variable': v, 'Source_Type': 'HEADER', 'Lookup_Key': v})
-        
-        if new_entries:
-            # Use pd.concat for modern pandas compatibility
-            df = pd.concat([df, pd.DataFrame(new_entries)], ignore_index=True)
-            # Only save if we actually found new things, or if the file didn't exist
-            df.to_csv(self.map_csv_path, index=False)
-        elif not os.path.exists(self.map_csv_path):
-            # Create the empty mapping file if it doesn't exist yet
-            df.to_csv(self.map_csv_path, index=False)
-
-    def save_mapping(self):
-        """Called by the parent NukeSetupDialog to write the CSV."""
-        if 'Live_Preview' in self.df_map.columns:
-            final_df = self.df_map.drop(columns=['Live_Preview'])
-        else:
-            final_df = self.df_map
-            
-        final_df.to_csv(self.map_csv_path, index=False)
-
-class ExecutionPreviewDialog(QDialog):
-    def __init__(self, template_path, output_paths, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("Execution Preview")
-        self.resize(800, 500)
-        
-        layout = QVBoxLayout(self)
-        
-        # 1. Template Information
-        layout.addWidget(QLabel("<b>Source Template:</b>"))
-        lbl_tpl = QLabel(template_path)
-        lbl_tpl.setStyleSheet("color: #2e885a; font-family: 'Courier New', 'Menlo', monospace;")
-        layout.addWidget(lbl_tpl)
-        
-        layout.addSpacing(10)
-        
-        # 2. Output Information
-        layout.addWidget(QLabel(f"<b>The following {len(output_paths)} files will be generated:</b>"))
-        
-        self.list_widget = QListWidget()
-        self.list_widget.setAlternatingRowColors(True)
-        self.list_widget.setStyleSheet("QListWidget { font-family: 'Courier New', 'Menlo', monospace; font-size: 11px; }")
-        for p in output_paths:
-            self.list_widget.addItem(p)
-        layout.addWidget(self.list_widget)
-        
-        # 3. Warning Text
-        lbl_warn = QLabel("<i>Note: Any missing directories in these paths will be created automatically. Existing files will be overwritten.</i>")
-        lbl_warn.setStyleSheet("color: #e6a822;") # Warning orange
-        layout.addWidget(lbl_warn)
-        
-        # 4. Action Buttons
-        self.buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        self.btn_exec = self.buttons.button(QDialogButtonBox.Ok)
-        self.btn_exec.setText("EXECUTE")
-        self.btn_exec.setStyleSheet("background-color: #f37321; color: white; font-weight: bold; padding: 5px 20px;")
-        
-        self.buttons.accepted.connect(self.accept)
-        self.buttons.rejected.connect(self.reject)
-        layout.addWidget(self.buttons)
-
-class NukeEngine:
-    def __init__(self, core_engine, app_window=None):
-        self.engine = core_engine
-        self.app = app_window
-        self.nuke_root = os.path.join(self.engine.root, "Project_Actions", "Nuke")
-        self.master_csv = os.path.join(self.nuke_root, "nuke_templates.csv")
-
-    def get_template_registry(self):
-        if not os.path.exists(self.master_csv): return []
-        df_index = pd.read_csv(self.master_csv, dtype=str).fillna("")
-        registry = []
-
-        for _, row in df_index.iterrows():
-            t_id = row['Template_ID']
-            config_path = os.path.join(self.nuke_root, t_id, "config.csv")
-            
-            if os.path.exists(config_path):
-                df_cfg = pd.read_csv(config_path).fillna("")
-                cfg_dict = dict(zip(df_cfg['Key'], df_cfg['Value']))
-                
-                registry.append({
-                    'Template_ID': t_id,
-                    'Source_Path': cfg_dict.get('Source_NK', ''),
-                    'Mapping_CSV': os.path.join(self.nuke_root, t_id, "mapping.csv"),
-                    'Config_Dict': cfg_dict # We store this to pass to the executor easily
-                })
-        return registry
-    
-    def setup_action(self, template_id, source_path, manager_df, parent_window=None):
-        dlg = NukeSetupDialog(self.engine, template_id, self.nuke_root, manager_df, parent=parent_window)
-        dlg.exec()
-
-    def execute_template(self, template_data, manager_df, parent_window=None):
-        """The Heavy Lifter: Merges paths, resolves variables, and writes .nk files."""
-        # To this safe fallback:
-        selected_rows = manager_df[manager_df['Select'] == True]
-        if selected_rows.empty:
-            if self.app and hasattr(self.app, 'statusBar'):
-                self.app.statusBar().showMessage("No shots selected.", 3000)
-            return
-
-        # 1. Setup Data
-        action_cfg = template_data['Config_Dict']
-        source_nk = PathSwapper.translate(action_cfg.get('Source_NK', ''))
-        out_path_raw = action_cfg.get('Output_Template_path', '')
-        out_file_raw = action_cfg.get('Output_Template_file', '')
-        
-        mapping_df = pd.read_csv(template_data['Mapping_CSV'], dtype=str).fillna("")
-        resolver = TemplateVariableResolver(self.engine, mapping_df, app_window=self.app)
-        
-        # 2. Pre-flight check: Build output paths
-        plan = []
-        for _, row in selected_rows.iterrows():
-            row_dict = row.to_dict()
-            ctx = {**self.engine.settings, **row_dict}
-            
-            # Resolve directory and filename placeholders
-            dir_path = out_path_raw
-            file_name = out_file_raw
-            for k in sorted(ctx.keys(), key=len, reverse=True):
-                ph = f"{{{k}}}"
-                if ph in dir_path: dir_path = dir_path.replace(ph, str(ctx[k]))
-                if ph in file_name: file_name = file_name.replace(ph, str(ctx[k]))
-            
-            # Combine into final absolute path
-            full_target = PathSwapper.translate(os.path.join(dir_path, file_name))
-            plan.append((row_dict, full_target))
-
-        # 3. Show Preview Dialog
-        preview = ExecutionPreviewDialog(source_nk, [p[1] for p in plan], parent=parent_window)
-        if preview.exec() != QDialog.Accepted:
-            return
-
-        # 4. EXECUTION LOOP
-        success_count = 0
-        for row_dict, target_path in plan:
-            try:
-                # Pass the action_cfg dictionary so ACTION_CONFIG and CONFIG_CONCAT work!
-                mapping_dict = resolver.get_resolved_map(row_dict, action_config=action_cfg)
-                
-                if TextInjectionEngine.inject(source_nk, target_path, mapping_dict):
-                    success_count += 1
-            except Exception as e:
-                print(f"FAILED TO GENERATE {target_path}: {e}")
-
-        if self.app and hasattr(self.app, 'statusBar'):
-            self.app.statusBar().showMessage(f"Successfully generated {success_count} Nuke scripts.", 5000)
-
-class NukeSetupDialog(QDialog):
-    def __init__(self, engine, template_id, nuke_root, manager_df, parent=None):
-        super().__init__(parent)
-        # --- PREVIEW CONTEXT SETUP ---
-        self.preview_ctx = {**engine.settings}
-        # Grab the first selected shot to use as our "Preview Truth"
-        selected = manager_df[manager_df['Select'] == True]
-        if not selected.empty:
-            self.preview_ctx.update(selected.iloc[0].to_dict())
-        elif not manager_df.empty:
-            self.preview_ctx.update(manager_df.iloc[0].to_dict())
-
-        self.engine = engine
-        self.template_id = template_id
-        self.dir_path = os.path.join(nuke_root, template_id)
-        self.config_path = os.path.join(self.dir_path, "config.csv")
-        self.mapping_path = os.path.join(self.dir_path, "mapping.csv")
-        
-        self.setWindowTitle(f"Setup Nuke Action: {template_id}")
-        self.resize(1200, 1000)
-        
-        layout = QVBoxLayout(self)
-
-        # --- TOP: DYNAMIC CONFIG SECTION ---
-        self.path_group = QFrame()
-        self.path_group.setStyleSheet("QFrame { background-color: #2b2b2b; padding: 10px; border-radius: 4px; }")
-        self.path_layout = QVBoxLayout(self.path_group)
-        
-        # This dict will hold our QLineEdit references: { "KeyName": QLineEdit_Object }
-        self.config_widgets = {}
-        self.refresh_config_ui()
-        
-        layout.addWidget(self.path_group)
-
-        # --- MIDDLE: MAPPING TABLE ---
-        self.mapping_table = TemplateMappingWidget(
-            self.engine, template_id, self.get_config_val('Source_NK'), 
-            self.mapping_path, manager_df, parent=self  # <--- SURGICAL FIX: changed source_dfs to manager_df
-        )
-        layout.addWidget(self.mapping_table)
-
-        # --- BOTTOM: BUTTONS ---
-        btns = QHBoxLayout()
-        self.btn_save = QPushButton("Save")
-        self.btn_save_exit = QPushButton("Save & Exit")
-        self.btn_cancel = QPushButton("Cancel")
-        
-        self.btn_save.clicked.connect(self.save_all)
-        self.btn_save_exit.clicked.connect(lambda: self.save_all(close=True))
-        self.btn_cancel.clicked.connect(self.reject)
-        
-        btns.addStretch(); btns.addWidget(self.btn_save); btns.addWidget(self.btn_save_exit); btns.addWidget(self.btn_cancel)
-        layout.addLayout(btns)
-
-    def keyPressEvent(self, event):
-        """Catches Enter to gracefully finish text editing without triggering buttons."""
-        if event.key() in (Qt.Key_Return, Qt.Key_Enter):
-            focused = self.focusWidget()
-            
-            # 1. If we are in a text box, 'Enter' just finishes the edit and drops focus
-            if isinstance(focused, QLineEdit):
-                focused.clearFocus()
-                event.accept() # Swallow the key so the dialog doesn't close
-                return
-                
-            # 2. If the user explicitly Tabbed to a button (like Save) and hit Enter, let it click
-            elif isinstance(focused, QPushButton):
-                super().keyPressEvent(event)
-                return
-                
-            # 3. If focused on anything else (or nothing), swallow the Enter key safely
-            event.accept()
-            return
-
-        # Let all other keys (Escape, typing, etc.) behave normally
-        super().keyPressEvent(event)
-        
-    def refresh_config_ui(self):
-        # --- THE TD CONTROL PANEL ---
-        FILE_KEYS = ["Source_NK", "Overlay_TPL"]
-        DIR_KEYS  = ["nope", "not_this", "proxy_that"]
-        BUILD_PREVIEW = [
-            "Output_Template_path", "Output_Template_file", 
-            "nuke_comp_render_path", "nuke_comp_render_filename"
-        ]
-        
-        # 1. Clear existing UI
-        for i in reversed(range(self.path_layout.count())): 
-            item = self.path_layout.itemAt(i)
-            if item.widget(): item.widget().setParent(None)
-            elif item.layout():
-                while item.layout().count():
-                    item.layout().itemAt(0).widget().setParent(None)
-
-        self.config_widgets = {}
-        self.preview_labels = {} # NEW: Keep track of preview labels
-
-        # 2. Load and Build
-        df = pd.read_csv(self.config_path).fillna("") if os.path.exists(self.config_path) else pd.DataFrame(columns=["Key", "Value"])
-
-        for _, row in df.iterrows():
-            key, val = row['Key'], row['Value']
-            
-            # --- MAIN ROW ---
-            row_layout = QHBoxLayout()
-            lbl = QLabel(f"{key}:")
-            lbl.setFixedWidth(250)
-            edit = QLineEdit(str(val))
-            self.config_widgets[key] = edit
-            
-            row_layout.addWidget(lbl)
-
-            if key in FILE_KEYS or key in DIR_KEYS:
-                btn_browse = QPushButton("Choose...")
-                btn_browse.setFixedWidth(80)
-                is_dir = key in DIR_KEYS
-                btn_browse.clicked.connect(lambda chk=False, e=edit, k=key, d=is_dir: self.browse_explicit(e, k, d))
-                row_layout.addWidget(btn_browse)
-
-            row_layout.addWidget(edit)
-            self.path_layout.addLayout(row_layout)
-
-            # --- PREVIEW ROW ---
-            if key in BUILD_PREVIEW:
-                preview_layout = QHBoxLayout()
-                
-                # Spacer label to push the preview text perfectly under the QLineEdit
-                spacer_lbl = QLabel("")
-                spacer_lbl.setFixedWidth(250)
-                if key in FILE_KEYS or key in DIR_KEYS:
-                    spacer_lbl.setFixedWidth(250 + 85) # Accommodate the 'Choose...' button width
-                    
-                lbl_preview = QLabel("Preview resolving...")
-                lbl_preview.setStyleSheet("color: #777777; font-family: 'Courier New', 'Menlo', monospace; font-size: 11px;")
-                
-                self.preview_labels[key] = lbl_preview
-                preview_layout.addWidget(spacer_lbl)
-                preview_layout.addWidget(lbl_preview)
-                self.path_layout.addLayout(preview_layout)
-
-                # Connect the live update signal to a centralized handler
-                edit.textChanged.connect(lambda text, k=key: self.on_config_edited(k, text))
-                
-                # Fire it once to set the initial preview state
-                self.update_config_preview(key, str(val))
-
-    def on_config_edited(self, key, text):
-        """Handles updating both the local label and the mapping table."""
-        # 1. Update the little preview label beneath the text box
-        self.update_config_preview(key, text)
-        
-        # 2. Force the mapping table to recalculate its live preview column
-        if hasattr(self, 'mapping_table'):
-            self.mapping_table.refresh_previews()
-            
-    def get_config_val(self, key):
-        """Helper for the mapping table to find the Source NK path."""
-        if os.path.exists(self.config_path):
-            df = pd.read_csv(self.config_path)
-            match = df[df['Key'] == key]
-            if not match.empty: return match.iloc[0]['Value']
-        return ""
-
-    def get_live_config(self):
-        """Returns the current state of the UI text boxes as a dictionary."""
-        return {key: edit.text() for key, edit in self.config_widgets.items()}
-    
-    def update_config_preview(self, key, text):
-        """Resolves the string live as the user types, using the first selected shot."""
-        if key not in self.preview_labels: return
-        
-        template = text
-        
-        # 1. Handle ALL Padding Exceptions
-        for k, v in self.preview_ctx.items():
-            if str(k).startswith('padding_') and f"{{{k}}}" in template:
-                pad_nom = PaddingNomBuilder.build(v, style="printf")
-                template = template.replace(f"{{{k}}}", pad_nom)
-            
-        # 2. Resolve Standard Placeholders
-        for k in sorted(self.preview_ctx.keys(), key=len, reverse=True):
-            placeholder = f"{{{k}}}"
-            if placeholder in template:
-                template = template.replace(placeholder, str(self.preview_ctx[k]))
-                
-        # 3. Update UI
-        self.preview_labels[key].setText(f"↳ {template}")
-
-    def browse_explicit(self, target_edit, key_name, is_dir):
-        """No meatballs, just a binary path picker."""
-        if is_dir:
-            path = QFileDialog.getExistingDirectory(self, f"Select Folder for {key_name}")
-        else:
-            path, _ = QFileDialog.getOpenFileName(self, f"Select File for {key_name}", "", "All Files (*.*)")
-            
-        if path:
-            target_edit.setText(path)
-
-    def save_all(self, close=False):
-        """Dumb save: Just takes what's in the widgets and puts it in the CSV."""
-        save_data = []
-        for key, edit in self.config_widgets.items():
-            save_data.append([key, edit.text()])
-            
-        df = pd.DataFrame(save_data, columns=["Key", "Value"])
-        df.to_csv(self.config_path, index=False)
-        
-        self.mapping_table.save_mapping()
-        
-        if close: self.accept()
-
-class ProjectManagerDialog(QDialog):
-    def __init__(self, engine, parent=None):
-        super().__init__(parent)
-        self.engine = engine
-        self.parent_app = parent 
-        
-        # Instantiate the dedicated Engine
-        self.nuke_engine = NukeEngine(self.engine, app_window=self.parent_app)
-        
-        self.project_name = getattr(parent, 'project_label', 'Generic Project')
-        self.setWindowTitle(f"[{self.project_name}] - Project Manager")
-        self.resize(1100, 700)
-        
-        # --- SURGICAL FIX: Keep the UI strictly to df_shots ---
-        if hasattr(self.parent_app, 'df_shots'):
-            self.df_manager = self.parent_app.df_shots.copy()
-        else:
-            self.df_manager = pd.DataFrame()
-            
-        if 'Select' not in self.df_manager.columns:
-            self.df_manager.insert(0, 'Select', False)
-
-        layout = QVBoxLayout(self)
-
-        # --- 1. APP ACTIONS SECTION (TOP) ---
-        actions_group = QFrame()
-        actions_group.setFrameShape(QFrame.StyledPanel)
-        actions_group.setStyleSheet("QFrame { background-color: #2b2b2b; border-radius: 5px; }")
-        actions_main_layout = QVBoxLayout(actions_group)
-        
-        actions_main_layout.addWidget(QLabel("<b>App Actions</b>"))
-        
-        self.actions_layout = QHBoxLayout()
-        # Dynamically build blocks from the Nuke Master Log
-        self.build_nuke_action_blocks(self.actions_layout)
-        
-        # Stretch to keep blocks to the left
-        self.actions_layout.addStretch()
-        actions_main_layout.addLayout(self.actions_layout)
-        
-        layout.addWidget(actions_group)
-
-        # --- 2. FILTERS ---
-        filter_bar = QHBoxLayout()
-        self.seq_filter = QComboBox()
-        self.seq_filter.addItem("All")
-        if not self.df_manager.empty:
-            seqs = sorted([s for s in self.df_manager['SEQUENCE'].unique() if s])
-            self.seq_filter.addItems(seqs)
-        self.seq_filter.currentTextChanged.connect(self.apply_filters)
-        
-        btn_all = QPushButton("Select All")
-        btn_none = QPushButton("Select None")
-        btn_all.setFocusPolicy(Qt.NoFocus)
-        btn_none.setFocusPolicy(Qt.NoFocus)
-        btn_all.clicked.connect(lambda: self.toggle_selection(True))
-        btn_none.clicked.connect(lambda: self.toggle_selection(False))
-
-        filter_bar.addWidget(QLabel("Sequence:"))
-        filter_bar.addWidget(self.seq_filter)
-        filter_bar.addStretch()
-        filter_bar.addWidget(btn_all); filter_bar.addWidget(btn_none)
-        layout.addLayout(filter_bar)
-
-        # --- 3. THE TABLE ---
-        self.table = QTableView()
-        self.model = SelectionModel(self.df_manager, self) 
-        self.proxy = QSortFilterProxyModel()
-        self.proxy.setSourceModel(self.model)
-        self.table.setModel(self.proxy)
-
-        self.table.setSelectionBehavior(QTableView.SelectRows)
-        self.table.setSelectionMode(QTableView.MultiSelection) 
-        self.table.setEditTriggers(QTableView.NoEditTriggers)
-        self.table.setSortingEnabled(True)
-        self.table.setStyleSheet("QTableView::item:selected { background-color: #2e5a88; color: white; }")
-        self.table.selectionModel().selectionChanged.connect(self.sync_checkboxes_to_selection)
-
-        layout.addWidget(self.table)
-        
-        # Final UI Cleanup
-        self.table.horizontalHeader().setStretchLastSection(True)
-        self.table.resizeColumnsToContents()
-
-    def get_unified_execution_data(self):
-        """Safely merges UI selections with master paths without row explosion."""
-        if hasattr(self.parent_app, 'df_master') and not self.df_manager.empty:
-            # --- THE FIX: Strip master down to 1 row per shot before merging ---
-            master = self.parent_app.df_master.drop_duplicates(subset=['SHOTNAME']).copy()
-            
-            unified_df = pd.merge(self.df_manager, master, on='SHOTNAME', how='left', suffixes=('', '_dup'))
-            return unified_df.loc[:, ~unified_df.columns.str.endswith('_dup')]
-            
-        return self.df_manager.copy()
-    
-    def build_nuke_action_blocks(self, layout):
-        """Creates a UI block for every template registered in the master log."""
-        templates = self.nuke_engine.get_template_registry()
-        
-        # Grab the Master DF once for the whole builder
-        # Note: Your AssetManager calls it 'df_master'
-        master_df = self.parent_app.df_master if hasattr(self.parent_app, 'df_master') else None
-
-        if not templates:
-            layout.addWidget(QLabel("<i>No Nuke Templates registered in Project_Actions</i>"))
-            return
-
-        for t_data in templates:
-            t_id = t_data['Template_ID']
-            s_path = t_data['Source_Path']
-            
-            block = QVBoxLayout()
-            block.setContentsMargins(5, 5, 5, 5)
-            
-            lbl = QLabel(f"<b>{t_id.replace('_', ' ').title()}</b>")
-            lbl.setAlignment(Qt.AlignCenter)
-            block.addWidget(lbl)
-            
-            btn_setup = QPushButton("⚙️ Setup")
-            btn_setup.setFixedWidth(140)
-            
-            # THE FIX: Pass master_df through the lambda so it's available for the mapper
-            # Remove mdf=master_df from the lambda
-            btn_setup.clicked.connect(lambda chk=False, tid=t_id, sp=s_path: 
-                                      self.action_nuke_config(tid, sp))
-            
-            btn_exec = QPushButton("🚀 Execute")
-            btn_exec.setFixedWidth(140)
-            btn_exec.setStyleSheet("background-color: #f37321; color: white; font-weight: bold;")
-            btn_exec.clicked.connect(lambda chk=False, td=t_data: 
-                                     self.action_nuke_execute(td))
-            
-            block.addWidget(btn_setup)
-            block.addWidget(btn_exec)
-            layout.addLayout(block)
-            layout.addSpacing(15)
-
-    def action_nuke_config(self, template_id, source_path):
-        self.nuke_engine.setup_action(
-            template_id, 
-            source_path, 
-            self.get_unified_execution_data(), # Pass the Big Kahuna here
-            parent_window=self
-        )
-
-    def action_nuke_execute(self, template_data):
-        self.nuke_engine.execute_template(
-            template_data, 
-            self.get_unified_execution_data(), # Pass the Big Kahuna here
-            parent_window=self
-        )
-
-    def apply_filters(self, text):
-        self._is_filtering = True 
-        if text != "All":
-            mask = self.df_manager['SEQUENCE'] != text
-            self.df_manager.loc[mask, 'Select'] = False
-        col_idx = self.df_manager.columns.get_loc("SEQUENCE")
-        self.proxy.setFilterKeyColumn(col_idx)
-        self.proxy.setFilterFixedString("" if text == "All" else text)
-        self._is_filtering = False
-        self.model.beginResetModel(); self.model.endResetModel()
-        self.restore_selections_from_data()
-
-    def restore_selections_from_data(self):
-        if not hasattr(self, 'table'): return
-        self.table.selectionModel().blockSignals(True)
-        self.table.clearSelection()
-        for row in range(self.proxy.rowCount()):
-            source_idx = self.proxy.mapToSource(self.proxy.index(row, 0))
-            if source_idx.isValid() and self.model._data.iat[source_idx.row(), 0] == True:
-                self.table.selectRow(row)
-        self.table.selectionModel().blockSignals(False)
-
-    def sync_checkboxes_to_selection(self, selected, deselected):
-        if getattr(self, '_is_filtering', False): return 
-        for sel_range in selected:
-            for index in sel_range.indexes():
-                if index.column() == 0: self.model.setData(self.proxy.mapToSource(index), True, Qt.CheckStateRole)
-        for desel_range in deselected:
-            for index in desel_range.indexes():
-                if index.column() == 0: self.model.setData(self.proxy.mapToSource(index), False, Qt.CheckStateRole)
-
-    def toggle_selection(self, state):
-        if state: self.table.selectAll()
-        else: self.table.clearSelection()
-
 class NotesEngine:
     def __init__(self, engine, asset_row_data=None):
         self.engine = engine
@@ -6888,6 +5956,1118 @@ class DataSourcesDock(QDockWidget):
                 # --- ALWAYS RESTORE THE CURSOR, even if it crashes ---
                 QApplication.restoreOverrideCursor()
 
+class PaddingNomBuilder:
+    @staticmethod
+    def build(raw_pad, style="printf"):
+        """
+        The Single Source of Truth for VFX sequence padding formatting.
+        Kills NaNs, fixes single digits, and translates to app-specific nomenclature.
+        """
+        # 1. The Sanity Check (Kill NaN/Ghosts)
+        padding_val = str(raw_pad).strip() if pd.notna(raw_pad) and str(raw_pad).strip() else ""
+        
+        # 2. The Strict Formatter (e.g., '4' -> '04')
+        if padding_val.isdigit() and len(padding_val) == 1:
+            padding_val = f"0{padding_val}"
+
+        # 3. The Output Switchboard
+        if style == "printf":
+            # Nuke/Maya/Standard C-style: %04d
+            return f"%{padding_val}d" if padding_val else "%d"
+            
+        elif style == "hash":
+            # Nuke alt/RV style: ####
+            if not padding_val: return "#"
+            # Strip the '0' prefix for the multiplier to avoid octal math weirdness, default to 1
+            return "#" * int(padding_val.lstrip('0') or 1)
+            
+        elif style == "houdini":
+            # Houdini style: $F4
+            if not padding_val: return "$F"
+            return f"$F{padding_val.lstrip('0')}"
+            
+        else:
+            # Failure-centric: Unrecognized style returns the raw parsed value
+            return padding_val
+       
+class TextInjectionEngine:
+    @staticmethod
+    def extract_variables(filepath):
+        """Finds any contiguous block of 4+ uppercase letters."""
+        if not os.path.exists(filepath): 
+            return set()
+            
+        with open(filepath, 'r') as f:
+            content = f.read()
+        
+        # Simple, contiguous uppercase lookup
+        matches = set(re.findall(r'[A-Z]{4,}', content))
+        return matches
+
+    @staticmethod
+    def inject(source_path, target_path, mapping_dict):
+        """Performs replacement, skipping variables set to IGNORE."""
+        with open(source_path, 'r') as f:
+            content = f.read()
+
+        # Sort by length descending to prevent partial matches (e.g., 'SHOT' in 'SHOTNAME')
+        for var in sorted(mapping_dict.keys(), key=len, reverse=True):
+            val = mapping_dict[var]
+            
+            # If the UI set this to IGNORE, we do nothing to this string
+            if val == "<<IGNORE>>":
+                continue
+                
+            content = content.replace(var, str(val))
+
+        os.makedirs(os.path.dirname(target_path), exist_ok=True)
+        with open(target_path, 'w') as f:
+            f.write(content)
+        return True
+
+class TemplateVariableResolver:
+    def __init__(self, engine, mapping_df, app_window=None):
+        self.engine = engine
+        self.mapping_df = mapping_df # Now takes a DF directly
+        self.app = app_window
+
+    def get_resolved_map(self, row_dict, action_config=None):
+        """THE ONE SOURCE OF TRUTH: Resolves a single row of data."""
+        if action_config is None: action_config = {}
+        final_map = {}
+        
+        for _, row in self.mapping_df.iterrows():
+            var = row['Variable']
+            src = row['Source_Type']
+            key = str(row['Lookup_Key']).strip()
+            val = "UNRESOLVED"
+
+            if src == "IGNORE":
+                val = "<<IGNORE>>"
+            elif src == "HEADER":
+                val = row_dict.get(key, "MISSING_COL")
+            elif src == "CONFIG":
+                val = self.engine.settings.get(key, "MISSING_SETTING")
+            elif src == "CONSTANT":
+                val = key
+            elif src == "SCAN":
+                shot = row_dict.get('SHOTNAME')
+                if self.app and hasattr(self.app, 'resolve_scan_path'):
+                    val = self.app.resolve_scan_path(shot) or "SCAN_NOT_FOUND"
+                else:
+                    val = "RESOLVER_NOT_FOUND"
+            
+            # --- THE GRAVITY INJECTION: EXPLICIT NUKE_WRITE ---
+            elif src == "NUKE_WRITE":
+                r_path = action_config.get('nuke_comp_render_path', "MISSING_COMP_PATH")
+                r_file = action_config.get('nuke_comp_render_filename', "MISSING_COMP_FILE")
+                
+                template = f"{r_path}/{r_file}".replace("//", "/")
+                
+                # --- SURGICAL PADDING: Catch ALL padding variables ---
+                for k, v in self.engine.settings.items():
+                    if k.startswith('padding_') and f"{{{k}}}" in template:
+                        padding_nomenclature = PaddingNomBuilder.build(v, style="printf")
+                        template = template.replace(f"{{{k}}}", padding_nomenclature)
+                
+                # Resolve the remaining placeholders ({SHOTNAME}, {data_root}, etc.)
+                ctx = {**self.engine.settings, **row_dict}
+                for k in sorted(ctx.keys(), key=len, reverse=True):
+                    placeholder = f"{{{k}}}"
+                    if placeholder in template:
+                        template = template.replace(placeholder, str(ctx[k]))
+                val = template
+
+            elif src == "NAMING":
+                template = self.engine.naming_templates.get(key, "")
+                ctx = {**self.engine.settings, **row_dict}
+                for k in sorted(ctx.keys(), key=len, reverse=True):
+                    placeholder = f"{{{k}}}"
+                    if placeholder in template:
+                        template = template.replace(placeholder, str(ctx[k]))
+                val = template
+
+            if isinstance(val, str) and src != "IGNORE":
+                val = val.replace("\\", "/")
+            final_map[var] = val
+            
+        return final_map
+
+class TemplateMappingWidget(QWidget):
+    # SURGICAL FIX: Change 'source_dfs' to 'manager_df' in the signature
+    def __init__(self, engine, template_id, template_path, map_csv_path, manager_df, active_shotname=None, parent=None):
+        super().__init__(parent)
+        self.engine = engine
+        self.template_path = template_path
+        self.map_csv_path = map_csv_path
+        
+        # --- SURGICAL FIX: The data is already unified. Just copy it. ---
+        self.full_context_df = manager_df.copy()
+        
+        # Find the index for our preview shot in the DF
+        self.active_row_idx = 0
+        if active_shotname:
+            matches = self.full_context_df.index[self.full_context_df['SHOTNAME'] == active_shotname].tolist()
+            if matches:
+                self.active_row_idx = matches[0]
+        
+        self.setWindowTitle(f"Template Mapping: {template_id}")
+        self.resize(1200, 600)
+        
+        layout = QVBoxLayout(self)
+
+        # 1. DATA PREP: Sync variables before loading
+        self.sync_variables_on_disk()
+        
+        # 2. LOAD DF
+        self.df_map = pd.read_csv(self.map_csv_path, dtype=str).fillna("")
+        
+        # 3. ADD LIVE PREVIEW
+        self.df_map['Live_Preview'] = self.df_map.apply(self.mock_resolve, axis=1)
+
+        # 4. TABLE SETUP
+        self.table = QTableView()
+        self.table.setAlternatingRowColors(True)
+        self.table.setEditTriggers(QTableView.AllEditTriggers)
+        
+        self.model = PandasModel(self.df_map, self, read_only=False)
+        self.model.flags = self.mapping_table_flags 
+        self.table.setModel(self.model)
+
+        self.model.dataChanged.connect(self.on_cell_edited)
+
+        # 5. APPLY DELEGATE TO ALL COLUMNS
+        # SURGICAL FIX: Removed generic options, added strict NUKE_WRITE
+        self.options = ["HEADER", "CONFIG", "SCAN", "NAMING", "CONSTANT", "IGNORE", "NUKE_WRITE"]
+        
+        self.row_delegate = CSVEditorDelegate(self.options, self.table)
+        
+        for i in range(self.model.columnCount()):
+            self.table.setItemDelegateForColumn(i, self.row_delegate)
+
+        layout.addWidget(QLabel(f"<b>Template:</b> {template_path}"))
+        layout.addWidget(self.table)
+
+        self.table.resizeColumnsToContents()
+
+    def keyPressEvent(self, event):
+        """Surgically intercepts Copy before the Editor can steal the focus."""
+        
+        # 1. Catch the Copy Command (Cmd+C / Ctrl+C)
+        if event.matches(QKeySequence.Copy):
+            # 2. FORCE-CLOSE any active editor in the table 
+            # This prevents the "last cell is currently being edited" ghosting.
+            if self.table.indexWidget(self.table.currentIndex()):
+                self.table.commitData(self.table.indexWidget(self.table.currentIndex()))
+            
+            # 3. Perform the centralized copy
+            ClipboardHelper.copy_table_selection(self.table)
+            
+            # 4. Optional: Feedback via status bar
+            curr = self
+            while curr:
+                if hasattr(curr, 'statusBar') and curr.statusBar():
+                    curr.statusBar().showMessage("Copied selection to clipboard", 2000)
+                    break
+                curr = curr.parent()
+            
+            # IMPORTANT: Accept the event so it doesn't trigger the default Qt edit behavior
+            event.accept()
+            return 
+
+        # Let all other keys (Enter, Arrows, etc.) behave normally
+        super().keyPressEvent(event)
+
+    def mapping_table_flags(self, index):
+        if not index.isValid(): return Qt.NoItemFlags
+        col_name = self.df_map.columns[index.column()]
+        
+        # 1. Hard Locks
+        if col_name in ['Variable', 'Live_Preview']:
+            return Qt.ItemIsEnabled | Qt.ItemIsSelectable
+            
+        # 2. Lookup_Key is ALWAYS editable (Failure-centric: User can type notes if they want)
+        # It will just be Greyed Out visually if Source is SCAN to show it's redundant.
+        return Qt.ItemIsEnabled | Qt.ItemIsSelectable | Qt.ItemIsEditable
+
+    def mock_resolve(self, row_map):
+        """Wrapper that uses the REAL TemplateVariableResolver with polite failure handling."""
+        
+        # 1. POLITE FAILURE: Check if we actually have any shots loaded in the Asset Manager
+        if self.full_context_df.empty:
+            return "Preview not available: No shot data loaded."
+
+        app_window = None
+        curr = self
+        while curr:
+            if hasattr(curr, 'resolve_scan_path'):
+                app_window = curr
+                break
+            curr = curr.parent()
+
+        # Try the LIVE UI first, fallback to disk
+        action_config = {}
+        if hasattr(self.parent(), 'get_live_config'):
+            action_config = self.parent().get_live_config()
+        else:
+            config_path = os.path.join(os.path.dirname(self.map_csv_path), "config.csv")
+            if os.path.exists(config_path):
+                df_cfg = pd.read_csv(config_path).fillna("")
+                action_config = dict(zip(df_cfg['Key'], df_cfg['Value']))
+
+        resolver = TemplateVariableResolver(self.engine, pd.DataFrame([row_map]), app_window=app_window)
+        
+        try:
+            # 2. POLITE FAILURE: Ensure the active row index is actually valid
+            if self.active_row_idx >= len(self.full_context_df):
+                return "Preview not available: Selected shot index out of range."
+                
+            current_data = self.full_context_df.iloc[self.active_row_idx].to_dict()
+            resolved_dict = resolver.get_resolved_map(current_data, action_config=action_config)
+            
+            val = resolved_dict.get(row_map['Variable'], "ERR")
+            
+            # 3. POLITE FAILURE: Translate the Engine's raw missing codes into human phrases
+            lookup_key = row_map.get('Lookup_Key', 'Unknown')
+            if val == "MISSING_COL":
+                return f"Preview not available: Missing column '{lookup_key}' in Shot data."
+            elif val == "MISSING_SETTING":
+                return f"Preview not available: Missing '{lookup_key}' in Project Settings."
+            elif val in ["SCAN_NOT_FOUND", "RESOLVER_NOT_FOUND"]:
+                return f"Preview not available: Could not locate scan path for this shot."
+            elif val == "MISSING_COMP_PATH":
+                return "Preview not available: 'Output_Template_path' missing in Nuke Config."
+            elif val == "MISSING_COMP_FILE":
+                return "Preview not available: 'Output_Template_file' missing in Nuke Config."
+                
+            return "[ SKIPPED ]" if val == "<<IGNORE>>" else val
+            
+        except Exception as e:
+            # Catch-all for any truly unexpected errors (like unparsed math or bad file formats)
+            return f"Preview not available: {str(e)}"
+    
+    def refresh_previews(self):
+        """Forces the Live Preview column to recalculate and repaint."""
+        # 1. Recalculate the entire Live_Preview column
+        self.df_map['Live_Preview'] = self.df_map.apply(self.mock_resolve, axis=1)
+        
+        # 2. Tell the model exactly which column changed so it redraws
+        if 'Live_Preview' in self.df_map.columns:
+            preview_col_idx = self.df_map.columns.get_loc('Live_Preview')
+            top_left = self.model.index(0, preview_col_idx)
+            bottom_right = self.model.index(self.model.rowCount() - 1, preview_col_idx)
+            self.model.dataChanged.emit(top_left, bottom_right, [Qt.DisplayRole])
+            self.table.viewport().update()
+
+    def execute_template(self, template_data, manager_df, parent_window=None):
+        """Iterates through selected shots and generates Nuke scripts."""
+        selected_rows = manager_df[manager_df['Select'] == True]
+        if selected_rows.empty:
+            return
+
+        mapping_df = pd.read_csv(template_data['Mapping_CSV'], dtype=str).fillna("")
+        resolver = TemplateVariableResolver(self.engine, mapping_df, app_window=self.app)
+        
+        source_nk = PathSwapper.translate(template_data['Source_Path'])
+        output_tpl = template_data['Output_Template']
+        
+        for _, row in selected_rows.iterrows():
+            row_dict = row.to_dict()
+            mapping_dict = resolver.get_resolved_map(row_dict)
+            
+            # Resolve Output Path
+            output_path = output_tpl
+            ctx = {**self.engine.settings, **row_dict}
+            for k in sorted(ctx.keys(), key=len, reverse=True):
+                placeholder = f"{{{k}}}"
+                if placeholder in output_path:
+                    output_path = output_path.replace(placeholder, str(ctx[k]))
+            
+            target_path = PathSwapper.translate(output_path)
+            TextInjectionEngine.inject(source_nk, target_path, mapping_dict)
+
+    def on_cell_edited(self, top_left, bottom_right):
+        """Triggered whenever a cell is finished being edited."""
+        row = top_left.row()
+        col = top_left.column()
+        
+        # We don't want an infinite loop! 
+        # Only recalculate if we edited something OTHER than the preview column itself.
+        preview_col_idx = self.df_map.columns.get_loc('Live_Preview')
+        
+        if col != preview_col_idx:
+            # 1. Grab the updated row data from the DataFrame
+            row_data = self.df_map.iloc[row]
+            
+            # 2. Run the mock_resolve again for this specific row
+            updated_preview = self.mock_resolve(row_data)
+            
+            # 3. Update the DataFrame silently (without triggering another signal yet)
+            self.df_map.iat[row, preview_col_idx] = updated_preview
+            
+            # 4. Tell the model that the PREVIEW cell has changed so it repaints
+            preview_index = self.model.index(row, preview_col_idx)
+            self.model.dataChanged.emit(preview_index, preview_index, [Qt.DisplayRole])
+            
+            # 5. Force the viewport update for the IGNORE grey-out logic
+            self.table.viewport().update()
+
+    def sync_variables_on_disk(self):
+        """Dumb extraction: 4+ uppercase letters. Now fails gracefully if file is missing."""
+        content = ""
+        found_vars = set()
+        
+        # --- SURGICAL FIX: Wrap file I/O in a check ---
+        if os.path.exists(self.template_path):
+            try:
+                with open(self.template_path, 'r') as f:
+                    content = f.read()
+                found_vars = set(re.findall(r'[A-Z]{4,}', content))
+            except Exception as e:
+                print(f"Error reading template file: {e}")
+        else:
+            # If the file doesn't exist, we just proceed with found_vars as an empty set.
+            # This allows the UI to open so the user can fix the path.
+            print(f"Template path not found: {self.template_path}")
+
+        if os.path.exists(self.map_csv_path):
+            df = pd.read_csv(self.map_csv_path, dtype=str).fillna("")
+        else:
+            # Ensure we have the correct columns even if starting fresh
+            df = pd.DataFrame(columns=['Variable', 'Source_Type', 'Lookup_Key'])
+
+        existing = df['Variable'].tolist()
+        new_entries = []
+        for v in found_vars:
+            if v not in existing:
+                # Default new variables to HEADER type
+                new_entries.append({'Variable': v, 'Source_Type': 'HEADER', 'Lookup_Key': v})
+        
+        if new_entries:
+            # Use pd.concat for modern pandas compatibility
+            df = pd.concat([df, pd.DataFrame(new_entries)], ignore_index=True)
+            # Only save if we actually found new things, or if the file didn't exist
+            df.to_csv(self.map_csv_path, index=False)
+        elif not os.path.exists(self.map_csv_path):
+            # Create the empty mapping file if it doesn't exist yet
+            df.to_csv(self.map_csv_path, index=False)
+
+    def save_mapping(self):
+        """Called by the parent NukeSetupDialog to write the CSV."""
+        if 'Live_Preview' in self.df_map.columns:
+            final_df = self.df_map.drop(columns=['Live_Preview'])
+        else:
+            final_df = self.df_map
+            
+        final_df.to_csv(self.map_csv_path, index=False)
+
+class ExecutionPreviewDialog(QDialog):
+    def __init__(self, template_path, output_paths, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Execution Preview")
+        self.resize(800, 500)
+        
+        layout = QVBoxLayout(self)
+        
+        # 1. Template Information
+        layout.addWidget(QLabel("<b>Source Template:</b>"))
+        lbl_tpl = QLabel(template_path)
+        lbl_tpl.setStyleSheet("color: #2e885a; font-family: 'Courier New', 'Menlo', monospace;")
+        layout.addWidget(lbl_tpl)
+        
+        layout.addSpacing(10)
+        
+        # 2. Output Information
+        layout.addWidget(QLabel(f"<b>The following {len(output_paths)} files will be generated:</b>"))
+        
+        self.list_widget = QListWidget()
+        self.list_widget.setAlternatingRowColors(True)
+        self.list_widget.setStyleSheet("QListWidget { font-family: 'Courier New', 'Menlo', monospace; font-size: 11px; }")
+        for p in output_paths:
+            self.list_widget.addItem(p)
+        layout.addWidget(self.list_widget)
+        
+        # 3. Warning Text
+        lbl_warn = QLabel("<i>Note: Any missing directories in these paths will be created automatically. Existing files will be overwritten.</i>")
+        lbl_warn.setStyleSheet("color: #e6a822;") # Warning orange
+        layout.addWidget(lbl_warn)
+        
+        # 4. Action Buttons
+        self.buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        self.btn_exec = self.buttons.button(QDialogButtonBox.Ok)
+        self.btn_exec.setText("EXECUTE")
+        self.btn_exec.setStyleSheet("background-color: #f37321; color: white; font-weight: bold; padding: 5px 20px;")
+        
+        self.buttons.accepted.connect(self.accept)
+        self.buttons.rejected.connect(self.reject)
+        layout.addWidget(self.buttons)
+
+class NukeEngine:
+    def __init__(self, core_engine, app_window=None):
+        self.engine = core_engine
+        self.app = app_window
+        self.nuke_root = os.path.join(self.engine.root, "Project_Actions", "Nuke")
+        self.master_csv = os.path.join(self.nuke_root, "nuke_templates.csv")
+
+    def get_template_registry(self):
+        if not os.path.exists(self.master_csv): return []
+        df_index = pd.read_csv(self.master_csv, dtype=str).fillna("")
+        registry = []
+
+        for _, row in df_index.iterrows():
+            t_id = row['Template_ID']
+            config_path = os.path.join(self.nuke_root, t_id, "config.csv")
+            
+            if os.path.exists(config_path):
+                df_cfg = pd.read_csv(config_path).fillna("")
+                cfg_dict = dict(zip(df_cfg['Key'], df_cfg['Value']))
+                
+                registry.append({
+                    'Template_ID': t_id,
+                    'Source_Path': cfg_dict.get('Source_NK', ''),
+                    'Mapping_CSV': os.path.join(self.nuke_root, t_id, "mapping.csv"),
+                    'Config_Dict': cfg_dict # We store this to pass to the executor easily
+                })
+        return registry
+    
+    def setup_action(self, template_id, source_path, manager_df, parent_window=None):
+        dlg = NukeSetupDialog(self.engine, template_id, self.nuke_root, manager_df, parent=parent_window)
+        dlg.exec()
+
+    def execute_template(self, template_data, manager_df, parent_window=None):
+        """The Heavy Lifter: Merges paths, resolves variables, and writes .nk files."""
+        # To this safe fallback:
+        selected_rows = manager_df[manager_df['Select'] == True]
+        if selected_rows.empty:
+            if self.app and hasattr(self.app, 'statusBar'):
+                self.app.statusBar().showMessage("No shots selected.", 3000)
+            return
+
+        # 1. Setup Data
+        action_cfg = template_data['Config_Dict']
+        source_nk = PathSwapper.translate(action_cfg.get('Source_NK', ''))
+        out_path_raw = action_cfg.get('Output_Template_path', '')
+        out_file_raw = action_cfg.get('Output_Template_file', '')
+        
+        mapping_df = pd.read_csv(template_data['Mapping_CSV'], dtype=str).fillna("")
+        resolver = TemplateVariableResolver(self.engine, mapping_df, app_window=self.app)
+        
+        # 2. Pre-flight check: Build output paths
+        plan = []
+        for _, row in selected_rows.iterrows():
+            row_dict = row.to_dict()
+            ctx = {**self.engine.settings, **row_dict}
+            
+            # Resolve directory and filename placeholders
+            dir_path = out_path_raw
+            file_name = out_file_raw
+            for k in sorted(ctx.keys(), key=len, reverse=True):
+                ph = f"{{{k}}}"
+                if ph in dir_path: dir_path = dir_path.replace(ph, str(ctx[k]))
+                if ph in file_name: file_name = file_name.replace(ph, str(ctx[k]))
+            
+            # Combine into final absolute path
+            full_target = PathSwapper.translate(os.path.join(dir_path, file_name))
+            plan.append((row_dict, full_target))
+
+        # 3. Show Preview Dialog
+        preview = ExecutionPreviewDialog(source_nk, [p[1] for p in plan], parent=parent_window)
+        if preview.exec() != QDialog.Accepted:
+            return
+
+        # 4. EXECUTION LOOP
+        success_count = 0
+        for row_dict, target_path in plan:
+            try:
+                # Pass the action_cfg dictionary so ACTION_CONFIG and CONFIG_CONCAT work!
+                mapping_dict = resolver.get_resolved_map(row_dict, action_config=action_cfg)
+                
+                if TextInjectionEngine.inject(source_nk, target_path, mapping_dict):
+                    success_count += 1
+            except Exception as e:
+                print(f"FAILED TO GENERATE {target_path}: {e}")
+
+        if self.app and hasattr(self.app, 'statusBar'):
+            self.app.statusBar().showMessage(f"Successfully generated {success_count} Nuke scripts.", 5000)
+
+class NukeSetupDialog(QDialog):
+    def __init__(self, engine, template_id, nuke_root, manager_df, parent=None):
+        super().__init__(parent)
+        # --- PREVIEW CONTEXT SETUP ---
+        self.preview_ctx = {**engine.settings}
+        # Grab the first selected shot to use as our "Preview Truth"
+        selected = manager_df[manager_df['Select'] == True]
+        if not selected.empty:
+            self.preview_ctx.update(selected.iloc[0].to_dict())
+        elif not manager_df.empty:
+            self.preview_ctx.update(manager_df.iloc[0].to_dict())
+
+        self.engine = engine
+        self.template_id = template_id
+        self.dir_path = os.path.join(nuke_root, template_id)
+        self.config_path = os.path.join(self.dir_path, "config.csv")
+        self.mapping_path = os.path.join(self.dir_path, "mapping.csv")
+        
+        self.setWindowTitle(f"Setup Nuke Action: {template_id}")
+        self.resize(1200, 1000)
+        
+        layout = QVBoxLayout(self)
+
+        # --- TOP: DYNAMIC CONFIG SECTION ---
+        self.path_group = QFrame()
+        self.path_group.setStyleSheet("QFrame { background-color: #2b2b2b; padding: 10px; border-radius: 4px; }")
+        self.path_layout = QVBoxLayout(self.path_group)
+        
+        # This dict will hold our QLineEdit references: { "KeyName": QLineEdit_Object }
+        self.config_widgets = {}
+        self.refresh_config_ui()
+        
+        layout.addWidget(self.path_group)
+
+        # --- MIDDLE: MAPPING TABLE ---
+        self.mapping_table = TemplateMappingWidget(
+            self.engine, template_id, self.get_config_val('Source_NK'), 
+            self.mapping_path, manager_df, parent=self  # <--- SURGICAL FIX: changed source_dfs to manager_df
+        )
+        layout.addWidget(self.mapping_table)
+
+        # --- BOTTOM: BUTTONS ---
+        btns = QHBoxLayout()
+        self.btn_save = QPushButton("Save")
+        self.btn_save_exit = QPushButton("Save & Exit")
+        self.btn_cancel = QPushButton("Cancel")
+        
+        self.btn_save.clicked.connect(self.save_all)
+        self.btn_save_exit.clicked.connect(lambda: self.save_all(close=True))
+        self.btn_cancel.clicked.connect(self.reject)
+        
+        btns.addStretch(); btns.addWidget(self.btn_save); btns.addWidget(self.btn_save_exit); btns.addWidget(self.btn_cancel)
+        layout.addLayout(btns)
+
+    def keyPressEvent(self, event):
+        """Catches Enter to gracefully finish text editing without triggering buttons."""
+        if event.key() in (Qt.Key_Return, Qt.Key_Enter):
+            focused = self.focusWidget()
+            
+            # 1. If we are in a text box, 'Enter' just finishes the edit and drops focus
+            if isinstance(focused, QLineEdit):
+                focused.clearFocus()
+                event.accept() # Swallow the key so the dialog doesn't close
+                return
+                
+            # 2. If the user explicitly Tabbed to a button (like Save) and hit Enter, let it click
+            elif isinstance(focused, QPushButton):
+                super().keyPressEvent(event)
+                return
+                
+            # 3. If focused on anything else (or nothing), swallow the Enter key safely
+            event.accept()
+            return
+
+        # Let all other keys (Escape, typing, etc.) behave normally
+        super().keyPressEvent(event)
+        
+    def refresh_config_ui(self):
+        # --- THE TD CONTROL PANEL ---
+        FILE_KEYS = ["Source_NK", "Overlay_TPL"]
+        DIR_KEYS  = ["nope", "not_this", "proxy_that"]
+        BUILD_PREVIEW = [
+            "Output_Template_path", "Output_Template_file", 
+            "nuke_comp_render_path", "nuke_comp_render_filename"
+        ]
+        
+        # 1. Clear existing UI
+        for i in reversed(range(self.path_layout.count())): 
+            item = self.path_layout.itemAt(i)
+            if item.widget(): item.widget().setParent(None)
+            elif item.layout():
+                while item.layout().count():
+                    item.layout().itemAt(0).widget().setParent(None)
+
+        self.config_widgets = {}
+        self.preview_labels = {} # NEW: Keep track of preview labels
+
+        # 2. Load and Build
+        df = pd.read_csv(self.config_path).fillna("") if os.path.exists(self.config_path) else pd.DataFrame(columns=["Key", "Value"])
+
+        for _, row in df.iterrows():
+            key, val = row['Key'], row['Value']
+            
+            # --- MAIN ROW ---
+            row_layout = QHBoxLayout()
+            lbl = QLabel(f"{key}:")
+            lbl.setFixedWidth(250)
+            edit = QLineEdit(str(val))
+            self.config_widgets[key] = edit
+            
+            row_layout.addWidget(lbl)
+
+            if key in FILE_KEYS or key in DIR_KEYS:
+                btn_browse = QPushButton("Choose...")
+                btn_browse.setFixedWidth(80)
+                is_dir = key in DIR_KEYS
+                btn_browse.clicked.connect(lambda chk=False, e=edit, k=key, d=is_dir: self.browse_explicit(e, k, d))
+                row_layout.addWidget(btn_browse)
+
+            row_layout.addWidget(edit)
+            self.path_layout.addLayout(row_layout)
+
+            # --- PREVIEW ROW ---
+            if key in BUILD_PREVIEW:
+                preview_layout = QHBoxLayout()
+                
+                # Spacer label to push the preview text perfectly under the QLineEdit
+                spacer_lbl = QLabel("")
+                spacer_lbl.setFixedWidth(250)
+                if key in FILE_KEYS or key in DIR_KEYS:
+                    spacer_lbl.setFixedWidth(250 + 85) # Accommodate the 'Choose...' button width
+                    
+                lbl_preview = QLabel("Preview resolving...")
+                lbl_preview.setStyleSheet("color: #777777; font-family: 'Courier New', 'Menlo', monospace; font-size: 11px;")
+                
+                self.preview_labels[key] = lbl_preview
+                preview_layout.addWidget(spacer_lbl)
+                preview_layout.addWidget(lbl_preview)
+                self.path_layout.addLayout(preview_layout)
+
+                # Connect the live update signal to a centralized handler
+                edit.textChanged.connect(lambda text, k=key: self.on_config_edited(k, text))
+                
+                # Fire it once to set the initial preview state
+                self.update_config_preview(key, str(val))
+
+    def on_config_edited(self, key, text):
+        """Handles updating both the local label and the mapping table."""
+        # 1. Update the little preview label beneath the text box
+        self.update_config_preview(key, text)
+        
+        # 2. Force the mapping table to recalculate its live preview column
+        if hasattr(self, 'mapping_table'):
+            self.mapping_table.refresh_previews()
+            
+    def get_config_val(self, key):
+        """Helper for the mapping table to find the Source NK path."""
+        if os.path.exists(self.config_path):
+            df = pd.read_csv(self.config_path)
+            match = df[df['Key'] == key]
+            if not match.empty: return match.iloc[0]['Value']
+        return ""
+
+    def get_live_config(self):
+        """Returns the current state of the UI text boxes as a dictionary."""
+        return {key: edit.text() for key, edit in self.config_widgets.items()}
+    
+    def update_config_preview(self, key, text):
+        """Resolves the string live as the user types, using the first selected shot."""
+        if key not in self.preview_labels: return
+        
+        template = text
+        
+        # 1. Handle ALL Padding Exceptions
+        for k, v in self.preview_ctx.items():
+            if str(k).startswith('padding_') and f"{{{k}}}" in template:
+                pad_nom = PaddingNomBuilder.build(v, style="printf")
+                template = template.replace(f"{{{k}}}", pad_nom)
+            
+        # 2. Resolve Standard Placeholders
+        for k in sorted(self.preview_ctx.keys(), key=len, reverse=True):
+            placeholder = f"{{{k}}}"
+            if placeholder in template:
+                template = template.replace(placeholder, str(self.preview_ctx[k]))
+                
+        # 3. Update UI
+        self.preview_labels[key].setText(f"↳ {template}")
+
+    def browse_explicit(self, target_edit, key_name, is_dir):
+        """No meatballs, just a binary path picker."""
+        if is_dir:
+            path = QFileDialog.getExistingDirectory(self, f"Select Folder for {key_name}")
+        else:
+            path, _ = QFileDialog.getOpenFileName(self, f"Select File for {key_name}", "", "All Files (*.*)")
+            
+        if path:
+            target_edit.setText(path)
+
+    def save_all(self, close=False):
+        """Dumb save: Just takes what's in the widgets and puts it in the CSV."""
+        save_data = []
+        for key, edit in self.config_widgets.items():
+            save_data.append([key, edit.text()])
+            
+        df = pd.DataFrame(save_data, columns=["Key", "Value"])
+        df.to_csv(self.config_path, index=False)
+        
+        self.mapping_table.save_mapping()
+        
+        if close: self.accept()
+
+class MacThumbGeneratorThread(QThread):
+    progress = Signal(int, str) # Emits (current_step, current_shot_name)
+    finished = Signal(int, int) # Emits (successful_count, total_count)
+
+    def __init__(self, shot_media_map, thumbs_dir):
+        super().__init__()
+        # shot_media_map is a dict: {"sh010": "/path/to/some/frame.exr"}
+        self.shot_media_map = shot_media_map 
+        self.thumbs_dir = thumbs_dir
+
+    def run(self):
+        # (os and subprocess are already imported globally at the top of your script)
+        os.makedirs(self.thumbs_dir, exist_ok=True)
+        success_count = 0
+        total_count = len(self.shot_media_map)
+
+        for i, (shotname, source_path) in enumerate(self.shot_media_map.items()):
+            self.progress.emit(i + 1, shotname)
+            
+            dest_path = os.path.join(self.thumbs_dir, f"{shotname}.jpg")
+            
+            # Skip if it already exists
+            if os.path.exists(dest_path):
+                success_count += 1
+                continue
+
+            try:
+                # STEP 1: Hijack macOS QuickLook to generate the thumbnail.
+                # This guarantees it looks exactly like what you see in the Finder!
+                ql_cmd = [
+                    "qlmanage", 
+                    "-t", 
+                    "-s", "640", 
+                    "-o", self.thumbs_dir, 
+                    source_path
+                ]
+                # Run silently
+                subprocess.run(ql_cmd, capture_output=True, text=True)
+                
+                # QuickLook always outputs the file as: OriginalName.extension.png
+                source_basename = os.path.basename(source_path)
+                ql_generated_png = os.path.join(self.thumbs_dir, f"{source_basename}.png")
+                
+                # STEP 2: Format it nicely as our {SHOTNAME}.jpg and clean up
+                if os.path.exists(ql_generated_png):
+                    sips_cmd = [
+                        "sips", 
+                        "-s", "format", "jpeg", 
+                        ql_generated_png, 
+                        "--out", dest_path
+                    ]
+                    subprocess.run(sips_cmd, capture_output=True, text=True)
+                    
+                    # Delete the temporary QuickLook PNG
+                    os.remove(ql_generated_png)
+                    
+                    if os.path.exists(dest_path):
+                        success_count += 1
+            except Exception as e:
+                print(f"Failed to generate thumb for {shotname}: {e}")
+
+        self.finished.emit(success_count, total_count)
+
+class ProjectManagerDialog(QDialog):
+    def __init__(self, engine, parent=None):
+        super().__init__(parent)
+        self.engine = engine
+        self.parent_app = parent 
+        
+        # Instantiate the dedicated Engine
+        self.nuke_engine = NukeEngine(self.engine, app_window=self.parent_app)
+        
+        self.project_name = getattr(parent, 'project_label', 'Generic Project')
+        self.setWindowTitle(f"[{self.project_name}] - Project Manager")
+        self.resize(1100, 700)
+        
+        # --- SURGICAL FIX: Keep the UI strictly to df_shots ---
+        if hasattr(self.parent_app, 'df_shots'):
+            self.df_manager = self.parent_app.df_shots.copy()
+        else:
+            self.df_manager = pd.DataFrame()
+            
+        if 'Select' not in self.df_manager.columns:
+            self.df_manager.insert(0, 'Select', False)
+
+        layout = QVBoxLayout(self)
+
+        # --- 1. APP ACTIONS SECTION (TOP) ---
+        actions_group = QFrame()
+        actions_group.setFrameShape(QFrame.StyledPanel)
+        # Add padding to the main box so the cards have breathing room
+        actions_group.setStyleSheet("QFrame { background-color: #2b2b2b; border-radius: 5px; padding: 5px; }")
+        actions_main_layout = QVBoxLayout(actions_group)
+        
+        lbl_title = QLabel("<b>App Actions</b>")
+        lbl_title.setStyleSheet("border: none; background: transparent; font-size: 14px; color: #eee;")
+        actions_main_layout.addWidget(lbl_title)
+        
+        self.actions_layout = QHBoxLayout()
+        self.actions_layout.setAlignment(Qt.AlignLeft | Qt.AlignTop) # Pack to top-left
+        self.actions_layout.setSpacing(15) # Space between cards
+        
+        # --- NEW: THUMBNAIL ACTION CARD ---
+        thumb_frame = QFrame()
+        # Give the block a distinct card look
+        thumb_frame.setStyleSheet("QFrame { background-color: #3a3a3a; border: 1px solid #555; border-radius: 6px; }")
+        thumb_block = QVBoxLayout(thumb_frame)
+        thumb_block.setAlignment(Qt.AlignTop) # Keeps contents neatly stacked at the top
+        
+        lbl_thumb = QLabel("<b>Thumbnails</b>")
+        lbl_thumb.setAlignment(Qt.AlignCenter)
+        lbl_thumb.setStyleSheet("border: none; background: transparent; color: #ddd;")
+        thumb_block.addWidget(lbl_thumb)
+        
+        self.btn_mac_thumbs = QPushButton("Go Thumbs :-)")
+        self.btn_mac_thumbs.setFixedWidth(140) # Lock the width to match Nuke buttons
+        self.btn_mac_thumbs.setStyleSheet("""
+            QPushButton { background-color: #2e885a; color: white; font-weight: bold; height: 28px; border-radius: 4px; }
+            QPushButton:hover { background-color: #3aa86f; }
+        """)
+        self.btn_mac_thumbs.clicked.connect(self.action_generate_mac_thumbs)
+        
+        import sys
+        if sys.platform != "darwin":
+            self.btn_mac_thumbs.setEnabled(False)
+            self.btn_mac_thumbs.setStyleSheet("QPushButton { background-color: #444; color: #888; font-weight: bold; height: 28px; border-radius: 4px; }")
+            self.btn_mac_thumbs.setToolTip("This native batch process only works on macOS.")
+            
+        thumb_block.addWidget(self.btn_mac_thumbs)
+        self.actions_layout.addWidget(thumb_frame)
+        # -----------------------------------
+
+        # Dynamically build blocks from the Nuke Master Log
+        self.build_nuke_action_blocks(self.actions_layout)
+        
+        actions_main_layout.addLayout(self.actions_layout)
+        layout.addWidget(actions_group)
+
+        # --- 2. FILTERS ---
+        filter_bar = QHBoxLayout()
+        self.seq_filter = QComboBox()
+        self.seq_filter.addItem("All")
+        if not self.df_manager.empty:
+            seqs = sorted([s for s in self.df_manager['SEQUENCE'].unique() if s])
+            self.seq_filter.addItems(seqs)
+        self.seq_filter.currentTextChanged.connect(self.apply_filters)
+        
+        btn_all = QPushButton("Select All")
+        btn_none = QPushButton("Select None")
+        btn_all.setFocusPolicy(Qt.NoFocus)
+        btn_none.setFocusPolicy(Qt.NoFocus)
+        btn_all.clicked.connect(lambda: self.toggle_selection(True))
+        btn_none.clicked.connect(lambda: self.toggle_selection(False))
+
+        filter_bar.addWidget(QLabel("Sequence:"))
+        filter_bar.addWidget(self.seq_filter)
+        filter_bar.addStretch()
+        filter_bar.addWidget(btn_all); filter_bar.addWidget(btn_none)
+        layout.addLayout(filter_bar)
+
+        # --- 3. THE TABLE ---
+        self.table = QTableView()
+        self.model = SelectionModel(self.df_manager, self) 
+        self.proxy = QSortFilterProxyModel()
+        self.proxy.setSourceModel(self.model)
+        self.table.setModel(self.proxy)
+
+        self.table.setSelectionBehavior(QTableView.SelectRows)
+        self.table.setSelectionMode(QTableView.MultiSelection) 
+        self.table.setEditTriggers(QTableView.NoEditTriggers)
+        self.table.setSortingEnabled(True)
+        self.table.setStyleSheet("QTableView::item:selected { background-color: #2e5a88; color: white; }")
+        self.table.selectionModel().selectionChanged.connect(self.sync_checkboxes_to_selection)
+
+        layout.addWidget(self.table)
+        
+        # Final UI Cleanup
+        self.table.horizontalHeader().setStretchLastSection(True)
+        self.table.resizeColumnsToContents()
+
+    def action_generate_mac_thumbs(self):
+        """Finds source media for selected shots and generates thumbs using macOS sips."""
+        from PySide6.QtWidgets import QProgressDialog, QMessageBox
+        import glob
+        import re
+        
+        # 1. Get Selected Shots from the UI Table
+        selected_rows = self.df_manager[self.df_manager['Select'] == True]
+        if selected_rows.empty:
+            QMessageBox.warning(self, "No Selection", "Please select at least one shot.")
+            return
+
+        selected_shots = selected_rows['SHOTNAME'].tolist()
+        
+        thumbs_dir = os.path.join(self.engine.project_root, self.engine.settings.get('thumbs_dir', 'thumbs'))
+        shot_media_map = {}
+        
+        # 2. Map Shots to Source Media
+        for raw_shot in selected_shots:
+            clean_shotname = str(raw_shot).split("|")[0].strip()
+            
+            # Skip if thumb already exists! Fail nicely and continue.
+            if os.path.exists(os.path.join(thumbs_dir, f"{clean_shotname}.jpg")):
+                continue
+                
+            # Use main window's existing logic (Returns something with %04d)
+            source_file = self.parent_app.resolve_scan_path(clean_shotname)
+            
+            if source_file:
+                # --- THE FIX: Resolve the %04d to an actual physical frame ---
+                if '%' in source_file:
+                    search_pattern = re.sub(r'%0?\d*d', '*', source_file)
+                    matches = glob.glob(search_pattern)
+                    if matches:
+                        source_file = sorted(matches)[0] # Grab the very first frame
+                    else:
+                        source_file = None
+                # -------------------------------------------------------------
+            
+            # Now that it's a real file (or directory), this check works!
+            if source_file and os.path.isdir(source_file):
+                found = False
+                for f in os.listdir(source_file):
+                    if f.lower().endswith(('.exr', '.jpg', '.jpeg', '.png')):
+                        source_file = os.path.join(source_file, f)
+                        found = True
+                        break
+                if not found:
+                    source_file = None
+            
+            if source_file and os.path.exists(source_file):
+                shot_media_map[clean_shotname] = source_file
+
+        if not shot_media_map:
+            QMessageBox.information(self, "Nothing to do", "All selected shots either have thumbnails already, or no valid scans were found.")
+            return
+        
+        print("SHOT MEDIA MAP: ", shot_media_map)
+            
+        # 3. Setup Progress and Fire Thread
+        self.thumb_progress = QProgressDialog("Generating Thumbnails...", "Cancel", 0, len(shot_media_map), self)
+        self.thumb_progress.setWindowTitle("Mac Batch Thumbnails")
+        self.thumb_progress.setWindowModality(Qt.WindowModal)
+        self.thumb_progress.setMinimumDuration(0)
+        
+        self.thumb_thread = MacThumbGeneratorThread(shot_media_map, thumbs_dir)
+        self.thumb_thread.progress.connect(
+            lambda i, name: (self.thumb_progress.setValue(i), self.thumb_progress.setLabelText(f"Processing: {name}"))
+        )
+        self.thumb_thread.finished.connect(self._on_batch_thumbs_finished)
+        self.thumb_progress.canceled.connect(self.thumb_thread.terminate)
+        
+        self.thumb_thread.start()
+
+    def _on_batch_thumbs_finished(self, success_count, total_count):
+        self.thumb_progress.setValue(total_count)
+        from PySide6.QtWidgets import QMessageBox
+        QMessageBox.information(self, "Finished", f"Successfully generated {success_count} of {total_count} thumbnails.")
+        
+        # Force the main app to refresh the thumbnail view if necessary
+        current_shot = self.parent_app.shot_selector.currentText()
+        if current_shot != "All":
+            self.parent_app.update_thumbnail_view(current_shot)
+
+    def get_unified_execution_data(self):
+        """Safely merges UI selections with master paths without row explosion."""
+        if hasattr(self.parent_app, 'df_master') and not self.df_manager.empty:
+            # --- THE FIX: Strip master down to 1 row per shot before merging ---
+            master = self.parent_app.df_master.drop_duplicates(subset=['SHOTNAME']).copy()
+            
+            unified_df = pd.merge(self.df_manager, master, on='SHOTNAME', how='left', suffixes=('', '_dup'))
+            return unified_df.loc[:, ~unified_df.columns.str.endswith('_dup')]
+            
+        return self.df_manager.copy()
+    
+    def build_nuke_action_blocks(self, layout):
+        """Creates a UI block for every template registered in the master log."""
+        templates = self.nuke_engine.get_template_registry()
+        
+        # Grab the Master DF once for the whole builder
+        # Note: Your AssetManager calls it 'df_master'
+        master_df = self.parent_app.df_master if hasattr(self.parent_app, 'df_master') else None
+
+        if not templates:
+            layout.addWidget(QLabel("<i>No Nuke Templates registered in Project_Actions</i>"))
+            return
+
+        for t_data in templates:
+            t_id = t_data['Template_ID']
+            s_path = t_data['Source_Path']
+            
+            block = QVBoxLayout()
+            block.setContentsMargins(5, 5, 5, 5)
+            
+            lbl = QLabel(f"<b>{t_id.replace('_', ' ').title()}</b>")
+            lbl.setAlignment(Qt.AlignCenter)
+            block.addWidget(lbl)
+            
+            btn_setup = QPushButton("⚙️ Setup")
+            btn_setup.setFixedWidth(140)
+            
+            # THE FIX: Pass master_df through the lambda so it's available for the mapper
+            # Remove mdf=master_df from the lambda
+            btn_setup.clicked.connect(lambda chk=False, tid=t_id, sp=s_path: 
+                                      self.action_nuke_config(tid, sp))
+            
+            btn_exec = QPushButton("🚀 Execute")
+            btn_exec.setFixedWidth(140)
+            btn_exec.setStyleSheet("background-color: #f37321; color: white; font-weight: bold;")
+            btn_exec.clicked.connect(lambda chk=False, td=t_data: 
+                                     self.action_nuke_execute(td))
+            
+            block.addWidget(btn_setup)
+            block.addWidget(btn_exec)
+            layout.addLayout(block)
+            layout.addSpacing(15)
+
+    def action_nuke_config(self, template_id, source_path):
+        self.nuke_engine.setup_action(
+            template_id, 
+            source_path, 
+            self.get_unified_execution_data(), # Pass the Big Kahuna here
+            parent_window=self
+        )
+
+    def action_nuke_execute(self, template_data):
+        self.nuke_engine.execute_template(
+            template_data, 
+            self.get_unified_execution_data(), # Pass the Big Kahuna here
+            parent_window=self
+        )
+
+    def apply_filters(self, text):
+        self._is_filtering = True 
+        if text != "All":
+            mask = self.df_manager['SEQUENCE'] != text
+            self.df_manager.loc[mask, 'Select'] = False
+        col_idx = self.df_manager.columns.get_loc("SEQUENCE")
+        self.proxy.setFilterKeyColumn(col_idx)
+        self.proxy.setFilterFixedString("" if text == "All" else text)
+        self._is_filtering = False
+        self.model.beginResetModel(); self.model.endResetModel()
+        self.restore_selections_from_data()
+
+    def restore_selections_from_data(self):
+        if not hasattr(self, 'table'): return
+        self.table.selectionModel().blockSignals(True)
+        self.table.clearSelection()
+        for row in range(self.proxy.rowCount()):
+            source_idx = self.proxy.mapToSource(self.proxy.index(row, 0))
+            if source_idx.isValid() and self.model._data.iat[source_idx.row(), 0] == True:
+                self.table.selectRow(row)
+        self.table.selectionModel().blockSignals(False)
+
+    def sync_checkboxes_to_selection(self, selected, deselected):
+        if getattr(self, '_is_filtering', False): return 
+        for sel_range in selected:
+            for index in sel_range.indexes():
+                if index.column() == 0: self.model.setData(self.proxy.mapToSource(index), True, Qt.CheckStateRole)
+        for desel_range in deselected:
+            for index in desel_range.indexes():
+                if index.column() == 0: self.model.setData(self.proxy.mapToSource(index), False, Qt.CheckStateRole)
+
+    def toggle_selection(self, state):
+        if state: self.table.selectAll()
+        else: self.table.clearSelection()
+
 class ScalingOptionsDialog(QDialog):
     """A small dialog to ask the user how they want to conform their image."""
     def __init__(self, parent=None):
@@ -7389,6 +7569,8 @@ class AssetManager(QMainWindow):
         config_menu = QMenu(self)
         import_menu = config_menu.addMenu("Import...")
         import_menu.addAction(f"Import Shots data", self.action_import_shots)
+        import_menu.addSeparator()
+        import_menu.addAction("Import Thumbs", self.action_import_thumbs)
         config_menu.addSeparator()
         config_menu.addAction("Edit Project Settings", self.open_settings_editor)
         config_menu.addSeparator()
@@ -7417,6 +7599,38 @@ class AssetManager(QMainWindow):
 
         # Initialize the numbers
         self.update_status_stats()
+
+    def action_import_thumbs(self):
+        """Copies all .jpg and .png files from a selected directory into the project's thumbs_dir."""
+        import shutil
+        
+        # 1. Ask for source directory
+        source_dir = QFileDialog.getExistingDirectory(self, "Select Directory containing Thumbnails")
+        if not source_dir:
+            return
+            
+        # 2. Establish destination directory
+        thumbs_dir = os.path.join(self.engine.project_root, self.engine.settings.get('thumbs_dir', 'thumbs'))
+        os.makedirs(thumbs_dir, exist_ok=True)
+        
+        # 3. Copy files
+        copied_count = 0
+        for file in os.listdir(source_dir):
+            if file.lower().endswith(('.jpg', '.jpeg', '.png')):
+                src_path = os.path.join(source_dir, file)
+                dst_path = os.path.join(thumbs_dir, file)
+                try:
+                    shutil.copy2(src_path, dst_path)
+                    copied_count += 1
+                except Exception as e:
+                    print(f"Failed to copy {file}: {e}")
+                    
+        QMessageBox.information(self, "Import Complete", f"Successfully copied {copied_count} thumbnails into project.")
+        
+        # Force a refresh of the thumbnail widget if a shot is currently selected
+        current_shot = self.shot_selector.currentText()
+        if current_shot != "All":
+            self.update_thumbnail_view(current_shot)
 
     def update_thumbnail_view(self, shotname):
         # Safety check: ensure the engine exists
