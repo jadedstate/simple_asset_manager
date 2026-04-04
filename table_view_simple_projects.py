@@ -6947,18 +6947,25 @@ class ShotThumbnailWidget(QLabel):
         self.setStyleSheet("background-color: #222; color: #888; border: 2px dashed #444;")
         self.setText("No Thumbnail Found\n\nClick to Add Media")
 
-    def load_shot(self, shotname, thumbs_dir):
+    def load_shot(self, raw_shotname, thumbs_dir):
         """Called by the main UI when the user selects a shot from the dropdown."""
         # 1. Handle the "All" or empty state
-        if not shotname or shotname == "All":
+        if not raw_shotname or raw_shotname.strip() == "All":
             self.set_neutral_state()
             return
             
-        # 2. Proceed normally for valid shots
-        self.current_shot = shotname
+        # 2. Extract the actual shot name from the UI display string
+        # This turns "sh010 | AltName" into just "sh010"
+        clean_shotname = raw_shotname.split("|")[0].strip()
+        
+        # 3. Strip any other accidentally illegal Windows characters just to be safe
+        import re
+        clean_shotname = re.sub(r'[<>:"/\\|?*]', '_', clean_shotname)
+
+        self.current_shot = clean_shotname
         self.thumbs_dir = thumbs_dir
         
-        # Construct the expected path: just {SHOTNAME}.jpg
+        # Construct the expected path: just {clean_shotname}.jpg
         self.expected_thumb_path = os.path.join(self.thumbs_dir, f"{self.current_shot}.jpg")
 
         if os.path.exists(self.expected_thumb_path):
@@ -7026,7 +7033,13 @@ class ShotThumbnailWidget(QLabel):
 
         # 4. Save the result
         os.makedirs(self.thumbs_dir, exist_ok=True)
-        success = final_pixmap.save(self.expected_thumb_path, "JPG", quality=85)
+        
+        # FIX 1: Qt strongly prefers forward slashes, even on Windows
+        safe_path = self.expected_thumb_path.replace("\\", "/")
+        print("SAF/VE PATH: ", self.expected_thumb_path)
+        
+        # FIX 2: Let Qt infer the format from the .jpg extension by not specifying it
+        success = final_pixmap.save(safe_path, quality=85)
 
         if success:
             self.load_shot(self.current_shot, self.thumbs_dir)
