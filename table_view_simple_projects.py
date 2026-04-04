@@ -5972,22 +5972,21 @@ class PaddingNomBuilder:
 
         # 3. The Output Switchboard
         if style == "printf":
-            # Nuke/Maya/Standard C-style: %04d
             return f"%{padding_val}d" if padding_val else "%d"
             
         elif style == "hash":
-            # Nuke alt/RV style: ####
             if not padding_val: return "#"
-            # Strip the '0' prefix for the multiplier to avoid octal math weirdness, default to 1
             return "#" * int(padding_val.lstrip('0') or 1)
             
         elif style == "houdini":
-            # Houdini style: $F4
             if not padding_val: return "$F"
             return f"$F{padding_val.lstrip('0')}"
             
+        elif style == "glob":
+            # --- NEW: Returns a glob wildcard for file searching ---
+            return "*" 
+            
         else:
-            # Failure-centric: Unrecognized style returns the raw parsed value
             return padding_val
        
 class TextInjectionEngine:
@@ -6825,6 +6824,7 @@ class ProjectManagerDialog(QDialog):
         
         import sys
         if sys.platform != "darwin":
+            # thumb_frame.setVisible(False)
             self.btn_mac_thumbs.setEnabled(False)
             self.btn_mac_thumbs.setStyleSheet("QPushButton { background-color: #444; color: #888; font-weight: bold; height: 28px; border-radius: 4px; }")
             self.btn_mac_thumbs.setToolTip("This native batch process only works on macOS.")
@@ -6906,21 +6906,16 @@ class ProjectManagerDialog(QDialog):
             if os.path.exists(os.path.join(thumbs_dir, f"{clean_shotname}.jpg")):
                 continue
                 
-            # Use main window's existing logic (Returns something with %04d)
-            source_file = self.parent_app.resolve_scan_path(clean_shotname)
+            # THE FIX: Tell the resolver to give us a glob-searchable pattern!
+            search_pattern = self.parent_app.resolve_scan_path(clean_shotname, padding_style="glob")
+            source_file = None
             
-            if source_file:
-                # --- THE FIX: Resolve the %04d to an actual physical frame ---
-                if '%' in source_file:
-                    search_pattern = re.sub(r'%0?\d*d', '*', source_file)
-                    matches = glob.glob(search_pattern)
-                    if matches:
-                        source_file = sorted(matches)[0] # Grab the very first frame
-                    else:
-                        source_file = None
-                # -------------------------------------------------------------
+            if search_pattern:
+                matches = glob.glob(search_pattern)
+                if matches:
+                    source_file = sorted(matches)[0] # Grab the very first frame found on disk
             
-            # Now that it's a real file (or directory), this check works!
+            # Check if we ended up inside a directory instead of a file
             if source_file and os.path.isdir(source_file):
                 found = False
                 for f in os.listdir(source_file):
@@ -9336,7 +9331,7 @@ class AssetManager(QMainWindow):
         except Exception as e:
             self.statusBar().showMessage(f"OS Reveal Error: {e}", 5000)
 
-    def resolve_scan_path(self, shot_name, target_ext="exr"):
+    def resolve_scan_path(self, shot_name, target_ext="exr", padding_style="printf"):
         """
         DIR / NAME . % [0] PADDING d . EXT
         Surgically handles single-digit padding and kills NaN ghosts.
@@ -9356,7 +9351,9 @@ class AssetManager(QMainWindow):
 
         # 3. THE PADDING LOGIC (Delegated to Builder)
         raw_pad = self.engine.settings.get('padding_scans', '')
-        padding_nomenclature = PaddingNomBuilder.build(raw_pad, style="printf")
+        
+        # NEW: Pass the requested style down to the builder
+        padding_nomenclature = PaddingNomBuilder.build(raw_pad, style=padding_style)
 
         # 4. Strict Resolution
         ctx = {**self.engine.settings, **shot_dict}
